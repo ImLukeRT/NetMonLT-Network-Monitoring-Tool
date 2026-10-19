@@ -4,8 +4,10 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from helpers import FakeClock, HangingProber
 from netmonlt.api import create_app
 from netmonlt.collector import poll_once
+from netmonlt.domain import CheckResult, PingResult, Status
 from netmonlt.inventory import Inventory
 from netmonlt.probes import SimulatedProber
 
@@ -58,3 +60,64 @@ def test_background_collector_populates_database(db, devices, inventory):
                 break
             time.sleep(0.05)
         assert all(r["status"] == "up" for r in rows)
+
+
+def test_stale_devices_are_flagged_using_the_server_clock(db, devices, inventory):
+    db.sync_devices(devices)
+    db.record_check(CheckResult("alpha", 1000.0, Status.UP, PingResult(3, 3, 5.0, 5.0, 5.0)))
+    clock = FakeClock(1000.0)
+    app = create_app(inventory, db, SimulatedProber(), start_collector=False, clock=clock)
+    with TestClient(app) as client:
+
+        def snapshot():
+            body = client.get("/api/devices").json()
+            return body, {d["name"]: d for d in body["devices"]}
+
+        body, devs = snapshot()
+        stale_after = body["stale_after_s"]
+        assert stale_after >= 3 * inventory.poll_interval_s
+        assert body["server_time"] == 1000.0
+        assert devs["alpha"]["stale"] is False and devs["alpha"]["age_s"] == 0
+
+        clock.now = 1000.0 + stale_after - 1
+        assert snapshot()[1]["alpha"]["stale"] is False
+
+        clock.now = 1000.0 + stale_after + 1
+        _, devs = snapshot()
+        assert devs["alpha"]["stale"] is True
+        assert devs["alpha"]["status"] == "up"  # raw status is kept; the flag says don't trust it
+        assert devs["alpha"]["age_s"] == pytest.approx(stale_after + 1)
+
+        # A device that was never checked is "unknown", not "stale".
+        assert devs["beta"]["stale"] is False and devs["beta"]["age_s"] is None
+
+
+def test_negative_age_from_a_clock_step_is_clamped(db, devices, inventory):
+    db.sync_devices(devices)
+    db.record_check(CheckResult("alpha", 5000.0, Status.UP, PingResult(3, 3, 5.0, 5.0, 5.0)))
+    app = create_app(inventory, db, SimulatedProber(), start_collector=False, clock=FakeClock(10.0))
+    with TestClient(app) as client:
+        alpha = client.get("/api/devices").json()["devices"][0]
+        assert alpha["age_s"] == 0 and alpha["stale"] is False
+
+
+def test_collector_stops_when_the_app_shuts_down(db, devices, inventory):
+    db.sync_devices(devices)
+    with TestClient(create_app(inventory, db, SimulatedProber())) as client:
+        deadline = time.time() + 5
+        while not db.history("alpha") and time.time() < deadline:
+            time.sleep(0.02)
+        assert client.get("/healthz").status_code == 200
+    count = len(db.history("alpha", 1000))
+    time.sleep(0.3)  # several poll intervals
+    assert len(db.history("alpha", 1000)) == count
+
+
+def test_shutdown_is_prompt_even_if_a_probe_is_hung(db, devices, inventory):
+    app = create_app(inventory, db, HangingProber())
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.2)
+
+    asyncio.run(asyncio.wait_for(run(), 5))

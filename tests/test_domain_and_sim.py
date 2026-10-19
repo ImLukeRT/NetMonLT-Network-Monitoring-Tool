@@ -23,9 +23,14 @@ def run(prober, device, count=3):
 
 def test_simulation_is_deterministic():
     dev = Device("a", "192.0.2.1", sim=SimProfile(rtt_ms=20, jitter_ms=5, loss=0.3))
-    first = [run(SimulatedProber(seed=1, clock=FakeClock()), dev) for _ in range(1)]
-    second = [run(SimulatedProber(seed=1, clock=FakeClock()), dev) for _ in range(1)]
-    assert first == second
+
+    def sequence(seed):
+        prober = SimulatedProber(seed=seed, clock=FakeClock())
+        return [run(prober, dev) for _ in range(20)]
+
+    assert sequence(1) == sequence(1)
+    assert sequence(1) != sequence(2)  # the seed actually matters
+    assert len({r.rtt_avg_ms for r in sequence(1)}) > 1  # and results are not constant
 
 
 def test_rtt_close_to_profile():
@@ -52,3 +57,10 @@ def test_outage_window_starts_and_ends():
         clock.now = t
         seen[t] = run(prober, dev).received > 0
     assert seen == {0: True, 9.9: True, 10: False, 14.9: False, 15: True, 30: True}
+
+
+def test_one_lost_packet_in_a_three_ping_check_is_degraded():
+    # The collector sends 3 pings per check, so loss can only be 0/33/67/100%. The 20% threshold
+    # therefore means "any loss at all"; this pins that behaviour so changing it is deliberate.
+    assert classify(PingResult(3, 2, 5.0, 5.0, 5.0)) == Status.DEGRADED
+    assert classify(PingResult(3, 3, 5.0, 5.0, 5.0)) == Status.UP

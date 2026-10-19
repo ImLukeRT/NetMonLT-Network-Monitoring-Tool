@@ -37,8 +37,10 @@
   .up { background:var(--up-bg); color:var(--up); }
   .degraded { background:var(--deg-bg); color:var(--deg); }
   .down { background:var(--down-bg); color:var(--down); }
-  .unknown { background:var(--none-bg); color:var(--none); }
-  #error { color:var(--down); margin-top:12px; min-height:1.5em; }
+  .unknown, .stale { background:var(--none-bg); color:var(--none); }
+  .wrap.offline { opacity:.5; }
+  #error { color:var(--down); font-weight:600; margin:0 0 12px; }
+  #error:empty { display:none; }
 </style>
 </head>
 <body>
@@ -48,6 +50,7 @@
     {% if mode == "simulated" %}<span class="banner">SIMULATED DATA</span>{% endif %}
     <span id="updated">Loading…</span>
   </p>
+  <div id="error" role="status"></div>
   <div class="summary" id="summary"></div>
   <div class="wrap">
     <table>
@@ -58,11 +61,11 @@
       <tbody id="rows"></tbody>
     </table>
   </div>
-  <div id="error" role="status"></div>
 </main>
 <script>
 const rows = document.getElementById("rows");
 const summary = document.getElementById("summary");
+const wrap = document.querySelector(".wrap");
 
 function cell(text, cls) {
   const td = document.createElement("td");
@@ -72,10 +75,11 @@ function cell(text, cls) {
 }
 
 function render(data) {
-  const counts = {up: 0, degraded: 0, down: 0, unknown: 0};
+  const counts = {up: 0, degraded: 0, down: 0, stale: 0, unknown: 0};
   rows.replaceChildren();
   for (const d of data.devices) {
-    const status = d.status || "unknown";
+    // A stale device keeps its last status in the API, but must not look current here.
+    const status = d.stale ? "stale" : (d.status || "unknown");
     counts[status] += 1;
     const tr = document.createElement("tr");
     const badgeCell = document.createElement("td");
@@ -85,13 +89,14 @@ function render(data) {
     badgeCell.appendChild(badge);
     const loss = d.sent ? Math.round(100 * (d.sent - d.received) / d.sent) + "%" : "–";
     const rtt = d.rtt_avg_ms == null ? "–" : d.rtt_avg_ms.toFixed(1) + " ms";
-    const age = d.ts == null ? "never" : Math.max(0, Math.round(Date.now() / 1000 - d.ts)) + "s ago";
+    const age = d.age_s == null ? "never" : Math.round(d.age_s) + "s ago";
     tr.append(badgeCell, cell(d.name), cell(d.address), cell(d.type),
               cell(rtt, "num"), cell(loss, "num"), cell(age, "num"));
     rows.appendChild(tr);
   }
   summary.replaceChildren();
-  for (const key of ["up", "degraded", "down"]) {
+  for (const key of ["up", "degraded", "down", "stale", "unknown"]) {
+    if (counts[key] === 0 && (key === "stale" || key === "unknown")) continue;
     const tile = document.createElement("div");
     tile.className = "tile";
     const b = document.createElement("b");
@@ -110,9 +115,12 @@ async function refresh() {
     const res = await fetch("/api/devices");
     if (!res.ok) throw new Error("HTTP " + res.status);
     render(await res.json());
+    wrap.classList.remove("offline");
     document.getElementById("error").textContent = "";
   } catch (err) {
-    document.getElementById("error").textContent = "Could not reach the API: " + err.message;
+    wrap.classList.add("offline");
+    document.getElementById("error").textContent =
+      "Could not reach the API (" + err.message + "). Showing the last data received, which is out of date.";
   }
 }
 refresh();

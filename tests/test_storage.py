@@ -58,3 +58,48 @@ def test_data_persists_across_connections(tmp_path, devices):
     second = Database(path)
     assert second.history("alpha")[0]["ts"] == 42
     second.close()
+
+
+def test_recording_for_an_unknown_device_is_rejected_and_db_stays_usable(db, devices):
+    import sqlite3
+
+    import pytest
+
+    db.sync_devices(devices)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.record_check(check("ghost", 1))
+    db.record_check(check("alpha", 2))  # the failed write must not poison the connection
+    assert [c["ts"] for c in db.history("alpha")] == [2]
+
+
+def test_concurrent_writer_and_readers_do_not_collide(db, devices):
+    import threading
+
+    db.sync_devices(devices)
+    writes, errors, done = 300, [], threading.Event()
+
+    def writer():
+        try:
+            for i in range(writes):
+                db.record_check(check("alpha", i))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    def reader():
+        try:
+            while not done.is_set():
+                db.latest_status()
+                db.history("alpha", 50)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer)]
+    threads += [threading.Thread(target=reader) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert not errors
+    assert len(db.history("alpha", 1000)) == writes

@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -36,8 +37,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    db = Database(args.db)
-    db.sync_devices(inventory.devices)
+    try:
+        db = Database(args.db)
+        db.sync_devices(inventory.devices)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"error: cannot open database {args.db}: {exc}", file=sys.stderr)
+        return 2
     app = create_app(inventory, db, SimulatedProber())
     print(f"NetMonLT ({inventory.mode} mode, {len(inventory.devices)} devices): "
           f"http://{args.host}:{args.port}")

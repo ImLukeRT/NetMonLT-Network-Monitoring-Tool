@@ -4,6 +4,7 @@ The YAML file is the source of truth for which devices exist. Validation is stri
 (unknown keys are rejected) so typos fail loudly instead of silently using defaults.
 """
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,31 @@ class InventoryError(ValueError):
     """The inventory file is missing or invalid."""
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate mapping keys instead of silently keeping the last.
+
+    Without this, a second `devices:` block quietly replaces the first and those devices are
+    never monitored.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in seen
+                seen.add(key)
+            except TypeError:  # unhashable key: let the base class report it
+                continue
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate key {key!r}", key_node.start_mark
+                )
+        return super().construct_mapping(node, deep=deep)
+
+
 @dataclass(frozen=True)
 class Inventory:
     mode: str
@@ -33,7 +59,10 @@ class Inventory:
 def load_inventory(path: str | Path) -> Inventory:
     path = Path(path)
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        # Read as a binary stream so PyYAML detects UTF-8/UTF-16 and BOMs (Windows editors and
+        # PowerShell redirection write these) and reports bad bytes as a YAML error.
+        with path.open("rb") as stream:
+            raw = yaml.load(stream, Loader=_StrictLoader)  # noqa: S506 - SafeLoader subclass
     except FileNotFoundError:
         raise InventoryError(f"inventory file not found: {path}") from None
     except yaml.YAMLError as exc:
@@ -74,7 +103,7 @@ def _parse_device(entry: Any, index: int) -> Device:
     _reject_unknown(entry, _DEVICE_KEYS, where)
 
     name = entry.get("name")
-    if not isinstance(name, str) or not _NAME_RE.match(name):
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
         raise InventoryError(f"{where}.name must be 1-64 chars of letters, digits, '.', '_', '-'")
     where = f"device {name!r}"
 
@@ -125,7 +154,13 @@ def _reject_unknown(mapping: dict, allowed: set[str], where: str) -> None:
 def _number(value: Any, label: str, minimum: float, maximum: float | None = None) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InventoryError(f"{label} must be a number")
-    if value < minimum or (maximum is not None and value > maximum):
+    try:
+        number = float(value)
+    except OverflowError:
+        raise InventoryError(f"{label} is out of range") from None
+    if not math.isfinite(number):
+        raise InventoryError(f"{label} must be a finite number")
+    if number < minimum or (maximum is not None and number > maximum):
         bound = f">= {minimum}" if maximum is None else f"between {minimum} and {maximum}"
         raise InventoryError(f"{label} must be {bound}")
-    return float(value)
+    return number
