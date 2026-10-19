@@ -21,6 +21,7 @@
   .sub { color:var(--muted); margin:0 0 16px; }
   .banner { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px;
             font-weight:600; background:var(--deg-bg); color:var(--deg); }
+  .banner.live { background:var(--up-bg); color:var(--up); }
   .summary { display:flex; gap:12px; margin:16px 0; flex-wrap:wrap; }
   .tile { background:var(--card); border:1px solid var(--line); border-radius:8px;
           padding:8px 16px; min-width:90px; }
@@ -47,7 +48,8 @@
 <main>
   <h1>NetMonLT</h1>
   <p class="sub">
-    {% if mode == "simulated" %}<span class="banner">SIMULATED DATA</span>{% endif %}
+    {% if mode == "simulated" %}<span class="banner">SIMULATED DATA</span>
+    {% else %}<span class="banner live">LIVE · ICMP</span>{% endif %}
     <span id="updated">Loading…</span>
   </p>
   <div id="error" role="status"></div>
@@ -88,7 +90,9 @@ function render(data) {
     badge.textContent = status;
     badgeCell.appendChild(badge);
     const loss = d.sent ? Math.round(100 * (d.sent - d.received) / d.sent) + "%" : "–";
-    const rtt = d.rtt_avg_ms == null ? "–" : d.rtt_avg_ms.toFixed(1) + " ms";
+    // Real LAN replies are often well under 1 ms, so keep two decimals there.
+    const rtt = d.rtt_avg_ms == null ? "–"
+      : d.rtt_avg_ms.toFixed(d.rtt_avg_ms < 1 ? 2 : 1) + " ms";
     const age = d.age_s == null ? "never" : Math.round(d.age_s) + "s ago";
     tr.append(badgeCell, cell(d.name), cell(d.address), cell(d.type),
               cell(rtt, "num"), cell(loss, "num"), cell(age, "num"));

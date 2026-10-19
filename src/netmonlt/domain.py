@@ -31,6 +31,8 @@ class Device:
     address: str
     type: str = "host"
     sim: SimProfile = field(default_factory=SimProfile)
+    # Real probers only measure devices explicitly marked authorized in the inventory.
+    authorized: bool = False
 
 
 @dataclass(frozen=True)

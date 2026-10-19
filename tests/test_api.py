@@ -121,3 +121,13 @@ def test_shutdown_is_prompt_even_if_a_probe_is_hung(db, devices, inventory):
             await asyncio.sleep(0.2)
 
     asyncio.run(asyncio.wait_for(run(), 5))
+
+
+def test_dashboard_labels_real_and_simulated_data_differently(db, devices):
+    def page(mode):
+        inv = Inventory(mode=mode, poll_interval_s=5, devices=tuple(devices))
+        with TestClient(create_app(inv, db, SimulatedProber(), start_collector=False)) as client:
+            return client.get("/").text
+
+    assert "SIMULATED DATA" in page("simulated") and "LIVE" not in page("simulated")
+    assert "LIVE · ICMP" in page("real") and "SIMULATED DATA" not in page("real")

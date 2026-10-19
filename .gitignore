@@ -11,4 +11,6 @@ dist/
 data/
 # Real-device scope files are local and must never be committed
 scope.yaml
+# Your own real-device inventory (private network addresses)
+config/devices.real.yaml
 .env

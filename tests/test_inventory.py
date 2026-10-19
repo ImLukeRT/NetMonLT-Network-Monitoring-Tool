@@ -31,7 +31,9 @@ def test_sim_profile_parsed():
     ({}, "non-empty list"),
     ({"devices": []}, "non-empty list"),
     ({"devices": [{"name": "a", "address": "x"}], "typo": 1}, "unknown key"),
-    ({"mode": "real", "devices": [{"name": "a", "address": "x"}]}, "not supported"),
+    ({"mode": "real", "devices": [{"name": "a", "address": "192.0.2.1"}]}, "authorized: true"),
+    ({"mode": "bogus", "devices": [{"name": "a", "address": "x"}]}, "'simulated' or 'real'"),
+    ({"mode": "Real", "devices": [{"name": "a", "address": "x"}]}, "'simulated' or 'real'"),
     ({"devices": [{"address": "x"}]}, "name"),
     ({"devices": [{"name": "bad name", "address": "x"}]}, "name"),
     ({"devices": [{"name": "a/b", "address": "x"}]}, "name"),
@@ -109,3 +111,76 @@ def test_undecodable_inventory_gives_a_friendly_error(tmp_path):
     f.write_bytes(b"devices: \xff\xfe\x00 not text")
     with pytest.raises(InventoryError, match="invalid YAML"):
         load_inventory(f)
+
+
+# ------------------------------------------------------------------ real (ICMP) mode
+def real(*devices, **top):
+    return {"mode": "real", "poll_interval_s": 10, "devices": list(devices), **top}
+
+
+def host(name="a", address="192.0.2.1", **extra):
+    return {"name": name, "address": address, "authorized": True, **extra}
+
+
+def test_simulated_remains_the_default_mode():
+    inv = parse_inventory({"devices": [{"name": "a", "address": "x"}]})
+    assert inv.mode == "simulated" and inv.devices[0].authorized is False
+
+
+def test_real_mode_accepts_authorized_single_hosts():
+    inv = parse_inventory(real(host("a", "192.168.1.1"), host("b", "router.local")))
+    assert inv.mode == "real"
+    assert all(d.authorized for d in inv.devices)
+
+
+@pytest.mark.parametrize("flag", [None, False, "yes please", 1, "true"])
+def test_real_mode_requires_authorized_true_on_every_device(flag):
+    device = {"name": "a", "address": "192.0.2.1"}
+    if flag is not None:
+        device["authorized"] = flag
+    with pytest.raises(InventoryError, match="authorized"):
+        parse_inventory(real(host("ok"), device))
+
+
+@pytest.mark.parametrize("address", [
+    "10.0.0.0/24", "10.0.0.1-50", "10.0.0.*", "10.0.0.1,10.0.0.2", "224.0.0.1",
+    "255.255.255.255", "0.0.0.0", "::1", "-f", "10.1", "0xe0.0.0.1", "0xffffffff",
+])
+def test_real_mode_rejects_ranges_and_special_addresses(address):
+    with pytest.raises(InventoryError, match="address"):
+        parse_inventory(real(host("a", address)))
+
+
+def test_real_mode_has_a_minimum_poll_interval():
+    with pytest.raises(InventoryError, match="poll_interval_s"):
+        parse_inventory(real(host(), poll_interval_s=1))
+    assert parse_inventory(real(host(), poll_interval_s=5)).poll_interval_s == 5
+
+
+def test_simulated_mode_keeps_its_fast_interval_and_lenient_addresses():
+    inv = parse_inventory(
+        {"poll_interval_s": 0.5, "devices": [{"name": "a", "address": "10.0.0.0/24"}]}
+    )
+    assert inv.poll_interval_s == 0.5
+
+
+def test_authorized_must_be_a_boolean_in_any_mode():
+    with pytest.raises(InventoryError, match="true or false"):
+        parse_inventory({"devices": [{"name": "a", "address": "x", "authorized": "yes please"}]})
+
+
+def test_sim_profile_is_still_validated_but_ignored_in_real_mode():
+    parse_inventory(real(host(sim={"rtt_ms": 5})))
+    with pytest.raises(InventoryError, match="loss"):
+        parse_inventory(real(host(sim={"loss": 3})))
+
+
+def test_shipped_real_example_is_valid_and_only_targets_loopback():
+    inv = load_inventory(REPO_ROOT / "config" / "devices.real.example.yaml")
+    assert inv.mode == "real"
+    assert [d.address for d in inv.devices] == ["127.0.0.1"]
+
+
+def test_shipped_demo_inventory_stays_simulated():
+    inv = load_inventory(REPO_ROOT / "config" / "devices.sim.yaml")
+    assert inv.mode == "simulated" and not any(d.authorized for d in inv.devices)

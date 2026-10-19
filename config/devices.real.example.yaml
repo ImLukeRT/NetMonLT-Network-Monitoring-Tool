@@ -1,0 +1,26 @@
+# Real ICMP monitoring (opt-in). Nothing here runs unless you pass this file to netmonlt:
+#   netmonlt --inventory config/devices.real.example.yaml
+#
+# Rules (enforced at startup and again inside the prober):
+#   * every device needs `authorized: true`: only list equipment you own or are explicitly
+#     permitted to monitor;
+#   * each address is ONE IPv4 address or hostname: ranges, CIDR blocks and wildcards are
+#     rejected, and nothing is ever scanned or discovered;
+#   * `sim:` settings are ignored in real mode.
+#
+# To monitor your own devices, copy this file to config/devices.real.yaml (git-ignored).
+mode: real
+poll_interval_s: 10      # minimum 5 in real mode
+
+devices:
+  # Your own computer over the loopback interface: always safe to try.
+  - name: this-machine
+    address: 127.0.0.1
+    type: host
+    authorized: true
+
+  # Example of a device you own (uncomment and edit):
+  # - name: home-router
+  #   address: 192.168.1.1
+  #   type: router
+  #   authorized: true

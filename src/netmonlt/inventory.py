@@ -13,10 +13,14 @@ from typing import Any
 import yaml
 
 from netmonlt.domain import Device, SimProfile
+from netmonlt.probes.icmp import TargetError, validate_target
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # used in URLs, so keep it URL-safe
 _TOP_KEYS = {"mode", "poll_interval_s", "devices"}
-_DEVICE_KEYS = {"name", "address", "type", "sim"}
+_DEVICE_KEYS = {"name", "address", "type", "sim", "authorized"}
+_MODES = ("simulated", "real")
+# Real probing sends traffic to someone's equipment, so don't allow hammering it.
+REAL_MIN_INTERVAL_S = 5.0
 _SIM_KEYS = {"rtt_ms", "jitter_ms", "loss", "outage_start_s", "outage_duration_s"}
 
 
@@ -76,10 +80,11 @@ def parse_inventory(raw: Any) -> Inventory:
     _reject_unknown(raw, _TOP_KEYS, "inventory")
 
     mode = raw.get("mode", "simulated")
-    if mode != "simulated":
-        raise InventoryError(f"mode {mode!r} is not supported yet; only 'simulated' is available")
+    if mode not in _MODES:
+        raise InventoryError(f"mode must be 'simulated' or 'real', not {mode!r}")
 
-    interval = _number(raw.get("poll_interval_s", 5), "poll_interval_s", minimum=0.1)
+    minimum = REAL_MIN_INTERVAL_S if mode == "real" else 0.1
+    interval = _number(raw.get("poll_interval_s", 5), "poll_interval_s", minimum=minimum)
 
     raw_devices = raw.get("devices")
     if not isinstance(raw_devices, list) or not raw_devices:
@@ -88,7 +93,7 @@ def parse_inventory(raw: Any) -> Inventory:
     devices: list[Device] = []
     seen: set[str] = set()
     for index, entry in enumerate(raw_devices):
-        device = _parse_device(entry, index)
+        device = _parse_device(entry, index, mode)
         if device.name in seen:
             raise InventoryError(f"duplicate device name {device.name!r}")
         seen.add(device.name)
@@ -96,7 +101,7 @@ def parse_inventory(raw: Any) -> Inventory:
     return Inventory(mode=mode, poll_interval_s=interval, devices=tuple(devices))
 
 
-def _parse_device(entry: Any, index: int) -> Device:
+def _parse_device(entry: Any, index: int, mode: str) -> Device:
     where = f"devices[{index}]"
     if not isinstance(entry, dict):
         raise InventoryError(f"{where} must be a mapping")
@@ -115,8 +120,24 @@ def _parse_device(entry: Any, index: int) -> Device:
     if not isinstance(dev_type, str) or not dev_type.strip():
         raise InventoryError(f"{where}: 'type' must be a non-empty string")
 
-    sim = _parse_sim(entry.get("sim"), where)
-    return Device(name=name, address=address, type=dev_type, sim=sim)
+    authorized = entry.get("authorized", False)
+    if not isinstance(authorized, bool):
+        raise InventoryError(f"{where}: 'authorized' must be true or false")
+    if mode == "real":
+        # Real probing is opt-in per device: each target must be acknowledged explicitly, and
+        # must be a single host (never a range), so nothing is scanned or discovered.
+        if not authorized:
+            raise InventoryError(
+                f"{where}: real mode requires 'authorized: true' (only list devices you own "
+                "or are explicitly permitted to monitor)"
+            )
+        try:
+            validate_target(address)
+        except TargetError as exc:
+            raise InventoryError(f"{where}: address {address!r}: {exc}") from None
+
+    sim = _parse_sim(entry.get("sim"), where)  # validated in both modes, used only when simulated
+    return Device(name=name, address=address, type=dev_type, sim=sim, authorized=authorized)
 
 
 def _parse_sim(raw: Any, where: str) -> SimProfile:
