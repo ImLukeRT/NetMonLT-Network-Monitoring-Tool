@@ -11,12 +11,26 @@ import uvicorn
 from netmonlt.api import create_app
 from netmonlt.inventory import InventoryError, load_inventory
 from netmonlt.probes import IcmpProber, ProbeError, SimulatedProber
+from netmonlt.snmp import SimulatedSnmpClient, SnmpClient, SnmpConfigError
 from netmonlt.storage import Database
 
 DEFAULT_INVENTORY = Path("config") / "devices.sim.yaml"
 DEFAULT_DB = Path("data") / "netmonlt.db"
 # Real and simulated history are kept in separate files so they can never be mixed up.
 DEFAULT_REAL_DB = Path("data") / "netmonlt-real.db"
+
+
+def _real_snmp_client(devices):
+    """Build the real SNMPv3 client, or explain what is missing. Imported lazily because it needs
+    the optional `snmp` dependencies, which a simulated or ICMP-only setup doesn't."""
+    try:
+        from netmonlt.snmp_pysnmp import PySnmpClient
+    except ImportError:
+        raise ImportError(
+            "SNMP polling needs the optional SNMP dependencies: install them with "
+            "'uv sync --extra snmp' or \"pip install 'netmonlt[snmp]'\""
+        ) from None
+    return PySnmpClient.from_devices(devices)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,17 +72,39 @@ def main(argv: list[str] | None = None) -> int:
         prober = SimulatedProber()
         db_path = args.db or DEFAULT_DB
 
+    snmp_client: SnmpClient | None = None
+    if inventory.snmp_devices:
+        if inventory.mode == "real":
+            try:
+                snmp_client = _real_snmp_client(inventory.snmp_devices)
+            except (ImportError, SnmpConfigError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+        else:
+            snmp_client = SimulatedSnmpClient()
+
     try:
         db = Database(db_path)
         db.sync_devices(inventory.devices)
     except (sqlite3.Error, OSError) as exc:
         print(f"error: cannot open database {db_path}: {exc}", file=sys.stderr)
         return 2
-    app = create_app(inventory, db, prober)
+    kwargs = {} if snmp_client is None else {"snmp_client": snmp_client}
+    app = create_app(inventory, db, prober, **kwargs)
     if inventory.mode == "real":
         print("REAL ICMP monitoring is ON. Probing only these configured targets:")
         for device in inventory.devices:
             print(f"  - {device.name} ({device.address})")
+    if snmp_client is not None:
+        if inventory.mode == "real":
+            print("REAL SNMPv3 interface polling is ON for these configured devices only:")
+            for device in inventory.snmp_devices:
+                cfg = device.snmp
+                print(f"  - {device.name} ({device.address}:{cfg.port}, {cfg.security_level}, "
+                      f"{cfg.auth_protocol}/{cfg.priv_protocol})")
+        else:
+            names = ", ".join(d.name for d in inventory.snmp_devices)
+            print(f"Simulated SNMP interface statistics for: {names}")
     print(f"NetMonLT ({inventory.mode} mode, {len(inventory.devices)} devices): "
           f"http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

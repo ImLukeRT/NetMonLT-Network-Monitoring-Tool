@@ -14,11 +14,19 @@ dependencies = [
 [project.scripts]
 netmonlt = "netmonlt.__main__:main"
 
+[project.optional-dependencies]
+snmp = [
+    "cryptography>=42",
+    "pysnmp>=7.1,<8",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",
     "httpx2>=2.0",
     "ruff>=0.6",
+    "pysnmp>=7.1,<8",
+    "cryptography>=42",
 ]
 
 [build-system]

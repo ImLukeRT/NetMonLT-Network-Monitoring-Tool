@@ -88,6 +88,22 @@
   .sw-up { background:var(--f-up); }
   .sw-gap { background:repeating-linear-gradient(45deg, var(--muted) 0 1.5px, transparent 1.5px 4px);
             border:1px solid var(--line); }
+  #if-panel[hidden] { display:none; }
+  .if-head { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:center; margin:28px 0 8px; }
+  .if-head h2 { margin:0; }
+  #if-note { font-size:13px; padding:6px 10px; border-radius:6px; margin:0 0 8px;
+             background:var(--down-bg); color:var(--down); }
+  #if-note:empty { display:none; }
+  .if-caption { color:var(--muted); font-size:12px; padding:8px 14px; }
+  tr.if-device td { background:var(--bg); font-weight:600; padding:8px 14px; white-space:normal; }
+  tr.if-device .badge { display:inline-block; margin:2px 0 2px 8px; font-weight:600;
+                        white-space:normal; }
+  tr.dim td:not(:first-child) { opacity:.55; }
+  tr.if-absent td { color:var(--muted); font-style:italic; }
+  td.na { color:var(--muted); cursor:help; }
+  td.ifname { white-space:normal; overflow-wrap:anywhere; max-width:260px; }
+  #if-wrap th { white-space:normal; }
+  #if-wrap th, #if-wrap td { padding-left:10px; padding-right:10px; }
 </style>
 </head>
 <body>
@@ -136,6 +152,26 @@
       <span>Strip: <i class="sw-up"></i>up <i class="sw-deg"></i>degraded <i class="sw-down"></i>down</span>
     </div>
   </div>
+  <section id="if-panel" hidden>
+    <div class="if-head">
+      <h2>Interfaces (SNMP)</h2>
+      <span id="if-badge" class="banner"></span>
+    </div>
+    <div id="if-note" role="status"></div>
+    <div class="wrap" id="if-wrap">
+      <table>
+        <thead><tr>
+          <th>Interface</th><th>Status</th><th>In</th><th>Out</th>
+          <th>Errors in / out</th><th>Discards in / out</th><th>Updated</th>
+        </tr></thead>
+        <tbody id="if-rows"></tbody>
+      </table>
+      <div class="if-caption">
+        Rates are averages over the last poll interval. Errors and discards are the increase since
+        the previous poll. A dash means the value is not known, and hovering it says why.
+      </div>
+    </div>
+  </section>
   <h2>Recent alerts</h2>
   <div class="wrap" id="alerts-wrap">
     <table>
@@ -566,6 +602,130 @@ window.addEventListener("resize", () => {
   requestAnimationFrame(() => { resizeQueued = false; if (chartData) drawChart(chartData); });
 });
 setInterval(refreshChart, 5000);
+
+// ---- interface statistics (SNMP) ----------------------------------------------------------
+// Values the server doesn't know are null and shown as a dash with the reason, never as 0.
+const ifPanel = document.getElementById("if-panel");
+const ifRows = document.getElementById("if-rows");
+const ifWrap = document.getElementById("if-wrap");
+const ifNote = document.getElementById("if-note");
+const ifBadge = document.getElementById("if-badge");
+const RATE_NOTES = {
+  first_sample: "A rate needs two polls; this is the first for this interface",
+  counter_reset: "The device's counters were reset (a restart, or cleared); rates resume at the next poll",
+  gap: "Too long since the previous poll to calculate a rate",
+  clock_step: "The clock did not move forward between polls, so no rate was calculated",
+  no_hc_counters: "This device does not provide 64-bit (high-capacity) octet counters",
+  absent: "The device no longer reports this interface",
+};
+
+function fmtBps(v) {
+  if (v === null || v === undefined) return "–";
+  if (v === 0) return "0 bps";
+  if (v < 1e3) return Math.round(v) + " bps";
+  if (v < 1e6) return (v / 1e3).toFixed(1) + " kbps";
+  if (v < 1e9) return (v / 1e6).toFixed(1) + " Mbps";
+  return (v / 1e9).toFixed(2) + " Gbps";
+}
+
+function pair(a, b) {
+  const f = (v) => (v === null || v === undefined ? "–" : String(v));
+  return f(a) + " / " + f(b);
+}
+
+function ifStatusClass(status) {
+  if (status === "up") return "up";
+  if (status === "down") return "down";
+  if (status === "absent") return "unknown";
+  return "degraded";   // testing, dormant, lowerLayerDown, notPresent, unknown...
+}
+
+function ifNumberCell(text, note) {
+  const td = cell(text, "num" + (text.startsWith("–") ? " na" : ""));
+  if (note && text.startsWith("–")) td.title = RATE_NOTES[note] || "Not known";
+  return td;
+}
+
+function renderInterfaces(data) {
+  ifPanel.hidden = data.devices.length === 0;
+  ifBadge.textContent = data.simulated ? "SIMULATED SNMP DATA" : "SNMPv3";
+  ifBadge.className = "banner" + (data.simulated ? "" : " live");
+  ifRows.replaceChildren();
+  for (const entry of data.devices) {
+    const snmp = entry.snmp;
+    const head = document.createElement("tr");
+    head.className = "if-device";
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    td.append(entry.device);
+    const badge = document.createElement("span");
+    const failed = snmp.status !== "ok" && snmp.status !== "pending";
+    badge.className = "badge " + (snmp.status === "pending" ? "unknown" : failed ? "down" : snmp.stale ? "stale" : "up");
+    badge.textContent = snmp.status === "pending" ? "waiting for first poll"
+      : failed ? "SNMP " + snmp.status.replace("_", " ") : snmp.stale ? "stale" : "SNMP ok";
+    td.appendChild(badge);
+    if (failed || snmp.stale) {
+      const why = document.createElement("span");
+      why.className = "badge unknown";
+      why.textContent = (failed && snmp.message ? snmp.message + "; " : "")
+        + (snmp.last_ok_age_s === null ? "no successful poll yet" : "last good data " + Math.round(snmp.last_ok_age_s) + "s ago");
+      why.style.fontWeight = "400";
+      td.appendChild(why);
+    }
+    if (snmp.truncated > 0) {
+      const extra = document.createElement("span");
+      extra.className = "badge unknown";
+      extra.textContent = snmp.truncated + " more interfaces not shown";
+      td.appendChild(extra);
+    }
+    head.appendChild(td);
+    ifRows.appendChild(head);
+
+    const dim = failed || snmp.stale;
+    for (const i of entry.interfaces) {
+      const tr = document.createElement("tr");
+      tr.className = (dim ? "dim " : "") + (i.present ? "" : "if-absent");
+      const statusCell = document.createElement("td");
+      const status = document.createElement("span");
+      status.className = "badge " + ifStatusClass(i.oper_status);
+      status.textContent = i.oper_status;
+      statusCell.appendChild(status);
+      const note = i.rate_note;
+      tr.append(cell(i.name, "ifname"), statusCell,
+                ifNumberCell(fmtBps(i.in_bps), note), ifNumberCell(fmtBps(i.out_bps), note),
+                ifNumberCell(pair(i.in_errors_delta, i.out_errors_delta), note),
+                ifNumberCell(pair(i.in_discards_delta, i.out_discards_delta), note),
+                cell(i.present ? Math.round(i.age_s) + "s ago" : "last seen " + Math.round(i.age_s) + "s ago", "num"));
+      ifRows.appendChild(tr);
+    }
+    if (entry.interfaces.length === 0 && snmp.status !== "pending") {
+      const tr = document.createElement("tr");
+      tr.appendChild(cell("No interface data yet."));
+      tr.firstChild.colSpan = 7;
+      tr.firstChild.className = "na";
+      ifRows.appendChild(tr);
+    }
+  }
+}
+
+let ifLoaded = false;
+async function refreshInterfaces() {
+  try {
+    renderInterfaces(await getJson("/api/interfaces"));
+    ifLoaded = true;
+    ifWrap.hidden = false;
+    ifNote.textContent = "";
+    ifWrap.classList.remove("offline");
+  } catch (err) {
+    ifNote.textContent = "Could not load interface statistics (" + err.message + ")."
+      + (ifLoaded ? " Showing the last data received, which is out of date." : "");
+    ifPanel.hidden = false;       // an error is always shown, even before the first success
+    ifWrap.hidden = !ifLoaded;    // but there is no table to show until something has loaded
+    if (ifLoaded) ifWrap.classList.add("offline");
+  }
+}
+refreshInterfaces();
+setInterval(refreshInterfaces, 5000);
 
 refresh();
 setInterval(refresh, 3000);

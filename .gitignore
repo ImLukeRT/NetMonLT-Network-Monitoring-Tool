@@ -11,4 +11,7 @@ dist/
 data/
 # Your own real-device inventory (private network addresses)
 config/devices.real.yaml
+# SNMPv3 credentials: never commit these
+config/snmp.env
+*.env
 .env

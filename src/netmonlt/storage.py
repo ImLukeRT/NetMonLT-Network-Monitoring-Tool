@@ -11,6 +11,7 @@ from pathlib import Path
 
 from netmonlt.alerts import Alert, AlertState
 from netmonlt.domain import CheckResult, Device, Status
+from netmonlt.ifstats import STATUS_OK, InterfaceState, SnmpStatus
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -49,7 +50,78 @@ CREATE TABLE IF NOT EXISTS alerts (
     message     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
+CREATE TABLE IF NOT EXISTS snmp_status (
+    device       TEXT PRIMARY KEY REFERENCES devices(name) ON DELETE CASCADE,
+    ts           REAL NOT NULL,
+    status       TEXT NOT NULL,
+    message      TEXT,
+    last_ok_ts   REAL,
+    uptime_ticks INTEGER,
+    truncated    INTEGER NOT NULL DEFAULT 0
+);
+-- Raw counters are TEXT because SQLite integers are signed 64-bit and a Counter64 can exceed that.
+CREATE TABLE IF NOT EXISTS interface_state (
+    device             TEXT NOT NULL REFERENCES devices(name) ON DELETE CASCADE,
+    if_index           INTEGER NOT NULL,
+    name               TEXT NOT NULL,
+    oper_status        TEXT NOT NULL,
+    present            INTEGER NOT NULL,
+    ts                 REAL NOT NULL,
+    in_octets          TEXT,
+    out_octets         TEXT,
+    in_errors          TEXT,
+    out_errors         TEXT,
+    in_discards        TEXT,
+    out_discards       TEXT,
+    interval_s         REAL,
+    in_bps             REAL,
+    out_bps            REAL,
+    in_errors_delta    INTEGER,
+    out_errors_delta   INTEGER,
+    in_discards_delta  INTEGER,
+    out_discards_delta INTEGER,
+    rate_note          TEXT,
+    PRIMARY KEY (device, if_index)
+);
 """
+
+_STATE_COLUMNS = (
+    "if_index, name, oper_status, present, ts, in_octets, out_octets, in_errors, out_errors, "
+    "in_discards, out_discards, interval_s, in_bps, out_bps, in_errors_delta, out_errors_delta, "
+    "in_discards_delta, out_discards_delta, rate_note"
+)
+
+
+def _text(value: int | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _int(value: str | int | None) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None  # a damaged value is treated as unknown, never guessed
+
+
+def _state_from_row(row: sqlite3.Row) -> InterfaceState:
+    return InterfaceState(
+        if_index=row["if_index"], name=row["name"], oper_status=row["oper_status"],
+        present=bool(row["present"]), ts=row["ts"],
+        in_octets=_int(row["in_octets"]), out_octets=_int(row["out_octets"]),
+        in_errors=_int(row["in_errors"]), out_errors=_int(row["out_errors"]),
+        in_discards=_int(row["in_discards"]), out_discards=_int(row["out_discards"]),
+        interval_s=row["interval_s"], in_bps=row["in_bps"], out_bps=row["out_bps"],
+        in_errors_delta=row["in_errors_delta"], out_errors_delta=row["out_errors_delta"],
+        in_discards_delta=row["in_discards_delta"], out_discards_delta=row["out_discards_delta"],
+        rate_note=row["rate_note"],
+    )
+
+
+def _status_from_row(row: sqlite3.Row) -> SnmpStatus:
+    return SnmpStatus(
+        ts=row["ts"], status=row["status"], message=row["message"], last_ok_ts=row["last_ok_ts"],
+        uptime_ticks=row["uptime_ticks"], truncated=row["truncated"],
+    )
 
 _LATEST = """
 SELECT d.name, d.address, d.type,
@@ -196,6 +268,92 @@ class Database:
                 "points": points, "gaps": gaps, "checks": count, "bucket_s": bucket_s,
                 "first_check_ts": first_ts, "last_check_ts": last_ts,
             }
+
+    # ---- SNMP interface statistics
+    def get_snmp_status(self, device: str) -> SnmpStatus | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM snmp_status WHERE device=?", (device,)
+            ).fetchone()
+        return None if row is None else _status_from_row(row)
+
+    def get_interface_states(self, device: str) -> dict[int, InterfaceState]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_STATE_COLUMNS} FROM interface_state WHERE device=?", (device,)
+            ).fetchall()
+        return {row["if_index"]: _state_from_row(row) for row in rows}
+
+    def save_snmp_success(
+        self,
+        device: str,
+        ts: float,
+        uptime_ticks: int | None,
+        truncated: int,
+        states: list[InterfaceState],
+    ) -> None:
+        """Record a successful poll: the new state of every interface, and the device status."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO snmp_status(device, ts, status, message, last_ok_ts, uptime_ticks, "
+                "truncated) VALUES (?, ?, ?, NULL, ?, ?, ?) "
+                "ON CONFLICT(device) DO UPDATE SET ts=excluded.ts, status=excluded.status, "
+                "message=NULL, last_ok_ts=excluded.last_ok_ts, "
+                "uptime_ticks=excluded.uptime_ticks, truncated=excluded.truncated",
+                (device, ts, STATUS_OK, ts, uptime_ticks, truncated),
+            )
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO interface_state(device, " + _STATE_COLUMNS + ") "
+                "VALUES (?, " + ", ".join("?" * 19) + ")",
+                [
+                    (
+                        device, s.if_index, s.name, s.oper_status, int(s.present), s.ts,
+                        _text(s.in_octets), _text(s.out_octets), _text(s.in_errors),
+                        _text(s.out_errors), _text(s.in_discards), _text(s.out_discards),
+                        s.interval_s, s.in_bps, s.out_bps, s.in_errors_delta, s.out_errors_delta,
+                        s.in_discards_delta, s.out_discards_delta, s.rate_note,
+                    )
+                    for s in states
+                ],
+            )
+
+    def save_snmp_failure(self, device: str, ts: float, category: str, message: str) -> None:
+        """Record a failed poll. Interface data is left exactly as it was (it is now stale)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO snmp_status(device, ts, status, message) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(device) DO UPDATE SET ts=excluded.ts, status=excluded.status, "
+                "message=excluded.message",
+                (device, ts, category, message),
+            )
+
+    def interface_overview(
+        self, device: str | None = None
+    ) -> list[tuple[str, SnmpStatus, list[InterfaceState]]]:
+        """(device, SNMP status, interfaces) for every device that has been polled."""
+        with self._lock:
+            sql, args = "SELECT * FROM snmp_status", ()
+            if device is not None:
+                sql, args = sql + " WHERE device=?", (device,)
+            statuses = self._conn.execute(sql + " ORDER BY device", args).fetchall()
+            result = []
+            for status_row in statuses:
+                rows = self._conn.execute(
+                    f"SELECT {_STATE_COLUMNS} FROM interface_state WHERE device=? "
+                    "ORDER BY if_index", (status_row["device"],),
+                ).fetchall()
+                result.append(
+                    (status_row["device"], _status_from_row(status_row),
+                     [_state_from_row(r) for r in rows])
+                )
+        return result
+
+    def prune_absent_interfaces(self, older_than: float) -> int:
+        """Forget interfaces that stopped being reported before `older_than`; returns the count."""
+        with self._lock, self._conn:
+            return self._conn.execute(
+                "DELETE FROM interface_state WHERE present=0 AND ts < ?", (older_than,)
+            ).rowcount
 
     def get_alert_state(self, device: str) -> AlertState | None:
         """The stored alerting state for a device, or None if it has never been checked."""

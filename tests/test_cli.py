@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from helpers import REPO_ROOT
@@ -85,7 +87,7 @@ class FakePinger:
 def app_capture(monkeypatch):
     captured = []
     monkeypatch.setattr(
-        "netmonlt.__main__.create_app", lambda inv, db, prober: captured.append(prober)
+        "netmonlt.__main__.create_app", lambda inv, db, prober, **kw: captured.append(prober)
     )
     FakePinger.instances, FakePinger.fail_with = [], None
     monkeypatch.setattr("netmonlt.__main__.IcmpProber", FakePinger)
@@ -127,3 +129,107 @@ def test_simulated_mode_never_touches_icmp(tmp_path, served, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert main(["--inventory", SHIPPED_INVENTORY]) == 0
     assert (tmp_path / "data" / "netmonlt.db").exists()
+
+
+# ------------------------------------------------------------------ SNMP wiring
+def write_inventory(tmp_path, text):
+    path = tmp_path / "inv.yaml"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+SIM_SNMP = """\
+mode: simulated
+snmp_poll_interval_s: 5
+devices:
+  - name: sw1
+    address: 192.0.2.1
+    sim: {interfaces: [{name: Gi0/1, in_mbps: 5}]}
+  - name: plain
+    address: 192.0.2.2
+"""
+REAL_SNMP = """\
+mode: real
+poll_interval_s: 10
+devices:
+  - name: r1
+    address: 127.0.0.1
+    authorized: true
+    snmp: {enabled: true, credentials_env: NETMONLT_SNMP_R1, port: 1161}
+"""
+SECRET = "SECRET-sentinel-value-9f3a"
+
+
+def test_simulated_interfaces_start_a_simulated_snmp_client(tmp_path, served, monkeypatch, capsys):
+    captured = {}
+    monkeypatch.setattr(
+        "netmonlt.__main__.create_app",
+        lambda inv, db, prober, **kw: captured.update(kw) or object(),
+    )
+    rc = main(["--inventory", write_inventory(tmp_path, SIM_SNMP), "--db", str(tmp_path / "x.db")])
+    assert rc == 0
+    assert type(captured["snmp_client"]).__name__ == "SimulatedSnmpClient"
+    assert "Simulated SNMP interface statistics for: sw1" in capsys.readouterr().out
+
+
+def test_no_snmp_client_is_created_when_no_device_uses_snmp(tmp_path, served, app_capture):
+    inventory = write_inventory(tmp_path, "devices:\n  - {name: a, address: x}\n")
+    assert main(["--inventory", inventory, "--db", str(tmp_path / "x.db")]) == 0
+
+
+def test_real_snmp_with_missing_credentials_stops_and_names_only_the_variables(
+    tmp_path, served, app_capture, monkeypatch, capsys
+):
+    pytest.importorskip("pysnmp")  # without the optional extra the dependency error comes first
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETMONLT_SNMP_R1_USER", "monitor")
+    monkeypatch.delenv("NETMONLT_SNMP_R1_AUTH_KEY", raising=False)
+    monkeypatch.delenv("NETMONLT_SNMP_R1_PRIV_KEY", raising=False)
+    rc = main(["--inventory", write_inventory(tmp_path, REAL_SNMP)])
+    err = capsys.readouterr().err
+    assert rc == 2 and not served and not app_capture
+    assert "NETMONLT_SNMP_R1_AUTH_KEY" in err and "NETMONLT_SNMP_R1_PRIV_KEY" in err
+    assert "monitor" not in err
+    assert not (tmp_path / "data").exists()  # nothing was created
+
+
+def test_real_snmp_without_the_optional_dependencies_explains_how_to_install_them(
+    tmp_path, served, app_capture, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(sys.modules, "netmonlt.snmp_pysnmp", None)  # makes the import fail
+    rc = main(["--inventory", write_inventory(tmp_path, REAL_SNMP)])
+    err = capsys.readouterr().err
+    assert rc == 2 and not served
+    assert "uv sync --extra snmp" in err and "netmonlt[snmp]" in err
+
+
+def test_real_snmp_starts_with_credentials_and_never_prints_them(
+    tmp_path, served, monkeypatch, capsys
+):
+    pytest.importorskip("pysnmp")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETMONLT_SNMP_R1_USER", SECRET + "-user")
+    monkeypatch.setenv("NETMONLT_SNMP_R1_AUTH_KEY", SECRET + "-auth")
+    monkeypatch.setenv("NETMONLT_SNMP_R1_PRIV_KEY", SECRET + "-priv")
+    captured = {}
+    monkeypatch.setattr(
+        "netmonlt.__main__.create_app",
+        lambda inv, db, prober, **kw: captured.update(kw) or object(),
+    )
+    monkeypatch.setattr("netmonlt.__main__.IcmpProber", FakePinger)
+    FakePinger.instances, FakePinger.fail_with = [], None
+    assert main(["--inventory", write_inventory(tmp_path, REAL_SNMP)]) == 0
+    out = capsys.readouterr()
+    assert "REAL SNMPv3 interface polling is ON" in out.out
+    assert "r1 (127.0.0.1:1161, authPriv, SHA256/AES128)" in out.out
+    assert SECRET not in out.out and SECRET not in out.err
+    assert "snmp_client" in captured and SECRET not in repr(captured["snmp_client"])
+
+
+def test_real_mode_without_snmp_enabled_never_loads_the_snmp_library(
+    tmp_path, served, app_capture, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(sys.modules, "netmonlt.snmp_pysnmp", None)  # would fail if it were imported
+    assert main(["--inventory", REAL_EXAMPLE]) == 0

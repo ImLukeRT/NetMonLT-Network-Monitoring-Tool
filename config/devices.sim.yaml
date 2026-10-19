@@ -3,23 +3,52 @@
 # so they can never refer to a real host.
 mode: simulated
 poll_interval_s: 5
+# How often the simulated SNMP interface counters are read (real devices: minimum 10).
+snmp_poll_interval_s: 10
 
 devices:
   - name: core-router
     address: 192.0.2.1
     type: router
-    sim: {rtt_ms: 2, jitter_ms: 0.5}
+    sim:
+      rtt_ms: 2
+      jitter_ms: 0.5
+      # Simulated SNMP interface statistics (IF-MIB). Traffic is the average rate in Mbit/s.
+      interfaces:
+        # The uplink's 64-bit octet counters roll over 75s after start: the rate stays correct.
+        - {name: Gi0/1, in_mbps: 180, out_mbps: 60, wrap_at_s: 75}
+        - {name: Gi0/2, in_mbps: 25, out_mbps: 8}
+        - {name: Gi0/3, status: down}
+        # A noisy port: errors and discards accumulate.
+        - {name: Gi0/4, in_mbps: 2, out_mbps: 1, in_errors_per_min: 6, in_discards_per_min: 2}
 
   - name: edge-firewall
     address: 192.0.2.2
     type: firewall
-    sim: {rtt_ms: 4, jitter_ms: 1}
+    sim:
+      rtt_ms: 4
+      jitter_ms: 1
+      # The firewall "restarts" 130s after start: its counters and uptime reset, so no rate is
+      # shown for one poll instead of a made-up (negative) one. vpn0 vanishes at 100s.
+      reboot_at_s: 130
+      interfaces:
+        - {name: wan0, in_mbps: 50, out_mbps: 12}
+        - {name: lan0, in_mbps: 30, out_mbps: 40}
+        - {name: vpn0, in_mbps: 5, out_mbps: 5, disappears_at_s: 100}
 
   - name: access-switch
     address: 192.0.2.10
     type: switch
-    # Goes down 30s after startup for 30s, then recovers.
-    sim: {rtt_ms: 3, jitter_ms: 0.5, outage_start_s: 30, outage_duration_s: 30}
+    # Goes down 30s after startup for 30s, then recovers. SNMP times out during the outage too.
+    sim:
+      rtt_ms: 3
+      jitter_ms: 0.5
+      outage_start_s: 30
+      outage_duration_s: 30
+      interfaces:
+        - {name: Fa0/1, in_mbps: 40, out_mbps: 12}
+        - {name: Fa0/2, in_mbps: 10, out_mbps: 30}
+        - {name: Fa0/24, in_mbps: 90, out_mbps: 70}
 
   - name: wifi-ap
     address: 192.0.2.20

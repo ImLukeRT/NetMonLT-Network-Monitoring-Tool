@@ -15,6 +15,8 @@ from netmonlt.collector import run_forever
 from netmonlt.collector import stale_after_s as compute_stale_after_s
 from netmonlt.inventory import Inventory
 from netmonlt.probes.base import Prober
+from netmonlt.snmp import SnmpClient
+from netmonlt.snmp_poller import run_snmp_forever, snmp_stale_after_s
 from netmonlt.storage import Database
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -27,22 +29,33 @@ def create_app(
     *,
     start_collector: bool = True,
     clock: Callable[[], float] = time.time,
+    snmp_client: SnmpClient | None = None,
 ) -> FastAPI:
-    """Build the app. Tests pass start_collector=False to control polling themselves."""
+    """Build the app. Tests pass start_collector=False to control polling themselves.
+
+    `snmp_client` (optional) polls interface statistics for `inventory.snmp_devices` in a
+    separate task, so SNMP problems can't affect the ICMP collector or anything it feeds.
+    """
     stale_after_s = compute_stale_after_s(inventory.poll_interval_s)
+    snmp_stale_s = snmp_stale_after_s(inventory.snmp_poll_interval_s)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
-        task = None
+        tasks = []
         if start_collector:
-            task = asyncio.create_task(
+            tasks.append(asyncio.create_task(
                 run_forever(inventory.devices, prober, db, inventory.poll_interval_s)
-            )
+            ))
+            if snmp_client is not None and inventory.snmp_devices:
+                tasks.append(asyncio.create_task(run_snmp_forever(
+                    inventory.snmp_devices, snmp_client, db, inventory.snmp_poll_interval_s
+                )))
         try:
             yield
         finally:
-            if task:
+            for task in tasks:
                 task.cancel()
+            for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
@@ -112,6 +125,53 @@ def create_app(
             "checks": series["checks"],
             "points": series["points"],
             "gaps": series["gaps"],
+        }
+
+    @app.get("/api/interfaces")
+    def list_interfaces(device: str | None = Query(None, max_length=64)):
+        """Latest SNMP interface statistics per device (read-only). Rates are bits per second and
+        error/discard figures are the increase over `interval_s`; both are null when unknown."""
+        if device is not None and device not in {d.name for d in inventory.devices}:
+            raise HTTPException(status_code=404, detail=f"unknown device {device!r}")
+        now = clock()
+        polled = {name: (status, states) for name, status, states in db.interface_overview(device)}
+        entries = []
+        for dev in inventory.snmp_devices:
+            if device is not None and dev.name != device:
+                continue
+            status, states = polled.get(dev.name, (None, []))
+            last_ok = None if status is None else status.last_ok_ts
+            entries.append({
+                "device": dev.name,
+                "snmp": {
+                    "status": "pending" if status is None else status.status,
+                    "message": None if status is None else status.message,
+                    "last_poll_age_s": None if status is None else max(0.0, now - status.ts),
+                    "last_ok_age_s": None if last_ok is None else max(0.0, now - last_ok),
+                    "stale": last_ok is not None and now - last_ok > snmp_stale_s,
+                    "truncated": 0 if status is None else status.truncated,
+                },
+                "interfaces": [
+                    {
+                        "if_index": s.if_index, "name": s.name, "oper_status": s.oper_status,
+                        "present": s.present, "age_s": max(0.0, now - s.ts),
+                        "interval_s": s.interval_s, "in_bps": s.in_bps, "out_bps": s.out_bps,
+                        "in_errors_delta": s.in_errors_delta,
+                        "out_errors_delta": s.out_errors_delta,
+                        "in_discards_delta": s.in_discards_delta,
+                        "out_discards_delta": s.out_discards_delta,
+                        "rate_note": s.rate_note,
+                    }
+                    for s in states
+                ],
+            })
+        return {
+            "mode": inventory.mode,
+            "simulated": inventory.mode == "simulated",
+            "server_time": now,
+            "poll_interval_s": inventory.snmp_poll_interval_s,
+            "stale_after_s": snmp_stale_s,
+            "devices": entries,
         }
 
     @app.get("/api/alerts")

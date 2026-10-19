@@ -12,16 +12,45 @@ from typing import Any
 
 import yaml
 
-from netmonlt.domain import Device, SimProfile
+from netmonlt.domain import (
+    SNMP_AUTH_PROTOCOLS,
+    SNMP_PRIV_PROTOCOLS,
+    SNMP_SECURITY_LEVELS,
+    Device,
+    SimInterface,
+    SimProfile,
+    SnmpConfig,
+)
 from netmonlt.probes.icmp import TargetError, validate_target
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # used in URLs, so keep it URL-safe
-_TOP_KEYS = {"mode", "poll_interval_s", "devices"}
-_DEVICE_KEYS = {"name", "address", "type", "sim", "authorized"}
+_TOP_KEYS = {"mode", "poll_interval_s", "snmp_poll_interval_s", "devices"}
+_DEVICE_KEYS = {"name", "address", "type", "sim", "authorized", "snmp"}
 _MODES = ("simulated", "real")
 # Real probing sends traffic to someone's equipment, so don't allow hammering it.
 REAL_MIN_INTERVAL_S = 5.0
-_SIM_KEYS = {"rtt_ms", "jitter_ms", "loss", "outage_start_s", "outage_duration_s"}
+_SIM_KEYS = {
+    "rtt_ms", "jitter_ms", "loss", "outage_start_s", "outage_duration_s", "interfaces",
+    "reboot_at_s",
+}
+_SIM_IF_KEYS = {
+    "name", "in_mbps", "out_mbps", "status", "in_errors_per_min", "out_errors_per_min",
+    "in_discards_per_min", "out_discards_per_min", "wrap_at_s", "disappears_at_s",
+}
+_SNMP_KEYS = {
+    "enabled", "credentials_env", "security_level", "auth_protocol", "priv_protocol", "port",
+    "timeout_s", "retries",
+}
+# Keys that would put a secret or a weaker protocol version into the inventory file.
+_SNMP_SECRET_KEYS = {
+    "community", "version", "user", "username", "password", "auth_key", "priv_key",
+    "auth_password", "priv_password", "passphrase", "key",
+}
+_IF_NAME_RE = re.compile(r"^[A-Za-z0-9/._:-]{1,64}$")
+_ENV_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,59}$")
+MAX_SIM_INTERFACES = 64
+# SNMP asks a device for many values per poll, so real polling is kept gentle.
+REAL_MIN_SNMP_INTERVAL_S = 10.0
 
 
 class InventoryError(ValueError):
@@ -58,6 +87,15 @@ class Inventory:
     mode: str
     poll_interval_s: float
     devices: tuple[Device, ...]
+    snmp_poll_interval_s: float = 30.0
+
+    @property
+    def snmp_devices(self) -> tuple[Device, ...]:
+        """Devices whose interfaces are polled: simulated ones with sim.interfaces in simulated
+        mode, and only devices that explicitly enable `snmp` in real mode."""
+        if self.mode == "real":
+            return tuple(d for d in self.devices if d.snmp is not None)
+        return tuple(d for d in self.devices if d.sim.interfaces)
 
 
 def load_inventory(path: str | Path) -> Inventory:
@@ -86,6 +124,11 @@ def parse_inventory(raw: Any) -> Inventory:
     minimum = REAL_MIN_INTERVAL_S if mode == "real" else 0.1
     interval = _number(raw.get("poll_interval_s", 5), "poll_interval_s", minimum=minimum)
 
+    snmp_minimum = REAL_MIN_SNMP_INTERVAL_S if mode == "real" else 1.0
+    snmp_interval = _number(
+        raw.get("snmp_poll_interval_s", 30), "snmp_poll_interval_s", minimum=snmp_minimum
+    )
+
     raw_devices = raw.get("devices")
     if not isinstance(raw_devices, list) or not raw_devices:
         raise InventoryError("'devices' must be a non-empty list")
@@ -98,7 +141,12 @@ def parse_inventory(raw: Any) -> Inventory:
             raise InventoryError(f"duplicate device name {device.name!r}")
         seen.add(device.name)
         devices.append(device)
-    return Inventory(mode=mode, poll_interval_s=interval, devices=tuple(devices))
+    return Inventory(
+        mode=mode,
+        poll_interval_s=interval,
+        devices=tuple(devices),
+        snmp_poll_interval_s=snmp_interval,
+    )
 
 
 def _parse_device(entry: Any, index: int, mode: str) -> Device:
@@ -137,7 +185,11 @@ def _parse_device(entry: Any, index: int, mode: str) -> Device:
             raise InventoryError(f"{where}: address {address!r}: {exc}") from None
 
     sim = _parse_sim(entry.get("sim"), where)  # validated in both modes, used only when simulated
-    return Device(name=name, address=address, type=dev_type, sim=sim, authorized=authorized)
+    # Validated in both modes, but only ever used to poll a real device in real mode.
+    snmp = _parse_snmp(entry.get("snmp"), where)
+    return Device(
+        name=name, address=address, type=dev_type, sim=sim, authorized=authorized, snmp=snmp
+    )
 
 
 def _parse_sim(raw: Any, where: str) -> SimProfile:
@@ -155,12 +207,125 @@ def _parse_sim(raw: Any, where: str) -> SimProfile:
     elif duration:
         raise InventoryError(f"{where}.sim: outage_duration_s needs outage_start_s")
 
+    reboot = raw.get("reboot_at_s")
+    if reboot is not None:
+        reboot = _number(reboot, f"{where}.sim.reboot_at_s", minimum=0)
+
     return SimProfile(
         rtt_ms=_number(raw.get("rtt_ms", 10), f"{where}.sim.rtt_ms", minimum=0.1),
         jitter_ms=_number(raw.get("jitter_ms", 1), f"{where}.sim.jitter_ms", minimum=0),
         loss=_number(raw.get("loss", 0), f"{where}.sim.loss", minimum=0, maximum=1),
         outage_start_s=start,
         outage_duration_s=float(duration or 0),
+        interfaces=_parse_sim_interfaces(raw.get("interfaces"), where),
+        reboot_at_s=reboot,
+    )
+
+
+def _parse_sim_interfaces(raw: Any, where: str) -> tuple[SimInterface, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise InventoryError(f"{where}.sim.interfaces must be a list")
+    if len(raw) > MAX_SIM_INTERFACES:
+        raise InventoryError(f"{where}.sim.interfaces: at most {MAX_SIM_INTERFACES} interfaces")
+    interfaces: list[SimInterface] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw):
+        label = f"{where}.sim.interfaces[{index}]"
+        if not isinstance(entry, dict):
+            raise InventoryError(f"{label} must be a mapping")
+        _reject_unknown(entry, _SIM_IF_KEYS, label)
+        name = entry.get("name")
+        if not isinstance(name, str) or not _IF_NAME_RE.fullmatch(name):
+            raise InventoryError(f"{label}.name must be 1-64 chars of letters, digits, / . _ : -")
+        if name in seen:
+            raise InventoryError(f"{where}.sim.interfaces: duplicate interface name {name!r}")
+        seen.add(name)
+        status = entry.get("status", "up")
+        if status not in ("up", "down"):
+            raise InventoryError(f"{label}.status must be 'up' or 'down'")
+
+        def number(key: str, label=label, entry=entry) -> float:
+            return _number(entry.get(key, 0), f"{label}.{key}", minimum=0)
+
+        def optional(key: str, label=label, entry=entry) -> float | None:
+            value = entry.get(key)
+            return None if value is None else _number(value, f"{label}.{key}", minimum=0)
+
+        interfaces.append(SimInterface(
+            name=name,
+            in_mbps=number("in_mbps"),
+            out_mbps=number("out_mbps"),
+            status=status,
+            in_errors_per_min=number("in_errors_per_min"),
+            out_errors_per_min=number("out_errors_per_min"),
+            in_discards_per_min=number("in_discards_per_min"),
+            out_discards_per_min=number("out_discards_per_min"),
+            wrap_at_s=optional("wrap_at_s"),
+            disappears_at_s=optional("disappears_at_s"),
+        ))
+    return tuple(interfaces)
+
+
+def _parse_snmp(raw: Any, where: str) -> SnmpConfig | None:
+    """Parse a device's `snmp` block. Returns None unless SNMP is explicitly enabled."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise InventoryError(f"{where}: 'snmp' must be a mapping")
+    secret_keys = sorted(set(raw) & _SNMP_SECRET_KEYS)
+    if secret_keys:
+        raise InventoryError(
+            f"{where}.snmp: {', '.join(secret_keys)} must not appear in the inventory. Only "
+            "SNMPv3 is supported, and its user name and keys come from environment variables "
+            "named by 'credentials_env' (<NAME>_USER, <NAME>_AUTH_KEY, <NAME>_PRIV_KEY)"
+        )
+    _reject_unknown(raw, _SNMP_KEYS, f"{where}.snmp")
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise InventoryError(f"{where}.snmp.enabled must be true or false")
+    level = raw.get("security_level", "authPriv")
+    if level not in SNMP_SECURITY_LEVELS:
+        raise InventoryError(
+            f"{where}.snmp.security_level must be one of {', '.join(SNMP_SECURITY_LEVELS)} "
+            "(noAuthNoPriv is not supported)"
+        )
+    auth = raw.get("auth_protocol", "SHA256")
+    if auth not in SNMP_AUTH_PROTOCOLS:
+        raise InventoryError(
+            f"{where}.snmp.auth_protocol must be one of {', '.join(SNMP_AUTH_PROTOCOLS)} "
+            "(MD5 is not supported because it is weak)"
+        )
+    priv = raw.get("priv_protocol", "AES128")
+    if priv not in SNMP_PRIV_PROTOCOLS:
+        raise InventoryError(
+            f"{where}.snmp.priv_protocol must be one of {', '.join(SNMP_PRIV_PROTOCOLS)} "
+            "(DES is not supported because it is weak)"
+        )
+    port = _number(raw.get("port", 161), f"{where}.snmp.port", minimum=1, maximum=65535)
+    timeout = _number(raw.get("timeout_s", 5), f"{where}.snmp.timeout_s", minimum=1, maximum=30)
+    retries = _number(raw.get("retries", 1), f"{where}.snmp.retries", minimum=0, maximum=3)
+    if int(port) != port or int(retries) != retries:
+        raise InventoryError(f"{where}.snmp: port and retries must be whole numbers")
+
+    if not enabled:
+        return None  # an `snmp` block alone never turns polling on
+    prefix = raw.get("credentials_env")
+    if not isinstance(prefix, str) or not _ENV_PREFIX_RE.fullmatch(prefix):
+        raise InventoryError(
+            f"{where}.snmp.credentials_env must name the environment-variable prefix that "
+            "holds the credentials, e.g. NETMONLT_SNMP_ROUTER (capital letters, digits, _)"
+        )
+    return SnmpConfig(
+        credentials_env=prefix,
+        security_level=level,
+        auth_protocol=auth,
+        priv_protocol=priv,
+        port=int(port),
+        timeout_s=timeout,
+        retries=int(retries),
     )
 
 

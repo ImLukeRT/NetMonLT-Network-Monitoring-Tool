@@ -6,11 +6,15 @@
 #     permitted to monitor;
 #   * each address is ONE IPv4 address or hostname: ranges, CIDR blocks and wildcards are
 #     rejected, and nothing is ever scanned or discovered;
-#   * `sim:` settings are ignored in real mode.
+#   * `sim:` settings are ignored in real mode;
+#   * SNMP interface polling is OFF unless a device has `snmp: {enabled: true, ...}` (see the
+#     commented example below). It is SNMPv3 only, and the user name and keys are NEVER written
+#     here: they come from environment variables named by `credentials_env`.
 #
 # To monitor your own devices, copy this file to config/devices.real.yaml (git-ignored).
 mode: real
 poll_interval_s: 10      # minimum 5 in real mode
+# snmp_poll_interval_s: 30   # how often interfaces are polled; default 30, minimum 10
 
 devices:
   # Your own computer over the loopback interface: always safe to try.
@@ -24,3 +28,18 @@ devices:
   #   address: 192.168.1.1
   #   type: router
   #   authorized: true
+
+  # The same device with SNMPv3 interface polling switched on. Before starting, set
+  #   NETMONLT_SNMP_HOME_ROUTER_USER, NETMONLT_SNMP_HOME_ROUTER_AUTH_KEY and
+  #   NETMONLT_SNMP_HOME_ROUTER_PRIV_KEY   (see config/snmp.env.example and the README).
+  # - name: home-router
+  #   address: 192.168.1.1
+  #   type: router
+  #   authorized: true
+  #   snmp:
+  #     enabled: true                          # off unless you say so
+  #     credentials_env: NETMONLT_SNMP_HOME_ROUTER   # prefix of the three variables above
+  #     security_level: authPriv               # authPriv (default) or authNoPriv
+  #     auth_protocol: SHA256                  # SHA, SHA224, SHA256, SHA384 or SHA512
+  #     priv_protocol: AES128                  # AES128, AES192 or AES256
+  #     port: 161
