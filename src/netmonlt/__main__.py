@@ -38,6 +38,12 @@ def main(argv: list[str] | None = None) -> int:
         inventory = load_inventory(args.inventory)
     except InventoryError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        if not args.inventory.exists():
+            print(
+                f"hint: looked for {args.inventory.resolve()}. Run netmonlt from the repository "
+                "root (where the config/ folder is), or pass --inventory PATH.",
+                file=sys.stderr,
+            )
         return 2
 
     if inventory.mode == "real":

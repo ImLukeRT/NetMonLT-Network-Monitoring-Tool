@@ -27,9 +27,19 @@ def test_main_syncs_inventory_and_starts_server(tmp_path, served):
 
 
 def test_missing_inventory_is_a_clean_error(tmp_path, served, capsys):
-    rc = main(["--inventory", str(tmp_path / "nope.yaml"), "--db", str(tmp_path / "x.db")])
+    missing = tmp_path / "nope.yaml"
+    rc = main(["--inventory", str(missing), "--db", str(tmp_path / "x.db")])
+    err = capsys.readouterr().err
     assert rc == 2 and not served
-    assert "not found" in capsys.readouterr().err
+    assert "not found" in err
+    assert "hint:" in err and str(missing) in err and "--inventory" in err  # says where it looked
+
+
+def test_a_broken_inventory_that_exists_gets_no_location_hint(tmp_path, served, capsys):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("devices: []\n", encoding="utf-8")
+    assert main(["--inventory", str(bad), "--db", str(tmp_path / "x.db")]) == 2
+    assert "hint:" not in capsys.readouterr().err
 
 
 def test_invalid_inventory_is_a_clean_error(tmp_path, served, capsys):
