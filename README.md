@@ -8,8 +8,8 @@ dashboard. It has two modes:
   with no networking equipment, no network access and no special permissions.
 - **Real ICMP (opt-in):** pings devices you list explicitly and are authorised to monitor.
 
-> Status: early MVP. ICMP reachability and latency, with state-change alerts. SNMP and charts
-> are not built yet (see [Roadmap](#roadmap)).
+> Status: early MVP. ICMP reachability and latency, state-change alerts and latency history
+> charts. SNMP is not built yet (see [Roadmap](#roadmap)).
 
 ## Quick start (simulated demo)
 
@@ -164,7 +164,7 @@ devices.yaml ─► Inventory ─► Collector ─► Prober (interface) ─┬�
                                  ▼            │
                               SQLite ◄────────┘
                                  ▲
-                              FastAPI ◄── dashboard (polls /api/devices and /api/alerts)
+                              FastAPI ◄── dashboard (polls /api/devices, /api/alerts, /api/devices/{name}/latency)
 ```
 
 - **Prober** is the only thing that measures a device. The collector, storage and API
@@ -180,8 +180,8 @@ devices.yaml ─► Inventory ─► Collector ─► Prober (interface) ─┬�
   too old as `stale`, using the server's clock.
 
 API: `GET /api/devices`, `GET /api/devices/{name}/history?limit=N`,
-`GET /api/alerts?limit=N`, `GET /healthz`, interactive docs at `/docs`. All endpoints are
-read-only.
+`GET /api/devices/{name}/latency?window_s=N`, `GET /api/alerts?limit=N`, `GET /healthz`,
+interactive docs at `/docs`. All endpoints are read-only.
 
 ## Alerts
 
@@ -229,6 +229,60 @@ before alerting existed are upgraded automatically.
 Not included: notifications (email, SMS, webhooks), acknowledgement, per-device rules, custom
 thresholds or alert pruning.
 
+## Latency history chart
+
+Under **Latency history** the dashboard plots a device's latency over time, from the checks
+already stored in SQLite. Pick the device and a window (15 min, 1 h, 6 h, 24 h or 7 d; the
+default is 15 minutes). The chart refreshes every 5 s, and hovering shows the exact time,
+latency, loss and status of the nearest measurement.
+
+It keeps three situations apart, because they mean different things:
+
+| What you see | What it means |
+|---|---|
+| A **blue line** with a pale min-to-max band | The device replied. The line is the average latency; a reply of 0 ms sits on the 0 baseline with a marker. |
+| A **red zone**, a break in the line, and red cells in the strip below | The device was checked and **did not reply** (down). It is never drawn as 0 ms. |
+| A **grey hatched zone** | **No measurements at all** (no-data): the app was stopped, or probes kept failing. This says nothing about the device, and is not the same as down. |
+
+The strip under the plot shows each measurement's status (green up, amber degraded, red down).
+A gap is shown when two checks are more than 3 poll intervals + 10 s apart (the same
+"stale" limit used elsewhere).
+
+Sensible defaults and edge cases:
+
+- **Short history:** if the device has been monitored for less than the window, the chart shows
+  just that history so it fills the width, and the summary says so.
+- **No history:** a device with no checks yet shows "No measurements yet" instead of an empty
+  chart. A device that is **stale** (no recent checks) shows a warning and a hatched region up
+  to now.
+- **Sparse data:** a single measurement, or points separated by gaps, are drawn as markers and
+  are never joined across a gap; the summary says the chart is sparse.
+- **API errors:** a failed load shows a message in the chart panel; a failed *refresh* keeps the
+  last chart, dims it and says it is out of date. The rest of the dashboard is unaffected.
+- **Long windows:** the server groups checks into at most about 300 time buckets, so a 7 day
+  view stays fast. A bucket's latency is the average of its replies (down checks are not counted
+  as 0), and a bucket is shown as down only if every check in it was down. A shorter outage
+  appears as an amber (degraded) cell, and hovering says how many of its checks were down.
+
+`GET /api/devices/{name}/latency?window_s=N&max_points=M` returns the data (`window_s` 60 to
+604800, default 900; `max_points` 10 to 1000, default 300): chronological `points` (`ts`,
+`status`, `rtt_min_ms` / `rtt_avg_ms` / `rtt_max_ms` which are `null` for a down check, `sent`,
+`received`, `checks`, `down`), the `gaps` with no measurements, `first_check_ts`,
+`last_check_ts`, `stale` and the bucket size (`resolution_s`, `aggregated`). It is read-only; the
+older `/history` endpoint is unchanged.
+
+### Try it
+
+1. `uv run netmonlt`, then open <http://127.0.0.1:8000>.
+2. Wait about 90 seconds, then choose **access-switch** in the chart. The scripted outage shows
+   as a red zone (about 30 to 60 s after start) with the line broken, red cells in the strip, and
+   the matching critical and recovery alerts below.
+3. Choose **wifi-ap** (a lossy link: mostly amber cells with some green and the odd red one) and **branch-vpn**
+   (high latency, about 170 ms, shown amber), and try the other windows.
+4. To see "no data": press Ctrl+C, wait about a minute, and start `uv run netmonlt` again. The
+   time in between is a hatched region, there is no red zone, and no alert is invented for it.
+5. For the live view, run real mode (see above); the chart works the same way.
+
 ## Development
 
 ```powershell
@@ -239,17 +293,23 @@ uv run ruff check .
 Tests never touch a network or run a real `ping`; the ICMP prober is tested with a fake
 command runner and recorded/constructed sample output.
 
+The dashboard is plain HTML and JavaScript with no build step and no JavaScript test suite.
+The chart's data rules (gaps, down checks, zero latency, downsampling) are tested in Python
+(`tests/test_latency.py`); its drawing was checked by hand in headless Chromium (desktop, a
+375 px phone width and dark mode), not in Firefox, Safari or Edge.
+
 ## Known limitations
 
 - Check history is never pruned (fine for a demo, not for long-running use).
 - Alert history is never pruned, and alerts are shown but not acknowledged or sent anywhere.
-- The dashboard shows current status and recent alerts only, with no charts.
+- Charts: no zoom, pan or export; alerts are not marked on the chart; the vertical scale
+  starts at 0 and fits the largest value, so one spike flattens the rest; axis times use the
+  browser's time zone (timestamps are stored as UTC).
 - No authentication on the dashboard or API. In real mode the page lists your device
   addresses and status, so keep the default `127.0.0.1` binding.
 
 ## Roadmap
 
-1. Latency history charts on the dashboard.
-2. SNMP interface counters (throughput, errors), with ICMP-only fallback when no
+1. SNMP interface counters (throughput, errors), with ICMP-only fallback when no
    credentials exist.
-3. Alert notifications (for example a webhook) and acknowledgement.
+2. Alert notifications (for example a webhook) and acknowledgement.

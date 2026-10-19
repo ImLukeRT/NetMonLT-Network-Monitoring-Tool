@@ -76,6 +76,44 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"unknown device {name!r}")
         return {"device": name, "checks": rows}
 
+    @app.get("/api/devices/{name}/latency")
+    def device_latency(
+        name: str,
+        window_s: int = Query(900, ge=60, le=7 * 86400),
+        max_points: int = Query(300, ge=10, le=1000),
+    ):
+        """Latency history for charting: the last `window_s` seconds, at most ~max_points points.
+
+        Down checks, missing measurements (`gaps`) and real 0 ms replies are reported separately;
+        see Database.latency_series.
+        """
+        now = clock()
+        series = db.latency_series(name, now - window_s, now, max_points, stale_after_s)
+        if series is None:
+            raise HTTPException(status_code=404, detail=f"unknown device {name!r}")
+        last = series["last_check_ts"]
+        age = None if last is None else max(0.0, now - last)
+        bucket = series["bucket_s"]
+        return {
+            "device": name,
+            "server_time": now,
+            "window_s": window_s,
+            "start": now - window_s,
+            "end": now,
+            "poll_interval_s": inventory.poll_interval_s,
+            # Time covered by one point: a bucket when downsampled, else one polling interval.
+            "resolution_s": inventory.poll_interval_s if bucket is None else bucket,
+            "aggregated": bucket is not None,
+            "gap_threshold_s": stale_after_s,
+            "first_check_ts": series["first_check_ts"],
+            "last_check_ts": last,
+            "last_check_age_s": age,
+            "stale": age is not None and age > stale_after_s,
+            "checks": series["checks"],
+            "points": series["points"],
+            "gaps": series["gaps"],
+        }
+
     @app.get("/api/alerts")
     def list_alerts(limit: int = Query(50, ge=1, le=500)):
         """Recent state-change alerts, newest first (read-only)."""

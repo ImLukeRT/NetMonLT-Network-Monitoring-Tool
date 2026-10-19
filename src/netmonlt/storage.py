@@ -104,6 +104,99 @@ class Database:
                  p.rtt_min_ms, p.rtt_avg_ms, p.rtt_max_ms),
             )
 
+    def latency_series(
+        self, device: str, start: float, end: float, max_points: int, gap_s: float
+    ) -> dict | None:
+        """Latency history for a device over [start, end], ready to chart. None if no such device.
+
+        Returns chronological `points`, the periods with no measurements (`gaps`), and the
+        device's first/last check times. The three cases a chart must tell apart are kept apart:
+          * a down check is a point with no latency (rtt_* is None, status "down");
+          * a missing measurement (probe errors, app stopped) is no point at all, reported as a
+            gap whenever consecutive checks are more than `gap_s` apart;
+          * a genuine 0 ms reply is a point with rtt 0.0.
+        If the window holds more than `max_points` checks, they are grouped into equal time
+        buckets: latency is the reply-weighted mean and min/max are the extremes. A bucket's status
+        is "down" only if every check in it was down, "degraded" if any check was down or
+        degraded (its `down` count says how many), else "up". Empty buckets are omitted, never
+        filled with zeros.
+        """
+        with self._lock:
+            if not self._conn.execute("SELECT 1 FROM devices WHERE name=?", (device,)).fetchone():
+                return None
+            first_ts, last_ts = self._conn.execute(
+                "SELECT MIN(ts), MAX(ts) FROM checks WHERE device=?", (device,)
+            ).fetchone()
+            count, first_in, last_in = self._conn.execute(
+                "SELECT COUNT(*), MIN(ts), MAX(ts) FROM checks "
+                "WHERE device=? AND ts BETWEEN ? AND ?",
+                (device, start, end),
+            ).fetchone()
+
+            bucket_s = None
+            if count <= max_points:
+                rows = self._conn.execute(
+                    "SELECT ts, status, sent, received, rtt_min_ms, rtt_avg_ms, rtt_max_ms "
+                    "FROM checks WHERE device=? AND ts BETWEEN ? AND ? ORDER BY ts, id",
+                    (device, start, end),
+                ).fetchall()
+                points = [
+                    {
+                        "ts": r["ts"], "checks": 1, "status": r["status"],
+                        "down": int(r["status"] == "down"),
+                        "degraded": int(r["status"] == "degraded"),
+                        "sent": r["sent"], "received": r["received"],
+                        "rtt_min_ms": r["rtt_min_ms"], "rtt_avg_ms": r["rtt_avg_ms"],
+                        "rtt_max_ms": r["rtt_max_ms"],
+                    }
+                    for r in rows
+                ]
+            else:
+                bucket_s = (end - start) / max_points
+                rows = self._conn.execute(
+                    "SELECT AVG(ts) AS ts, COUNT(*) AS checks, SUM(status='down') AS down, "
+                    "SUM(status='degraded') AS degraded, SUM(sent) AS sent, "
+                    "SUM(received) AS received, MIN(rtt_min_ms) AS rtt_min_ms, "
+                    "SUM(rtt_avg_ms * received) * 1.0 / "
+                    "NULLIF(SUM(CASE WHEN rtt_avg_ms IS NOT NULL THEN received END), 0) "
+                    "AS rtt_avg_ms, MAX(rtt_max_ms) AS rtt_max_ms "
+                    "FROM checks WHERE device=? AND ts BETWEEN ? AND ? "
+                    "GROUP BY CAST((ts - ?) / ? AS INTEGER) ORDER BY ts",
+                    (device, start, end, start, bucket_s),
+                ).fetchall()
+                points = []
+                for r in rows:
+                    point = dict(r)
+                    point["status"] = (
+                        "down" if r["down"] == r["checks"]
+                        else "degraded" if r["down"] or r["degraded"]
+                        else "up"
+                    )
+                    if point["rtt_avg_ms"] is not None:
+                        point["rtt_avg_ms"] = round(point["rtt_avg_ms"], 2)
+                    points.append(point)
+
+            gaps = []
+            if count:
+                if first_ts < start and first_in - start > gap_s:
+                    gaps.append({"start": start, "end": first_in})  # nothing near the window start
+                for prev, ts in self._conn.execute(
+                    "SELECT prev, ts FROM (SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev "
+                    "FROM checks WHERE device=? AND ts BETWEEN ? AND ?) "
+                    "WHERE prev IS NOT NULL AND ts - prev > ?",
+                    (device, start, end, gap_s),
+                ):
+                    gaps.append({"start": prev, "end": ts})
+                if end - last_in > gap_s:
+                    gaps.append({"start": last_in, "end": end})  # measurements stopped
+            elif first_ts is not None and first_ts <= end:
+                gaps.append({"start": start, "end": end})  # history exists, but only before this
+
+            return {
+                "points": points, "gaps": gaps, "checks": count, "bucket_s": bucket_s,
+                "first_check_ts": first_ts, "last_check_ts": last_ts,
+            }
+
     def get_alert_state(self, device: str) -> AlertState | None:
         """The stored alerting state for a device, or None if it has never been checked."""
         with self._lock:

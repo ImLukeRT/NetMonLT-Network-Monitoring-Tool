@@ -8,11 +8,13 @@
 <style>
   :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#667085; --line:#e4e7ec;
           --up:#067647; --up-bg:#d1fadf; --deg:#93370d; --deg-bg:#fef0c7;
-          --down:#b42318; --down-bg:#fee4e2; --none:#475467; --none-bg:#eaecf0; }
+          --down:#b42318; --down-bg:#fee4e2; --none:#475467; --none-bg:#eaecf0; --accent:#2563eb;
+          --f-up:#12b76a; --f-deg:#f79009; --f-down:#d92d20; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#0f1318; --card:#171c23; --fg:#e6e9ee; --muted:#98a2b3; --line:#2a313b;
             --up:#6ce9a6; --up-bg:#0b3a24; --deg:#fec84b; --deg-bg:#4a2f06;
-            --down:#fda29b; --down-bg:#55160f; --none:#cbd5e1; --none-bg:#2a313b; }
+            --down:#fda29b; --down-bg:#55160f; --none:#cbd5e1; --none-bg:#2a313b; --accent:#7cacf8;
+            --f-up:#32d583; --f-deg:#fdb022; --f-down:#f97066; }
   }
   body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg);
          font:15px/1.5 system-ui, sans-serif; }
@@ -45,6 +47,47 @@
   .empty { color:var(--muted); padding:14px; }
   #error { color:var(--down); font-weight:600; margin:0 0 12px; }
   #error:empty { display:none; }
+  .chart-card { padding:12px 14px 10px; }
+  .chart-controls { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; margin-bottom:8px; }
+  .chart-controls label { color:var(--muted); font-size:13px; }
+  select, .windows button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+                            border:1px solid var(--line); border-radius:6px; padding:3px 8px; }
+  .windows { display:inline-flex; gap:4px; }
+  .windows button { cursor:pointer; }
+  .windows button[aria-pressed="true"] { background:var(--fg); color:var(--bg); border-color:var(--fg); }
+  .note { font-size:13px; padding:6px 10px; border-radius:6px; margin:0 0 8px;
+          background:var(--deg-bg); color:var(--deg); }
+  .note:empty { display:none; }
+  .note.bad { background:var(--down-bg); color:var(--down); }
+  #chart-box { position:relative; min-height:100px; }
+  #chart { display:block; }
+  #chart text { fill:var(--muted); font-size:11px; }
+  #chart .grid { stroke:var(--line); }
+  #chart .line { fill:none; stroke:var(--accent); stroke-width:1.75; stroke-linejoin:round; }
+  #chart .band { fill:var(--accent); opacity:.16; }
+  #chart .dot { fill:var(--card); stroke:var(--accent); stroke-width:1.75; }
+  #chart .downzone { fill:var(--f-down); opacity:.22; }
+  #chart .s-up { fill:var(--f-up); }
+  #chart .s-degraded { fill:var(--f-deg); }
+  #chart .s-down { fill:var(--f-down); }
+  #chart .hatch-line { stroke:var(--muted); stroke-width:1.5; opacity:.6; }
+  #chart .gapzone { stroke:var(--line); }
+  #chart .cross { stroke:var(--fg); opacity:.45; pointer-events:none; }
+  #chart-msg { color:var(--muted); padding:36px 12px; text-align:center; }
+  #chart-tip { position:absolute; top:6px; pointer-events:none; background:var(--fg); color:var(--bg);
+               font-size:12px; line-height:1.4; padding:6px 8px; border-radius:6px; white-space:pre;
+               z-index:2; }
+  #chart-summary { color:var(--muted); font-size:13px; margin-top:6px; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 14px; color:var(--muted); font-size:12px; margin-top:6px; }
+  .legend i { display:inline-block; width:14px; height:10px; margin-right:5px; vertical-align:-1px;
+              border-radius:2px; }
+  .sw-line { height:2px !important; vertical-align:3px !important; background:var(--accent); }
+  .sw-band { background:var(--accent); opacity:.3; }
+  .sw-down { background:var(--f-down); }
+  .sw-deg { background:var(--f-deg); }
+  .sw-up { background:var(--f-up); }
+  .sw-gap { background:repeating-linear-gradient(45deg, var(--muted) 0 1.5px, transparent 1.5px 4px);
+            border:1px solid var(--line); }
 </style>
 </head>
 <body>
@@ -65,6 +108,33 @@
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
+  </div>
+  <h2>Latency history</h2>
+  <div class="wrap chart-card" id="chart-card">
+    <div class="chart-controls">
+      <label>Device <select id="chart-device"></select></label>
+      <div class="windows" role="group" aria-label="Time window">
+        <button type="button" data-window="900" aria-pressed="true">15 min</button>
+        <button type="button" data-window="3600" aria-pressed="false">1 h</button>
+        <button type="button" data-window="21600" aria-pressed="false">6 h</button>
+        <button type="button" data-window="86400" aria-pressed="false">24 h</button>
+        <button type="button" data-window="604800" aria-pressed="false">7 d</button>
+      </div>
+    </div>
+    <div class="note" id="chart-note" role="status"></div>
+    <div id="chart-box">
+      <svg id="chart" role="img" aria-label="Latency history chart"></svg>
+      <div id="chart-msg">Loading…</div>
+      <div id="chart-tip" hidden></div>
+    </div>
+    <div id="chart-summary"></div>
+    <div class="legend" aria-hidden="true">
+      <span><i class="sw-line"></i>Average latency</span>
+      <span><i class="sw-band"></i>Min to max</span>
+      <span><i class="sw-down"></i>Down: no reply</span>
+      <span><i class="sw-gap"></i>No data: not measured</span>
+      <span>Strip: <i class="sw-up"></i>up <i class="sw-deg"></i>degraded <i class="sw-down"></i>down</span>
+    </div>
   </div>
   <h2>Recent alerts</h2>
   <div class="wrap" id="alerts-wrap">
@@ -130,6 +200,7 @@ function render(data) {
   }
   document.getElementById("updated").textContent =
     "Refreshes every " + data.poll_interval_s + "s · " + data.devices.length + " devices";
+  syncChartDevices(data.devices);
 }
 
 function renderAlerts(data) {
@@ -182,6 +253,320 @@ async function refresh() {
       "Could not reach the API (" + err.message + "). Showing the last data received, which is out of date.";
   }
 }
+// ---- latency history chart: hand-drawn SVG (no library, works offline) -----------------------
+// A check with no reply has rtt null; a missing measurement has no point at all (a "gap"); a real
+// 0 ms reply has rtt 0. Always test latency with `=== null`, never with truthiness.
+const SVGNS = "http://www.w3.org/2000/svg";
+const chartEl = document.getElementById("chart");
+const chartBox = document.getElementById("chart-box");
+const chartMsg = document.getElementById("chart-msg");
+const chartNote = document.getElementById("chart-note");
+const chartSummary = document.getElementById("chart-summary");
+const chartTip = document.getElementById("chart-tip");
+const deviceSelect = document.getElementById("chart-device");
+let chartDevice = null, chartWindow = 900, chartData = null, chartReq = 0;
+
+const hasRtt = (p) => p.rtt_avg_ms !== null && p.rtt_avg_ms !== undefined;
+
+function svgEl(name, attrs, parent) {
+  const e = document.createElementNS(SVGNS, name);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+function fmtDuration(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m " + String(s % 60).padStart(2, "0") + "s";
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + "h " + String(m % 60).padStart(2, "0") + "m";
+  return Math.floor(h / 24) + "d " + (h % 24) + "h";
+}
+
+function fmtMs(v) {
+  if (v === 0) return "0 ms";
+  return (v < 1 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : String(Math.round(v))) + " ms";
+}
+
+function fmtTick(t, span) {
+  const d = new Date(t * 1000);
+  if (span > 2 * 86400) return d.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+  if (span > 12 * 3600) return d.toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+  if (span <= 1800) return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+  return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+}
+
+function windowLabel(s) {
+  if (s % 86400 === 0) return s / 86400 + (s === 86400 ? " day" : " days");
+  if (s % 3600 === 0) return s / 3600 + (s === 3600 ? " hour" : " hours");
+  return s / 60 + " minutes";
+}
+
+function niceScale(maxV) {
+  const raw = Math.max(maxV, 0.5) * 1.1;
+  const pow = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((f) => f * pow).find((s) => raw / s <= 5);
+  return {max: Math.ceil(raw / step) * step, step};
+}
+
+function showChartMessage(text) {
+  chartEl.replaceChildren();
+  chartEl.style.display = "none";
+  chartTip.hidden = true;
+  chartSummary.textContent = "";
+  chartMsg.textContent = text;
+  chartMsg.hidden = false;
+}
+
+function syncChartDevices(devices) {
+  const names = devices.map((d) => d.name);
+  if (names.join("\n") !== Array.from(deviceSelect.options, (o) => o.value).join("\n")) {
+    deviceSelect.replaceChildren(...names.map((n) => {
+      const o = document.createElement("option");
+      o.value = o.textContent = n;
+      return o;
+    }));
+  }
+  const wanted = names.includes(chartDevice) ? chartDevice : (names[0] || null);
+  deviceSelect.value = wanted;
+  if (wanted !== chartDevice) {
+    chartDevice = wanted;
+    resetChart();
+  }
+}
+
+function resetChart() {
+  chartData = null;
+  chartNote.className = "note";
+  chartNote.textContent = "";
+  chartBox.classList.remove("offline");
+  showChartMessage("Loading…");
+  refreshChart();
+}
+
+async function refreshChart() {
+  if (!chartDevice) return;
+  const req = ++chartReq;   // a response for an earlier device/window must not overwrite this one
+  const url = "/api/devices/" + encodeURIComponent(chartDevice) + "/latency?window_s=" + chartWindow;
+  try {
+    const res = await fetch(url);
+    if (res.status === 404) throw new Error("this device is no longer in the inventory");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (req !== chartReq) return;
+    chartBox.classList.remove("offline");
+    drawChart(data);
+  } catch (err) {
+    if (req !== chartReq) return;
+    chartNote.className = "note bad";
+    if (chartData) {
+      chartNote.textContent = "Could not refresh the history (" + err.message + "). Showing the last chart received, which is out of date.";
+      chartBox.classList.add("offline");
+    } else {
+      chartNote.textContent = "Could not load the history: " + err.message + ".";
+      showChartMessage("No history to show.");
+    }
+  }
+}
+
+function summarize(d) {
+  let checks = 0, down = 0, replies = 0, weighted = 0, mn = Infinity, mx = -Infinity;
+  for (const p of d.points) {
+    checks += p.checks;
+    down += p.down;
+    if (hasRtt(p)) {
+      weighted += p.rtt_avg_ms * p.received;
+      replies += p.received;
+      mn = Math.min(mn, p.rtt_min_ms);
+      mx = Math.max(mx, p.rtt_max_ms);
+    }
+  }
+  const partial = d.first_check_ts > d.start;
+  const parts = [partial
+    ? "History starts " + fmtDuration(d.end - d.first_check_ts) + " ago, shorter than the " + windowLabel(d.window_s) + " window"
+    : "Last " + windowLabel(d.window_s)];
+  parts.push(checks + (checks === 1 ? " check" : " checks") +
+             (d.aggregated ? ", averaged into " + fmtDuration(d.resolution_s) + " intervals" : ""));
+  parts.push(replies > 0
+    ? "latency avg " + fmtMs(weighted / replies) + " (min " + fmtMs(mn) + ", max " + fmtMs(mx) + ")"
+    : "no latency data");
+  parts.push(down + " down");
+  if (d.gaps.length) {
+    const total = d.gaps.reduce((t, g) => t + (g.end - g.start), 0);
+    parts.push(d.gaps.length + (d.gaps.length === 1 ? " gap" : " gaps") + " with no measurements (" + fmtDuration(total) + " in total)");
+  }
+  if (d.checks < 10) parts.push("only " + d.checks + " so far, so the chart is sparse");
+  return parts.join(" · ");
+}
+
+function drawChart(d) {
+  chartData = d;
+  chartTip.hidden = true;
+  chartNote.className = "note";
+  chartNote.textContent = d.stale
+    ? "No new measurements for " + fmtDuration(d.last_check_age_s) + ": this device is stale. The chart shows its history up to the last check; the hatched area has no data."
+    : "";
+  if (d.first_check_ts === null) {
+    return showChartMessage("No measurements yet for this device. The first check should appear within " + d.poll_interval_s + " s.");
+  }
+  if (d.points.length === 0) {
+    return showChartMessage("No measurements in the last " + windowLabel(d.window_s) + ". The last check was " + fmtDuration(d.last_check_age_s) + " ago.");
+  }
+  chartMsg.hidden = true;
+  chartEl.style.display = "block";
+  chartEl.replaceChildren();
+
+  const W = Math.max(320, chartBox.clientWidth), H = 270;
+  const m = {l: 58, r: 14, t: 12, b: 44};
+  const pw = W - m.l - m.r, ph = H - m.t - m.b, bottom = m.t + ph;
+  // If the device's history is shorter than the window, show just the history so the chart fills.
+  const x0 = Math.min(Math.max(d.start, d.first_check_ts), d.end - 30), x1 = d.end;
+  const xs = (t) => m.l + Math.min(1, Math.max(0, (t - x0) / (x1 - x0))) * pw;
+  const pts = d.points;
+  const maxRtt = pts.reduce((a, p) => (hasRtt(p) ? Math.max(a, p.rtt_max_ms) : a), 0);
+  const scale = niceScale(maxRtt);
+  const ys = (v) => bottom - (v / scale.max) * ph;
+  const bw = Math.max(2, (d.resolution_s / (x1 - x0)) * pw);   // width of one point's time slot
+  const hasGapBetween = (a, b) => d.gaps.some((g) => g.start < b.ts && g.end > a.ts);
+  const span = x1 - x0;
+
+  chartEl.setAttribute("width", W);
+  chartEl.setAttribute("height", H);
+  chartEl.setAttribute("viewBox", "0 0 " + W + " " + H);
+  chartEl.setAttribute("aria-label", "Latency history for " + d.device + ". " + summarize(d));
+
+  const defs = svgEl("defs", {}, chartEl);
+  const hatch = svgEl("pattern", {id: "hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}, defs);
+  svgEl("line", {x1: 0, y1: 0, x2: 0, y2: 6, class: "hatch-line"}, hatch);
+
+  // Latency grid (0 is always the bottom, so a 0 ms reply sits on the baseline).
+  for (let v = 0; v <= scale.max + scale.step / 1000; v += scale.step) {
+    svgEl("line", {x1: m.l, x2: m.l + pw, y1: ys(v), y2: ys(v), class: "grid"}, chartEl);
+    const label = svgEl("text", {x: m.l - 6, y: ys(v) + 4, "text-anchor": "end"}, chartEl);
+    label.textContent = Number(v.toFixed(2)) + " ms";
+  }
+
+  // No data: periods with no measurements at all (hatched, in the plot and the status strip).
+  for (const g of d.gaps) {
+    const gx0 = xs(Math.max(g.start, x0)), gx1 = xs(Math.min(g.end, x1));
+    if (gx1 - gx0 < 0.5) continue;
+    svgEl("rect", {x: gx0, y: m.t, width: gx1 - gx0, height: ph, fill: "url(#hatch)", class: "gapzone", "data-kind": "gap"}, chartEl);
+    svgEl("rect", {x: gx0, y: bottom + 8, width: gx1 - gx0, height: 10, fill: "url(#hatch)", class: "gapzone", "data-kind": "gap-strip"}, chartEl);
+  }
+
+  // Down: checks that were made and got no reply (red zone, and no line through them).
+  let run = [];
+  const flushDown = () => {
+    if (!run.length) return;
+    const a = Math.max(m.l, xs(run[0].ts) - bw / 2), b = Math.min(m.l + pw, xs(run[run.length - 1].ts) + bw / 2);
+    svgEl("rect", {x: a, y: m.t, width: Math.max(2, b - a), height: ph, class: "downzone", "data-kind": "down"}, chartEl);
+    run = [];
+  };
+  for (const p of pts) {
+    if (p.status === "down" && (!run.length || !hasGapBetween(run[run.length - 1], p))) run.push(p);
+    else { flushDown(); if (p.status === "down") run.push(p); }
+  }
+  flushDown();
+
+  // Latency: one line per unbroken run of replies. A null latency or a gap breaks the line.
+  const runs = [];
+  let cur = [];
+  for (const p of pts) {
+    if (!hasRtt(p) || (cur.length && hasGapBetween(cur[cur.length - 1], p))) {
+      if (cur.length) runs.push(cur);
+      cur = [];
+    }
+    if (hasRtt(p)) cur.push(p);
+  }
+  if (cur.length) runs.push(cur);
+  // Markers only where they have room (a few px between neighbours); lines carry the dense cases.
+  let minDx = Infinity;
+  for (let i = 1; i < pts.length; i++) minDx = Math.min(minDx, xs(pts[i].ts) - xs(pts[i - 1].ts));
+  const dots = pts.length <= 80 && minDx >= 7;
+  for (const r of runs) {
+    if (r.length > 1) {
+      const top = r.map((p) => xs(p.ts) + "," + ys(p.rtt_max_ms ?? p.rtt_avg_ms));
+      const low = r.slice().reverse().map((p) => xs(p.ts) + "," + ys(p.rtt_min_ms ?? p.rtt_avg_ms));
+      svgEl("polygon", {points: top.concat(low).join(" "), class: "band", "data-kind": "band"}, chartEl);
+      svgEl("polyline", {points: r.map((p) => xs(p.ts) + "," + ys(p.rtt_avg_ms)).join(" "), class: "line", "data-kind": "line"}, chartEl);
+    }
+    if (dots || r.length === 1) {
+      for (const p of r) {
+        svgEl("circle", {cx: xs(p.ts), cy: ys(p.rtt_avg_ms), r: 3, class: "dot", "data-kind": "point", "data-rtt": p.rtt_avg_ms}, chartEl);
+      }
+    }
+  }
+
+  // Status strip: what each measurement said, independent of latency.
+  for (const p of pts) {
+    svgEl("rect", {x: xs(p.ts) - bw / 2, y: bottom + 8, width: bw, height: 10, class: "s-" + p.status, "data-kind": "strip", "data-status": p.status}, chartEl);
+  }
+
+  // Time axis: as many labels as fit (each needs ~110px), so narrow screens don't overlap them.
+  const ticks = Math.max(1, Math.min(4, Math.floor(pw / 110)));
+  for (let i = 0; i <= ticks; i++) {
+    const t = x0 + (span * i) / ticks;
+    const label = svgEl("text", {x: xs(t), y: bottom + 34, "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle", "data-kind": "tick"}, chartEl);
+    label.textContent = fmtTick(t, span);
+  }
+
+  // Hover: nearest measurement, or the gap under the cursor.
+  const cross = svgEl("line", {y1: m.t, y2: bottom + 18, class: "cross", visibility: "hidden"}, chartEl);
+  const overlay = svgEl("rect", {x: m.l, y: m.t, width: pw, height: ph + 18, fill: "transparent"}, chartEl);
+  overlay.addEventListener("pointermove", (ev) => {
+    const box = chartEl.getBoundingClientRect();
+    const px = ev.clientX - box.left;
+    const t = x0 + ((px - m.l) / pw) * span;
+    let best = null, bestDx = Infinity;
+    for (const p of pts) {
+      const dx = Math.abs(xs(p.ts) - px);
+      if (dx < bestDx) { best = p; bestDx = dx; }
+    }
+    const gap = d.gaps.find((g) => t >= g.start && t <= g.end);
+    let lines = null, at = px;
+    if (best && bestDx <= Math.max(bw, 10)) {
+      lines = [new Date(best.ts * 1000).toLocaleString() + (d.aggregated ? " (" + best.checks + " checks averaged)" : "")];
+      lines.push(hasRtt(best)
+        ? "Latency: " + fmtMs(best.rtt_avg_ms) + (best.rtt_min_ms !== best.rtt_max_ms ? " (min " + fmtMs(best.rtt_min_ms) + ", max " + fmtMs(best.rtt_max_ms) + ")" : "")
+        : "No latency: no reply to any ping");
+      lines.push("Status: " + best.status + (best.sent ? " · loss " + Math.round((100 * (best.sent - best.received)) / best.sent) + "%" : ""));
+      if (d.aggregated && best.down) lines.push(best.down + " of " + best.checks + " checks were down");
+      at = xs(best.ts);
+    } else if (gap) {
+      lines = ["No measurements", "from " + new Date(gap.start * 1000).toLocaleString(), "to " + new Date(gap.end * 1000).toLocaleString(),
+               fmtDuration(gap.end - gap.start) + " without a check (not the same as down)"];
+    }
+    if (!lines) { chartTip.hidden = true; cross.setAttribute("visibility", "hidden"); return; }
+    chartTip.textContent = lines.join("\n");
+    chartTip.hidden = false;
+    chartTip.style.left = Math.max(0, Math.min(at + 12, chartBox.clientWidth - chartTip.offsetWidth)) + "px";
+    cross.setAttribute("x1", at);
+    cross.setAttribute("x2", at);
+    cross.setAttribute("visibility", "visible");
+  });
+  overlay.addEventListener("pointerleave", () => { chartTip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+
+  chartSummary.textContent = summarize(d);
+}
+
+deviceSelect.addEventListener("change", () => { chartDevice = deviceSelect.value; resetChart(); });
+for (const button of document.querySelectorAll(".windows button")) {
+  button.addEventListener("click", () => {
+    chartWindow = Number(button.dataset.window);
+    for (const other of document.querySelectorAll(".windows button")) other.setAttribute("aria-pressed", String(other === button));
+    resetChart();
+  });
+}
+let resizeQueued = false;
+window.addEventListener("resize", () => {
+  if (resizeQueued || !chartData) return;
+  resizeQueued = true;
+  requestAnimationFrame(() => { resizeQueued = false; if (chartData) drawChart(chartData); });
+});
+setInterval(refreshChart, 5000);
+
 refresh();
 setInterval(refresh, 3000);
 </script>
