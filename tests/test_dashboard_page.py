@@ -64,29 +64,36 @@ def test_every_age_shown_is_a_live_label():
 # ------------------------------------------------------------------ the arithmetic, in Node.js
 NODE = shutil.which("node")
 
+# The program is sent to Node on standard input (`node -`), never as a command-line argument:
+# Windows rejects a command line longer than about 32,000 characters (WinError 206).
 HARNESS = r"""
-const page = %(page)s;
-const start = page.indexOf(%(start)s), end = page.indexOf(%(end)s);
-const agoStart = page.indexOf("function ago(");
-const agoSource = page.slice(agoStart, page.indexOf("\n}\n", agoStart) + 2);
-let now = 0;
-const performance = {now: () => now};
-const labels = [];
-const document = {querySelectorAll: () => labels};
-const label = () => { const el = {dataset: {}, textContent: ""}; labels.push(el); return el; };
-eval(agoSource + page.slice(start, end) + "; globalThis.api = {setAge, tickAges};");
+(function () {
+  let now = 0;
+  const performance = {now: () => now};
+  const labels = [];
+  const document = {querySelectorAll: () => labels};
+  const label = () => { const el = {dataset: {}, textContent: ""}; labels.push(el); return el; };
+%(helpers)s
+  const api = {setAge, tickAges};
 %(body)s
+})();
 """
 
 
+def helper_source():
+    """Just the page's own label helpers (and the `ago` function they use), not the whole page."""
+    ago_start = PAGE.index("function ago(")
+    ago_source = PAGE[ago_start:PAGE.index("\n}\n", ago_start) + 2]
+    block = PAGE[PAGE.index(HELPERS_START):PAGE.index(HELPERS_END)]
+    return ago_source + block
+
+
 def run_js(body):
-    script = HARNESS % {
-        "page": json.dumps(PAGE), "start": json.dumps(HELPERS_START),
-        "end": json.dumps(HELPERS_END), "body": body,
-    }
-    done = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30)
-    assert done.returncode == 0, done.stderr
-    return json.loads(done.stdout)
+    script = HARNESS % {"helpers": helper_source(), "body": body}
+    done = subprocess.run([NODE, "-"], input=script.encode("utf-8"), capture_output=True,
+                          timeout=30)
+    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
+    return json.loads(done.stdout.decode("utf-8"))
 
 
 @pytest.mark.skipif(NODE is None, reason="Node.js is not installed")
@@ -135,3 +142,10 @@ def test_the_age_never_runs_backwards():
       console.log(JSON.stringify([el.textContent]));
     """)
     assert out == ["10s ago"]
+
+
+@pytest.mark.skipif(NODE is None, reason="Node.js is not installed")
+def test_a_program_far_longer_than_a_windows_command_line_still_runs():
+    # Regression test: the program travels on stdin, so its length is not limited like argv is.
+    padding = "/* " + "x" * 300_000 + " */"
+    assert run_js(padding + 'console.log(JSON.stringify(["ok"]));') == ["ok"]
