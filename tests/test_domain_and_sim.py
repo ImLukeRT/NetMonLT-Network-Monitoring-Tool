@@ -1,0 +1,54 @@
+import asyncio
+
+from helpers import FakeClock
+from netmonlt.domain import Device, PingResult, SimProfile, Status, classify
+from netmonlt.probes import SimulatedProber
+
+
+def ping(sent, received, avg):
+    return PingResult(sent, received, avg, avg, avg)
+
+
+def test_classify():
+    assert classify(PingResult(3, 0, None, None, None)) == Status.DOWN
+    assert classify(ping(3, 3, 10)) == Status.UP
+    assert classify(ping(10, 7, 10)) == Status.DEGRADED  # 30% loss
+    assert classify(ping(10, 9, 10)) == Status.UP  # 10% loss is tolerated
+    assert classify(ping(3, 3, 200)) == Status.DEGRADED  # high latency
+
+
+def run(prober, device, count=3):
+    return asyncio.run(prober.ping(device, count))
+
+
+def test_simulation_is_deterministic():
+    dev = Device("a", "192.0.2.1", sim=SimProfile(rtt_ms=20, jitter_ms=5, loss=0.3))
+    first = [run(SimulatedProber(seed=1, clock=FakeClock()), dev) for _ in range(1)]
+    second = [run(SimulatedProber(seed=1, clock=FakeClock()), dev) for _ in range(1)]
+    assert first == second
+
+
+def test_rtt_close_to_profile():
+    dev = Device("a", "192.0.2.1", sim=SimProfile(rtt_ms=20, jitter_ms=1))
+    result = run(SimulatedProber(clock=FakeClock()), dev, count=50)
+    assert result.received == 50
+    assert 18 < result.rtt_avg_ms < 22
+    assert result.rtt_min_ms <= result.rtt_avg_ms <= result.rtt_max_ms
+
+
+def test_total_loss_means_nothing_received():
+    dev = Device("a", "192.0.2.1", sim=SimProfile(loss=1.0))
+    result = run(SimulatedProber(clock=FakeClock()), dev)
+    assert result.received == 0 and result.rtt_avg_ms is None
+    assert classify(result) == Status.DOWN
+
+
+def test_outage_window_starts_and_ends():
+    clock = FakeClock()
+    dev = Device("a", "192.0.2.1", sim=SimProfile(outage_start_s=10, outage_duration_s=5))
+    prober = SimulatedProber(clock=clock)
+    seen = {}
+    for t in (0, 9.9, 10, 14.9, 15, 30):
+        clock.now = t
+        seen[t] = run(prober, dev).received > 0
+    assert seen == {0: True, 9.9: True, 10: False, 14.9: False, 15: True, 30: True}

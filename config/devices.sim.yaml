@@ -1,0 +1,39 @@
+# Demo inventory: everything here is simulated, nothing touches the network.
+# Addresses are in 192.0.2.0/24 (RFC 5737 "TEST-NET-1"), reserved for documentation,
+# so they can never refer to a real host.
+mode: simulated
+poll_interval_s: 5
+
+devices:
+  - name: core-router
+    address: 192.0.2.1
+    type: router
+    sim: {rtt_ms: 2, jitter_ms: 0.5}
+
+  - name: edge-firewall
+    address: 192.0.2.2
+    type: firewall
+    sim: {rtt_ms: 4, jitter_ms: 1}
+
+  - name: access-switch
+    address: 192.0.2.10
+    type: switch
+    # Goes down 30s after startup for 30s, then recovers.
+    sim: {rtt_ms: 3, jitter_ms: 0.5, outage_start_s: 30, outage_duration_s: 30}
+
+  - name: wifi-ap
+    address: 192.0.2.20
+    type: access-point
+    # Lossy radio link: shows up as "degraded".
+    sim: {rtt_ms: 18, jitter_ms: 6, loss: 0.4}
+
+  - name: file-server
+    address: 192.0.2.30
+    type: server
+    sim: {rtt_ms: 1, jitter_ms: 0.2}
+
+  - name: branch-vpn
+    address: 192.0.2.40
+    type: vpn-gateway
+    # High latency over a WAN link: also "degraded".
+    sim: {rtt_ms: 170, jitter_ms: 15}
