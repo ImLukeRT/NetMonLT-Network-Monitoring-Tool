@@ -131,3 +131,79 @@ def test_dashboard_labels_real_and_simulated_data_differently(db, devices):
 
     assert "SIMULATED DATA" in page("simulated") and "LIVE" not in page("simulated")
     assert "LIVE · ICMP" in page("real") and "SIMULATED DATA" not in page("real")
+
+
+# ------------------------------------------------------------------ alerts endpoint
+def make_alert(ts, severity="critical", old=Status.UP, new=Status.DOWN, device="alpha"):
+    from netmonlt.alerts import Alert, Severity
+
+    return Alert(device, ts, Severity(severity), old, new, f"{device} went {new.value} at {ts}")
+
+
+def test_alerts_endpoint_is_empty_before_anything_happens(db, devices, inventory):
+    db.sync_devices(devices)
+    app = create_app(inventory, db, SimulatedProber(), start_collector=False, clock=FakeClock(5.0))
+    with TestClient(app) as client:
+        assert client.get("/api/alerts").json() == {"server_time": 5.0, "alerts": []}
+
+
+def test_alerts_endpoint_returns_newest_first_with_all_fields(db, devices, inventory):
+    from netmonlt.alerts import AlertState
+
+    db.sync_devices(devices)
+    db.save_alert_state("alpha", AlertState(updated=100.0), make_alert(100.0))
+    db.save_alert_state(
+        "beta", AlertState(updated=200.0), make_alert(200.0, "info", Status.DOWN, Status.UP, "beta")
+    )
+    clock = FakeClock(260.0)
+    app = create_app(inventory, db, SimulatedProber(), start_collector=False, clock=clock)
+    with TestClient(app) as client:
+        body = client.get("/api/alerts").json()
+    assert body["server_time"] == 260.0
+    first, second = body["alerts"]
+    assert first == {
+        "id": 2, "device": "beta", "ts": 200.0, "severity": "info", "from_status": "down",
+        "to_status": "up", "transition": "down -> up", "message": "beta went up at 200.0",
+        "age_s": 60.0,
+    }
+    assert (second["device"], second["severity"], second["transition"]) == (
+        "alpha", "critical", "up -> down"
+    )
+    assert second["age_s"] == 160.0
+
+
+def test_alerts_limit_and_validation(db, devices, inventory):
+    from netmonlt.alerts import AlertState
+
+    db.sync_devices(devices)
+    for ts in (1.0, 2.0, 3.0):
+        db.save_alert_state("alpha", AlertState(updated=ts), make_alert(ts))
+    app = create_app(inventory, db, SimulatedProber(), start_collector=False)
+    with TestClient(app) as client:
+        assert [a["ts"] for a in client.get("/api/alerts?limit=2").json()["alerts"]] == [3.0, 2.0]
+        assert client.get("/api/alerts?limit=0").status_code == 422
+        assert client.get("/api/alerts?limit=501").status_code == 422
+
+
+def test_alerts_endpoint_is_read_only(db, devices, inventory):
+    app = create_app(inventory, db, SimulatedProber(), start_collector=False)
+    with TestClient(app) as client:
+        for method in ("post", "put", "patch", "delete"):
+            assert getattr(client, method)("/api/alerts").status_code == 405
+
+
+def test_alerts_appear_through_the_api_after_polling(db, devices, inventory):
+    from helpers import ScriptedProber, run_cycles
+
+    db.sync_devices(devices)
+    script = {"alpha": [Status.UP] * 3 + [Status.DOWN], "beta": [Status.UP]}
+    run_cycles(devices, ScriptedProber(script), db, 12)
+    with TestClient(create_app(inventory, db, SimulatedProber(), start_collector=False)) as client:
+        alerts = client.get("/api/alerts").json()["alerts"]
+    assert [(a["device"], a["transition"]) for a in alerts] == [("alpha", "up -> down")]
+
+
+def test_dashboard_page_has_an_alerts_section(db, devices, inventory):
+    with TestClient(create_app(inventory, db, SimulatedProber(), start_collector=False)) as client:
+        page = client.get("/").text
+    assert "Recent alerts" in page and "/api/alerts" in page

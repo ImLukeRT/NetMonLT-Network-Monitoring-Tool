@@ -35,11 +35,14 @@
   tr:last-child td { border-bottom:0; }
   td.num { font-variant-numeric: tabular-nums; }
   .badge { padding:2px 10px; border-radius:999px; font-size:13px; font-weight:600; }
-  .up { background:var(--up-bg); color:var(--up); }
-  .degraded { background:var(--deg-bg); color:var(--deg); }
-  .down { background:var(--down-bg); color:var(--down); }
+  .up, .info { background:var(--up-bg); color:var(--up); }
+  .degraded, .warning { background:var(--deg-bg); color:var(--deg); }
+  .down, .critical { background:var(--down-bg); color:var(--down); }
   .unknown, .stale { background:var(--none-bg); color:var(--none); }
-  .wrap.offline { opacity:.5; }
+  .offline { opacity:.5; }
+  h2 { font-size:16px; margin:28px 0 8px; }
+  td.msg { white-space:normal; min-width:280px; }
+  .empty { color:var(--muted); padding:14px; }
   #error { color:var(--down); font-weight:600; margin:0 0 12px; }
   #error:empty { display:none; }
 </style>
@@ -63,11 +66,26 @@
       <tbody id="rows"></tbody>
     </table>
   </div>
+  <h2>Recent alerts</h2>
+  <div class="wrap" id="alerts-wrap">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Severity</th><th>Device</th><th>Change</th><th>Message</th>
+      </tr></thead>
+      <tbody id="alerts"></tbody>
+    </table>
+    <div class="empty" id="no-alerts" hidden>
+      No alerts yet. An alert is raised when a device's state changes and stays changed for 3
+      consecutive checks.
+    </div>
+  </div>
 </main>
 <script>
 const rows = document.getElementById("rows");
 const summary = document.getElementById("summary");
 const wrap = document.querySelector(".wrap");
+const alertsWrap = document.getElementById("alerts-wrap");
+const alertRows = document.getElementById("alerts");
 
 function cell(text, cls) {
   const td = document.createElement("td");
@@ -114,15 +132,52 @@ function render(data) {
     "Refreshes every " + data.poll_interval_s + "s · " + data.devices.length + " devices";
 }
 
+function renderAlerts(data) {
+  alertRows.replaceChildren();
+  for (const a of data.alerts) {
+    const tr = document.createElement("tr");
+    const sevCell = document.createElement("td");
+    const sev = document.createElement("span");
+    sev.className = "badge " + a.severity;
+    sev.textContent = a.severity;
+    sevCell.appendChild(sev);
+    // Time of day is enough for recent alerts; older ones also need the date. Full time on hover.
+    const at = new Date(a.ts * 1000);
+    const when = a.age_s < 86400 ? at.toLocaleTimeString() : at.toLocaleString();
+    const timeCell = cell(when + " · " + ago(a.age_s), "num");
+    timeCell.title = at.toLocaleString();
+    tr.append(timeCell, sevCell, cell(a.device),
+              cell(a.from_status + " → " + a.to_status), cell(a.message, "msg"));
+    alertRows.appendChild(tr);
+  }
+  document.getElementById("no-alerts").hidden = data.alerts.length > 0;
+}
+
+function ago(seconds) {
+  if (seconds < 60) return Math.round(seconds) + "s ago";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+  return Math.round(seconds / 3600) + "h ago";
+}
+
+async function getJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
 async function refresh() {
   try {
-    const res = await fetch("/api/devices");
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    render(await res.json());
+    const [devices, alerts] = await Promise.all([
+      getJson("/api/devices"), getJson("/api/alerts?limit=20"),
+    ]);
+    render(devices);
+    renderAlerts(alerts);
     wrap.classList.remove("offline");
+    alertsWrap.classList.remove("offline");
     document.getElementById("error").textContent = "";
   } catch (err) {
     wrap.classList.add("offline");
+    alertsWrap.classList.add("offline");
     document.getElementById("error").textContent =
       "Could not reach the API (" + err.message + "). Showing the last data received, which is out of date.";
   }

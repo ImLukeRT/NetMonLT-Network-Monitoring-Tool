@@ -8,8 +8,8 @@ dashboard. It has two modes:
   with no networking equipment, no network access and no special permissions.
 - **Real ICMP (opt-in):** pings devices you list explicitly and are authorised to monitor.
 
-> Status: early MVP. ICMP reachability and latency only. SNMP and alerting are not built yet
-> (see [Roadmap](#roadmap)).
+> Status: early MVP. ICMP reachability and latency, with state-change alerts. SNMP and charts
+> are not built yet (see [Roadmap](#roadmap)).
 
 ## Quick start (simulated demo)
 
@@ -159,24 +159,75 @@ switching modes is a one-line change.
 
 ```
 devices.yaml ─► Inventory ─► Collector ─► Prober (interface) ─┬─► SimulatedProber (default)
-                                 │                            └─► IcmpProber ─► system ping
-                                 ▼
-                              SQLite ◄── FastAPI ◄── dashboard (polls /api/devices)
+                                 │  │                         └─► IcmpProber ─► system ping
+                                 │  └─► alert state machine
+                                 ▼            │
+                              SQLite ◄────────┘
+                                 ▲
+                              FastAPI ◄── dashboard (polls /api/devices and /api/alerts)
 ```
 
 - **Prober** is the only thing that measures a device. The collector, storage and API
   don't know whether results are simulated or real.
 - **Status** is derived from three pings per check: `down` if none reply, `degraded`
   at 20% loss or more, or average latency of 150 ms or more, otherwise `up`. With three pings
-  per check, any single lost packet marks a device `degraded`.
+  per check, any single lost packet marks a single check `degraded`; alerts ignore such
+  blips (see [Alerts](#alerts)).
 - **Simulation** is deterministic: each device has a seeded random generator, and outages
   are scripted relative to start time.
 - A probe *error or timeout* (a broken or hung prober) is logged and not recorded, so it is
   never mistaken for a device being down. The dashboard marks devices whose last result is
   too old as `stale`, using the server's clock.
 
-API: `GET /api/devices`, `GET /api/devices/{name}/history?limit=N`, `GET /healthz`,
-interactive docs at `/docs`.
+API: `GET /api/devices`, `GET /api/devices/{name}/history?limit=N`,
+`GET /api/alerts?limit=N`, `GET /healthz`, interactive docs at `/docs`. All endpoints are
+read-only.
+
+## Alerts
+
+NetMonLT raises an alert when a device **changes state** and stays changed. Alerts are stored
+in the same SQLite database, listed on the dashboard under **Recent alerts**, and also logged
+to the console.
+
+| Change | Severity |
+|---|---|
+| to `down` (from `up` or `degraded`) | `critical` |
+| to `degraded` (from `up` or `down`) | `warning` |
+| to `up` (recovery, from `down` or `degraded`) | `info` |
+
+Each alert records the device, time, severity, the change (`from_status` → `to_status`) and a
+message such as `access-switch is DOWN: no reply to 3 pings (was up for 30s)` or
+`access-switch recovered: 3/3 replies, avg 2.57 ms (was down for 30s)`.
+
+**No alert storms.** A single check is noisy (one lost packet marks it `degraded`), so a
+device's state only changes after **3 consecutive checks** agree on the new status. While a device
+stays in one state it raises nothing, however many times it is polled. With the 5 s demo
+interval an alert therefore appears about 10 s after a change starts, and a one- or two-check
+blip raises nothing. In the simulated demo, comparing each check with the previous one gives
+about 110 state changes per 20 minutes (almost all from the deliberately lossy `wifi-ap`, which
+has 40% packet loss); with confirmation it raises about 7 alerts: the 2 for the scripted
+`access-switch` outage, plus a few for `wifi-ap`, whose link really does change state every few
+minutes. (Measured over 8 simulator seeds.)
+
+**Restarts.** The confirmed state is stored in the database, so a restart continues where it left
+off: a change that was half-confirmed keeps counting, and nothing is alerted twice. NetMonLT
+does not invent history it can't know:
+
+- A device with no stored state (first run, or newly added) gets a silent *baseline* once 3
+  consecutive checks agree. A device that is already down when monitoring starts is not an alert.
+- If the last check is older than the stale limit (3 poll intervals plus the 10 s probe timeout),
+  because the app was stopped or the device couldn't be measured for a while, the old state is
+  discarded and re-baselined silently. A device that went down while the app was off, or came
+  back while it was off, produces no alert for that change.
+- Probe errors (no `ping`, unresolvable host, timeouts) are not outages and never produce alerts.
+
+`GET /api/alerts?limit=N` (default 50, maximum 500) returns the newest alerts first, each with
+`id`, `device`, `ts`, `severity`, `from_status`, `to_status`, `transition`, `message` and
+`age_s`. Removing a device from the inventory also removes its alerts. Databases created
+before alerting existed are upgraded automatically.
+
+Not included: notifications (email, SMS, webhooks), acknowledgement, per-device rules, custom
+thresholds or alert pruning.
 
 ## Development
 
@@ -191,14 +242,14 @@ command runner and recorded/constructed sample output.
 ## Known limitations
 
 - Check history is never pruned (fine for a demo, not for long-running use).
-- The dashboard shows current status only, with no charts or alerts yet.
+- Alert history is never pruned, and alerts are shown but not acknowledged or sent anywhere.
+- The dashboard shows current status and recent alerts only, with no charts.
 - No authentication on the dashboard or API. In real mode the page lists your device
   addresses and status, so keep the default `127.0.0.1` binding.
 
 ## Roadmap
 
-1. Alerting: threshold rules with a pending/firing/resolved state machine (this is also the
-   place to add flap damping, since one lost packet currently flips a device to `degraded`).
-2. Latency history charts on the dashboard.
-3. SNMP interface counters (throughput, errors), with ICMP-only fallback when no
+1. Latency history charts on the dashboard.
+2. SNMP interface counters (throughput, errors), with ICMP-only fallback when no
    credentials exist.
+3. Alert notifications (for example a webhook) and acknowledgement.

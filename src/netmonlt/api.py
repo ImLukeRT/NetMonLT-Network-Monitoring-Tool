@@ -11,16 +11,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from netmonlt import __version__
-from netmonlt.collector import PROBE_TIMEOUT_S, run_forever
+from netmonlt.collector import run_forever
+from netmonlt.collector import stale_after_s as compute_stale_after_s
 from netmonlt.inventory import Inventory
 from netmonlt.probes.base import Prober
 from netmonlt.storage import Database
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-
-# A device is "stale" when its newest stored check is older than this many poll intervals plus
-# the probe timeout (so one slow cycle isn't mistaken for a dead collector).
-STALE_AFTER_INTERVALS = 3
 
 
 def create_app(
@@ -32,7 +29,7 @@ def create_app(
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     """Build the app. Tests pass start_collector=False to control polling themselves."""
-    stale_after_s = STALE_AFTER_INTERVALS * inventory.poll_interval_s + PROBE_TIMEOUT_S
+    stale_after_s = compute_stale_after_s(inventory.poll_interval_s)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -78,6 +75,20 @@ def create_app(
         if rows is None:
             raise HTTPException(status_code=404, detail=f"unknown device {name!r}")
         return {"device": name, "checks": rows}
+
+    @app.get("/api/alerts")
+    def list_alerts(limit: int = Query(50, ge=1, le=500)):
+        """Recent state-change alerts, newest first (read-only)."""
+        now = clock()
+        alerts = [
+            {
+                **row,
+                "transition": f"{row['from_status']} -> {row['to_status']}",
+                "age_s": max(0.0, now - row["ts"]),
+            }
+            for row in db.recent_alerts(limit)
+        ]
+        return {"server_time": now, "alerts": alerts}
 
     @app.get("/healthz")
     def healthz():

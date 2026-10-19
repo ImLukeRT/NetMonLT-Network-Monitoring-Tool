@@ -9,7 +9,8 @@ import threading
 from collections.abc import Iterable
 from pathlib import Path
 
-from netmonlt.domain import CheckResult, Device
+from netmonlt.alerts import Alert, AlertState
+from netmonlt.domain import CheckResult, Device, Status
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -29,6 +30,25 @@ CREATE TABLE IF NOT EXISTS checks (
     rtt_max_ms REAL
 );
 CREATE INDEX IF NOT EXISTS idx_checks_device_ts ON checks(device, ts);
+CREATE TABLE IF NOT EXISTS device_state (
+    device          TEXT PRIMARY KEY REFERENCES devices(name) ON DELETE CASCADE,
+    status          TEXT,
+    since           REAL,
+    candidate       TEXT,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    candidate_since REAL,
+    updated         REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alerts (
+    id          INTEGER PRIMARY KEY,
+    device      TEXT NOT NULL REFERENCES devices(name) ON DELETE CASCADE,
+    ts          REAL NOT NULL,
+    severity    TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status   TEXT NOT NULL,
+    message     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 """
 
 _LATEST = """
@@ -83,6 +103,72 @@ class Database:
                 (check.device, check.ts, check.status.value, p.sent, p.received,
                  p.rtt_min_ms, p.rtt_avg_ms, p.rtt_max_ms),
             )
+
+    def get_alert_state(self, device: str) -> AlertState | None:
+        """The stored alerting state for a device, or None if it has never been checked."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status, since, candidate, candidate_count, candidate_since, updated "
+                "FROM device_state WHERE device=?",
+                (device,),
+            ).fetchone()
+        if row is None:
+            return None
+        return AlertState(
+            status=Status(row["status"]) if row["status"] else None,
+            since=row["since"],
+            candidate=Status(row["candidate"]) if row["candidate"] else None,
+            candidate_count=row["candidate_count"],
+            candidate_since=row["candidate_since"],
+            updated=row["updated"],
+        )
+
+    def save_alert_state(self, device: str, state: AlertState, alert: Alert | None = None) -> None:
+        """Save a device's alerting state and, if given, its new alert in one transaction.
+
+        Doing both together means a crash can't leave an alert without the state change that
+        caused it (which would repeat the alert after a restart).
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO device_state(device, status, since, candidate, candidate_count, "
+                "candidate_since, updated) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(device) DO UPDATE SET status=excluded.status, since=excluded.since, "
+                "candidate=excluded.candidate, candidate_count=excluded.candidate_count, "
+                "candidate_since=excluded.candidate_since, updated=excluded.updated",
+                (
+                    device,
+                    state.status.value if state.status else None,
+                    state.since,
+                    state.candidate.value if state.candidate else None,
+                    state.candidate_count,
+                    state.candidate_since,
+                    state.updated,
+                ),
+            )
+            if alert is not None:
+                self._conn.execute(
+                    "INSERT INTO alerts(device, ts, severity, from_status, to_status, message) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        alert.device,
+                        alert.ts,
+                        alert.severity.value,
+                        alert.from_status.value,
+                        alert.to_status.value,
+                        alert.message,
+                    ),
+                )
+
+    def recent_alerts(self, limit: int = 50) -> list[dict]:
+        """Newest-first alerts across all devices."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, device, ts, severity, from_status, to_status, message "
+                "FROM alerts ORDER BY ts DESC, id DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in rows]
 
     def latest_status(self) -> list[dict]:
         """One row per device with its most recent check (check fields are None if unchecked)."""

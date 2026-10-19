@@ -110,3 +110,27 @@ def test_run_forever_recovers_after_a_database_error(db, devices, caplog):
     asyncio.run(_run_until_recorded(devices, SimulatedProber(), db, RecordFailsOnce(db)))
     assert "polling cycle failed" in caplog.text
     assert db.history("alpha") and db.history("beta")
+
+
+def test_run_forever_scales_the_alerting_gap_to_the_poll_interval(db, devices, monkeypatch):
+    # With a 60s interval, consecutive checks are 60s apart. If the gap tolerance stayed at its
+    # 5s-interval default, every check would look like a gap and alerting would never fire.
+    from netmonlt import collector
+
+    seen = []
+
+    async def fake_poll_once(devices, prober, db, **kwargs):
+        seen.append(kwargs["max_gap_s"])
+
+    monkeypatch.setattr(collector, "poll_once", fake_poll_once)
+
+    async def scenario():
+        task = asyncio.create_task(collector.run_forever(devices, object(), db, 60.0))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert seen == [collector.stale_after_s(60.0)]
+    assert seen[0] > 60.0
