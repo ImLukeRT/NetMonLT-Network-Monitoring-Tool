@@ -30,7 +30,8 @@ starts, so don't leave it for later (if you miss it, the history is still there;
 
 ## Steps
 
-1. **Watch the device table.** Statuses, latency, loss and "last check" refresh every 3 seconds.
+1. **Watch the device table.** Statuses, latency and loss refresh every 3 seconds. The "N s ago"
+   labels count up every second in the browser from the age the API reported, without extra requests.
 2. **See the outage (about 30 to 40 s).** `access-switch` goes DOWN with 100% loss and the
    critical alert appears. Meanwhile the lossy `wifi-ap` raises only the occasional alert: a change
    needs 3 consecutive checks to agree, so single lost packets don't cause alert noise.

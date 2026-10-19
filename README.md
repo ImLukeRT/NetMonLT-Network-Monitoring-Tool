@@ -39,7 +39,7 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   server.
 - **Dashboard with no framework.** Plain HTML, JavaScript and hand-built SVG, no CDN, so it works
   offline. Shows stale data and API failures clearly.
-- **Tested.** 537 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
+- **Tested.** 545 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
   network and never need an SNMP device.
 
 ## Quick start (simulated demo)
@@ -411,7 +411,7 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-537 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
+545 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
 persistence, schema upgrade), the ICMP prober and its safety rules (with a fake command runner
 and recorded or constructed `ping` output), inventory validation, the collector's error handling,
 storage, the history and downsampling queries, the API and the CLI, and for SNMP: the counter

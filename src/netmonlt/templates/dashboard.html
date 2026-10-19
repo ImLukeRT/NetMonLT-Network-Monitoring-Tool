@@ -200,6 +200,34 @@ function cell(text, cls) {
   return td;
 }
 
+// ---- live "N s ago" labels -------------------------------------------------------------------
+// The API reports each age (in seconds) as of the moment it answered. A label made with setAge()
+// remembers that age and when the response arrived (on the browser's monotonic clock, so it is
+// immune to clock changes and to any difference between this clock and the server's), and a single
+// timer repaints it every second. No request is made: the polling intervals at the bottom of this
+// script are the only things that fetch data, and they replace the labels with fresh ages.
+const AGE_FORMATS = {
+  seconds: (s) => Math.round(s) + "s ago",
+  ago: (s) => ago(s),
+};
+
+function setAge(el, ageS, format, prefix) {
+  el.dataset.age = ageS;
+  el.dataset.at = performance.now();
+  el.dataset.format = format;
+  el.dataset.prefix = prefix || "";
+  paintAge(el);
+}
+
+function paintAge(el) {
+  const elapsed = Math.max(0, (performance.now() - Number(el.dataset.at)) / 1000);
+  el.textContent = el.dataset.prefix + AGE_FORMATS[el.dataset.format](Number(el.dataset.age) + elapsed);
+}
+
+function tickAges() {
+  for (const el of document.querySelectorAll("[data-age]")) paintAge(el);
+}
+
 function render(data) {
   const counts = {up: 0, degraded: 0, down: 0, stale: 0, unknown: 0};
   rows.replaceChildren();
@@ -217,9 +245,10 @@ function render(data) {
     // Real LAN replies are often well under 1 ms, so keep two decimals there.
     const rtt = d.rtt_avg_ms == null ? "–"
       : d.rtt_avg_ms.toFixed(d.rtt_avg_ms < 1 ? 2 : 1) + " ms";
-    const age = d.age_s == null ? "never" : Math.round(d.age_s) + "s ago";
+    const ageCell = cell("never", "num");
+    if (d.age_s != null) setAge(ageCell, d.age_s, "seconds");
     tr.append(badgeCell, cell(d.name), cell(d.address), cell(d.type),
-              cell(rtt, "num"), cell(loss, "num"), cell(age, "num"));
+              cell(rtt, "num"), cell(loss, "num"), ageCell);
     rows.appendChild(tr);
   }
   summary.replaceChildren();
@@ -251,7 +280,8 @@ function renderAlerts(data) {
     // Time of day is enough for recent alerts; older ones also need the date. Full time on hover.
     const at = new Date(a.ts * 1000);
     const when = a.age_s < 86400 ? at.toLocaleTimeString() : at.toLocaleString();
-    const timeCell = cell(when + " · " + ago(a.age_s), "num");
+    const timeCell = cell("", "num");
+    setAge(timeCell, a.age_s, "ago", when + " · ");
     timeCell.title = at.toLocaleString();
     tr.append(timeCell, sevCell, cell(a.device),
               cell(a.from_status + " → " + a.to_status), cell(a.message, "msg"));
@@ -667,8 +697,9 @@ function renderInterfaces(data) {
     if (failed || snmp.stale) {
       const why = document.createElement("span");
       why.className = "badge unknown";
-      why.textContent = (failed && snmp.message ? snmp.message + "; " : "")
-        + (snmp.last_ok_age_s === null ? "no successful poll yet" : "last good data " + Math.round(snmp.last_ok_age_s) + "s ago");
+      const reason = failed && snmp.message ? snmp.message + "; " : "";
+      if (snmp.last_ok_age_s === null) why.textContent = reason + "no successful poll yet";
+      else setAge(why, snmp.last_ok_age_s, "seconds", reason + "last good data ");
       why.style.fontWeight = "400";
       td.appendChild(why);
     }
@@ -691,11 +722,13 @@ function renderInterfaces(data) {
       status.textContent = i.oper_status;
       statusCell.appendChild(status);
       const note = i.rate_note;
+      const updated = cell("", "num");
+      setAge(updated, i.age_s, "seconds", i.present ? "" : "last seen ");
       tr.append(cell(i.name, "ifname"), statusCell,
                 ifNumberCell(fmtBps(i.in_bps), note), ifNumberCell(fmtBps(i.out_bps), note),
                 ifNumberCell(pair(i.in_errors_delta, i.out_errors_delta), note),
                 ifNumberCell(pair(i.in_discards_delta, i.out_discards_delta), note),
-                cell(i.present ? Math.round(i.age_s) + "s ago" : "last seen " + Math.round(i.age_s) + "s ago", "num"));
+                updated);
       ifRows.appendChild(tr);
     }
     if (entry.interfaces.length === 0 && snmp.status !== "pending") {
@@ -729,6 +762,7 @@ setInterval(refreshInterfaces, 5000);
 
 refresh();
 setInterval(refresh, 3000);
+setInterval(tickAges, 1000);   // repaints the "N s ago" labels from data already received; no requests
 </script>
 </body>
 </html>
