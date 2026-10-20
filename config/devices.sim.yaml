@@ -44,6 +44,14 @@ wifi:
     disconnect_at_s: 130   # then the link drops entirely ...
     disconnect_duration_s: 20  # ... for this long
 
+# Incident management defaults (all optional). In this simulated demo, acknowledging an incident
+# stores clearly labelled example documentation. Automatic resolution is OFF unless you enable it;
+# both are simulation-only and are rejected in real mode.
+# incidents:
+#   simulation_auto_documentation: true   # default; false disables the example documentation
+#   simulation_auto_resolve: false        # true: resolve acknowledged, documented, recovered
+#                                         # incidents automatically (never active or unknown ones)
+
 devices:
   - name: core-router
     address: 192.0.2.1

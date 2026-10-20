@@ -32,7 +32,10 @@ def process_once(
         )
         total += done
         if done < 500:
-            return total
+            break
+    if simulated and cfg.simulation_auto_resolve:  # simulation only, and off unless enabled
+        db.auto_resolve_incidents(cfg, simulated_mode=True, now=clock())
+    return total
 
 
 async def run_incidents_forever(

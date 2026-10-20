@@ -160,8 +160,8 @@ def test_full_workflow_over_the_api(seeded):
     assert detail["report"]["operator"]["actions_taken"] == "Reseated the patch cable."
     assert detail["report"]["resolved_at"] is not None
     kinds = [t["kind"] for t in detail["report"]["observed"]["timeline"]]
-    assert kinds == ["opened", "recovered", "acknowledged", "note", inc.EV_REPORT, inc.EV_REPORT,
-                     "resolved"]
+    assert kinds == ["opened", "recovered", "acknowledged", inc.EV_AUTO_DOC, "note",
+                     inc.EV_REPORT, inc.EV_REPORT, "resolved"]  # simulated: example docs stored
 
     re = client.post(f"{url}/reopen", json={"actor": "bob", "reason": "Dropped again."}, headers=h)
     assert re.status_code == 200 and "alpha" in ids(client)
@@ -403,7 +403,7 @@ def test_simulated_incidents_carry_a_labelled_illustrative_example(db):
     assert example["illustrative_troubleshooting_steps"][0].startswith("Check the router")
     assert all(report["operator"][f] == "" for f in inc.REPORT_TEXT_FIELDS)
     md = client.get(f"/api/incidents/{alpha}/report").text
-    assert "SIMULATED / ILLUSTRATIVE EXAMPLE" in md and "NetMonLT performed no repair" in md
+    assert "SIMULATED EXAMPLE — AUTO-GENERATED" in md and "NetMonLT performed no repair" in md
     assert client.get(f"/api/incidents/{alpha}/report").text == md  # deterministic
 
 

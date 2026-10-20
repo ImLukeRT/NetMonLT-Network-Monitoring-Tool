@@ -48,6 +48,9 @@ poll_interval_s: 10      # minimum 5 in real mode
 #   correlation_window_s: 900     # a fault that returns within this many seconds of recovery
 #                                 # joins the same incident (60 to 86400)
 #   flapping_recurrences: 2       # this many recurrences mark an incident as flapping
+#   # simulation_auto_documentation and simulation_auto_resolve are SIMULATION-ONLY features of
+#   # the demo inventory (see config/devices.sim.yaml). Do not set them to true here: enabling
+#   # either in real mode is rejected when the inventory loads.
 #   operator_actions: false       # OFF by default in real mode (incidents are read-only). Set
 #                                 # true to let this machine acknowledge, note, resolve and
 #                                 # import earlier alerts as incidents.

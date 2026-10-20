@@ -47,6 +47,11 @@ KIND_ICMP = "icmp-status"  # the only alert type today; correlation never crosse
 # ---- event sources and kinds (the audit trail is append-only)
 SRC_MONITORING = "monitoring"
 SRC_OPERATOR = "operator"
+SRC_SIMULATION = "simulation"  # automatic, simulation-only actions: never a person, never real
+EV_AUTO_DOC, EV_AUTO_RESOLVED = "auto_documented", "auto_resolved"
+AUTO_ACTOR = "simulation-auto"  # who an automatic resolution is attributed to (reserved name)
+AUTO_MARKER = "SIMULATED EXAMPLE — AUTO-GENERATED"
+AUTO_DOC_VERSION = 1
 EV_OPENED, EV_ALERT, EV_RECOVERED, EV_RECURRED = "opened", "alert", "recovered", "recurred"
 EV_IMPORTED = "imported"  # the incident was reconstructed later from stored alerts
 ORIGIN_LIVE, ORIGIN_IMPORTED = "live", "imported"
@@ -57,6 +62,8 @@ EVENT_LABELS = {
     EV_RECURRED: "Fault recurred", EV_ACK: "Acknowledged", EV_NOTE: "Investigation note",
     EV_REPORT: "Write-up updated", EV_RESOLVED: "Resolved", EV_REOPENED: "Reopened",
     EV_IMPORTED: "Imported from alert history",
+    EV_AUTO_DOC: "Example documentation generated (simulation)",
+    EV_AUTO_RESOLVED: "Auto-resolved by the simulation",
 }
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
@@ -154,7 +161,10 @@ def lifecycle(inc: Incident) -> dict:
     recovered = inc.monitoring_state == MON_RECOVERED
     unknown = inc.monitoring_state == MON_UNKNOWN
     reopened = inc.reopened_count > 0
-    if inc.review_state == REV_RESOLVED:
+    auto_resolved = inc.review_state == REV_RESOLVED and inc.resolved_by == AUTO_ACTOR
+    if auto_resolved:
+        code, label = "auto_resolved", "Auto-resolved (simulation)"
+    elif inc.review_state == REV_RESOLVED:
         code, label = "resolved", "Resolved"
     elif inc.review_state == REV_ACKNOWLEDGED:
         if recovered:
@@ -185,6 +195,9 @@ def lifecycle(inc: Incident) -> dict:
         "awaiting_review": recovered and inc.review_state == REV_OPEN,
         "recovery_unknown": unknown,
         "imported": inc.origin == ORIGIN_IMPORTED,
+        "auto_resolved": auto_resolved,
+        "resolution": (None if inc.review_state != REV_RESOLVED
+                       else "simulation-auto" if auto_resolved else "operator"),
         "in_active_view": inc.review_state != REV_RESOLVED,
     }
 
@@ -371,6 +384,9 @@ def clean_actor(value: Any) -> str:
         raise IncidentError(
             IncidentError.INVALID_INPUT,
             "actor must be 1 to 40 characters: letters, digits, spaces and . _ @ ' -")
+    if value.strip().lower() == AUTO_ACTOR:
+        raise IncidentError(IncidentError.INVALID_INPUT,
+                            f"the actor name {AUTO_ACTOR!r} is reserved for the simulation")
     return value.strip()
 
 
@@ -541,12 +557,89 @@ ILLUSTRATIVE_LESSONS = [
 ]
 SIM_NOTICE = (
     "Everything in this block is fictional EXAMPLE content generated from the simulator's known "
-    "events. It was not observed or performed by anyone, and no real device was involved."
+    "events. It was not observed or performed by anyone, no real device was involved, and no "
+    "troubleshooting, root cause or repair is verified."
 )
 NO_REMEDIATION = (
     "NetMonLT performed no repair, restart or reconfiguration of any device: it only observes "
     "and records."
 )
+
+
+def auto_resolution_text(inc: Incident) -> str:
+    """The AUTO-GENERATED resolution statement for a simulated incident, from its current state.
+    It never claims a repair, a root cause or a human investigation."""
+    if inc.monitoring_state == MON_RECOVERED and inc.recovered_ts is not None:
+        return (f"{AUTO_MARKER}. EXAMPLE ONLY (fictional): this incident recovered in "
+                f"simulation (monitoring confirmed recovery at {fmt_ts(inc.recovered_ts)}) "
+                "without any verified repair. No human investigation, root cause or repair was "
+                "performed or verified, and none is claimed. This is not an operator resolution.")
+    if inc.monitoring_state == MON_UNKNOWN:
+        return (f"{AUTO_MARKER}. EXAMPLE ONLY (fictional): no recovery was recorded for this "
+                "historical fault, so state in your own words how you know it ended.")
+    return (f"{AUTO_MARKER}. EXAMPLE ONLY (fictional): monitoring has not yet confirmed "
+            "recovery, so there is nothing to resolve.")
+
+
+def monitoring_state_phrase(inc: Incident) -> str:
+    if inc.monitoring_state == MON_RECOVERED and inc.recovered_ts is not None:
+        return f"monitoring had confirmed recovery at {fmt_ts(inc.recovered_ts)}"
+    if inc.monitoring_state == MON_UNKNOWN:
+        return "monitoring had recorded no recovery for this fault (recovery unknown)"
+    return "monitoring still reported the fault and had not confirmed recovery"
+
+
+def build_auto_documentation(
+    inc: Incident, *, device_type: str = "host", sim: SimProfile | None = None,
+    poll_interval_s: float = 5.0,
+) -> dict:
+    """The AUTO-GENERATED example documentation for a SIMULATED incident. Deterministic, and
+    narrative only: every note is an instruction or an explicit example, never a statement that
+    something was observed, done or fixed. The observed facts (timeline, checks, recovery) are not
+    copied here: reports always read them live from the stored alerts and checks."""
+    steps = (ILLUSTRATIVE_OUTAGE_STEPS.get(device_type, ILLUSTRATIVE_DEFAULT_STEPS)
+             if inc.severity == "critical" else ILLUSTRATIVE_DEGRADED_STEPS)
+    cause = known_scenario_cause(inc, sim, poll_interval_s)
+    imported = inc.origin == ORIGIN_IMPORTED
+    notes = ["Example note — start with the original alert timeline and the monitoring "
+             "evidence in this report: they are the only observed facts here."]
+    notes += [f"Example check — {step}" for step in steps]
+    notes.append(
+        "Simulator-defined scenario (a label from the simulation script, not a diagnosis) — "
+        + cause["text"] if cause else
+        "No cause is defined by the simulator for this incident, so none is stated.")
+    if imported:
+        notes.append("This incident was reconstructed from historical monitoring events: the "
+                     "original alert times and stored checks are kept, and nothing missing from "
+                     "them has been filled in.")
+    notes.append(f"At the time this example was generated, {monitoring_state_phrase(inc)}.")
+    return {
+        "version": AUTO_DOC_VERSION, "marker": AUTO_MARKER, "notice": SIM_NOTICE,
+        "imported": imported, "monitoring_at_generation": inc.monitoring_state,
+        "investigation_notes": notes, "steps": list(steps), "scenario_cause": cause,
+        "no_cause_note": (None if cause else
+                          "The simulator defines no cause for this incident, so none is stated."),
+        "recommendations": list(ILLUSTRATIVE_RECOMMENDATIONS),
+        "lessons": list(ILLUSTRATIVE_LESSONS),
+    }
+
+
+def auto_resolve_blocker(inc: Incident, *, has_doc: bool, simulated_mode: bool,
+                         enabled: bool) -> str | None:
+    """Why an incident may NOT be auto-resolved (None: it may). The one place the rule lives."""
+    if not (enabled and simulated_mode):
+        return "automatic resolution is off (simulation-only, disabled by default)"
+    if not inc.simulated:
+        return "the incident is not a simulated one"
+    if inc.review_state != REV_ACKNOWLEDGED:
+        return "it has not been acknowledged (or is already resolved)"
+    if inc.reopened_count:
+        return "it was reopened, so a person has taken it over"
+    if inc.monitoring_state != MON_RECOVERED or inc.recovered_ts is None:
+        return "monitoring has not confirmed recovery (an active fault or an unknown recovery)"
+    if not has_doc:
+        return "its example documentation has not been generated"
+    return None
 
 
 def known_scenario_cause(
@@ -599,6 +692,7 @@ def build_report(
     device_type: str = "host",
     sim: SimProfile | None = None,
     poll_interval_s: float = 5.0,
+    auto_doc: Mapping[str, Any] | None = None,
 ) -> dict:
     """The structured incident write-up. Keys are grouped by provenance:
 
@@ -733,29 +827,31 @@ def build_report(
         },
         "simulated_example": None,
     }
+    resolved = inc.review_state == REV_RESOLVED
+    auto_event = next((e for e in events if e.kind == EV_AUTO_RESOLVED), None)
+    report["resolution"] = {
+        "kind": life["resolution"], "by": inc.resolved_by if resolved else None,
+        "auto_statement": auto_event.text if (life["auto_resolved"] and auto_event) else None,
+    }
     if inc.simulated:
-        steps = (ILLUSTRATIVE_OUTAGE_STEPS.get(device_type, ILLUSTRATIVE_DEFAULT_STEPS)
-                 if inc.severity == "critical" else ILLUSTRATIVE_DEGRADED_STEPS)
-        cause = known_scenario_cause(inc, sim, poll_interval_s)
-        recovered = inc.monitoring_state == MON_RECOVERED
+        stored = auto_doc is not None
+        doc = (auto_doc["doc"] if stored else
+               build_auto_documentation(inc, device_type=device_type, sim=sim,
+                                        poll_interval_s=poll_interval_s))
         report["simulated_example"] = {
-            "label": "SIMULATED / ILLUSTRATIVE EXAMPLE",
-            "notice": SIM_NOTICE,
-            "known_scenario_cause": cause,
-            "no_cause_note": (None if cause else
-                              "The simulator defines no cause for this incident, so none is "
-                              "stated."),
-            "illustrative_troubleshooting_steps": list(steps),
-            "illustrative_resolution_summary": (
-                "EXAMPLE ONLY (fictional): in this simulation the condition cleared by itself "
-                "according to its script, so no repair was needed. For a real incident, record "
-                "what you actually found and did." if recovered else
-                "EXAMPLE ONLY (fictional): no recovery was recorded for this historical fault, "
-                "so state in your own words how you know it ended." if unknown else
-                "EXAMPLE ONLY (fictional): monitoring has not yet confirmed recovery, so there "
-                "is nothing to resolve."),
-            "illustrative_recommendations": list(ILLUSTRATIVE_RECOMMENDATIONS),
-            "illustrative_lessons_learned": list(ILLUSTRATIVE_LESSONS),
+            "label": AUTO_MARKER,
+            "notice": doc["notice"],
+            "stored": stored,
+            "generated_at": fmt_ts(auto_doc["generated_ts"]) if stored else None,
+            "imported": doc["imported"],
+            "monitoring_at_generation": doc["monitoring_at_generation"],
+            "investigation_notes": list(doc["investigation_notes"]),
+            "known_scenario_cause": doc["scenario_cause"],
+            "no_cause_note": doc["no_cause_note"],
+            "illustrative_troubleshooting_steps": list(doc["steps"]),
+            "illustrative_resolution_summary": auto_resolution_text(inc),
+            "illustrative_recommendations": list(doc["recommendations"]),
+            "illustrative_lessons_learned": list(doc["lessons"]),
         }
     return report
 
@@ -777,6 +873,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     recovered_line = report["recovered_at"] or (
         "unknown (no recovery alert was recorded)" if report.get("recovery_unknown")
         else "not confirmed")
+    res = report["resolution"]
+    resolved_by_line = (
+        f"SIMULATION AUTO-RESOLUTION ({res['by']}): no operator reviewed or resolved this"
+        if res["kind"] == "simulation-auto" else f"operator ({res['by']})")
     lines = [
         f"# {report['title']}",
         "",
@@ -787,6 +887,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"- **Detected:** {report['detected_at']}",
         f"- **Monitoring recovered:** {recovered_line}",
         f"- **Resolved:** {report['resolved_at'] or 'not resolved'}",
+        *([f"- **Resolved by:** {resolved_by_line}"] if report["resolved_at"] else []),
         f"- **Flapping:** {flapping}",
         "",
         "## 1. Summary (observed by NetMonLT)",
@@ -796,7 +897,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     ]
     for item in obs["timeline"]:
         who = f" ({item['actor']})" if item.get("actor") else ""
-        origin = "NetMonLT" if item["source"] == SRC_MONITORING else "operator"
+        origin = {SRC_MONITORING: "NetMonLT", SRC_SIMULATION: "simulation (auto)"}.get(
+            item["source"], "operator")
         text = (item.get("text") or "").replace("\n", " ")
         line = f"- {item['time']} [{origin}] {item['label']}{who}"
         lines.append(line + (f": {text}" if text else ""))
@@ -829,8 +931,12 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "## 8. Actions taken (operator-entered)",
         _block(op["actions_taken"], unset),
         "",
-        "## 9. Resolution",
+        ("## 9. Resolution (SIMULATION AUTO-RESOLUTION: not an operator)"
+         if res["kind"] == "simulation-auto" else "## 9. Resolution (operator)"),
         f"- Resolved at: {report['resolved_at'] or 'not resolved'}",
+        *([f"- Auto-resolution statement ({AUTO_MARKER}): {res['auto_statement']}",
+           "- No human investigation or repair was verified, and the fields below are blank "
+           "because only a person writes them."] if res["kind"] == "simulation-auto" else []),
         *(["- Monitoring status: recovery unknown. NetMonLT never recorded a recovery for this "
            "fault; the resolution below is the operator's statement, not a monitoring "
            "confirmation."] if report.get("recovery_unknown") else []),
@@ -847,6 +953,12 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"## {example['label']}",
             f"**{example['notice']}**",
             "",
+            (f"- Generated automatically at {example['generated_at']} when the incident was "
+             "acknowledged (stored once)." if example["stored"] else
+             "- Preview only: not stored yet. It is generated and stored when the incident is "
+             "acknowledged."),
+            "- Example investigation notes (not performed by anyone):",
+            *[f"  - {n}" for n in example["investigation_notes"]],
             "- Known scenario cause (defined by the simulator): "
             + (cause["text"] if cause else example["no_cause_note"]),
             "- Illustrative troubleshooting steps (fictional, not performed):",

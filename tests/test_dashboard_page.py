@@ -360,3 +360,23 @@ def test_incident_requests_can_never_carry_an_undefined_view():
     refresh_body = function_body("refresh")
     assert 'ALERT_VIEWS.includes(view) ? view : "unresolved"' in refresh_body
     assert '"&view=" + (ALERT_VIEWS' in refresh_body
+
+
+# ------------------------------------------------------- simulation auto-documentation UI
+def test_the_page_keeps_the_four_kinds_of_content_visibly_apart():
+    for needle in (
+        "SIMULATION AUTO-RESOLUTION",           # the simulation's resolution, not an operator's
+        '"Resolved by operator "',              # a person's resolution
+        "Generate example documentation",       # the button for incidents acknowledged earlier
+        "Generated automatically at",           # auto-generated documentation, with when
+        'human-entered',                        # the operator write-up is marked as a person's
+        '"Simulation (auto)"',                  # its own timeline tag
+        "auto_resolved: \"auto\"",              # its own status badge
+        "Monitoring: ",                         # monitoring's recovery, shown separately
+    ):
+        assert needle in PAGE, needle
+    assert ".inc-src.simulation" in PAGE and ".badge.auto" in PAGE
+    assert "/auto-documentation" in PAGE
+    script = PAGE[PAGE.index("<script>"):]
+    for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+        assert forbidden not in script

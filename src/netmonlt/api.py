@@ -76,6 +76,10 @@ class ImportBody(_Body):
     confirm: str = Field(pattern=r"^[0-9a-f]{64}$")  # the fingerprint the preview returned
 
 
+class AutoDocBody(_Body):
+    actor: str | None = Field(None, max_length=40)  # accepted for symmetry; not recorded
+
+
 class ReopenBody(_Body):
     actor: str | None = Field(None, max_length=40)
     reason: str = Field(max_length=inc.MAX_REASON_LEN)
@@ -126,6 +130,11 @@ def create_app(
     qos_stale_s = qos_stale_after_s(inventory.qos_poll_interval_s)
     incidents_cfg = inventory.incidents
     simulated_mode = inventory.mode == "simulated"
+    # Simulation-only features. Example documentation is on by default in the simulated demo and
+    # can be switched off; automatic resolution is off unless the inventory enables it. Neither
+    # can ever apply to real monitoring (the loader also rejects enabling them in real mode).
+    auto_doc_enabled = simulated_mode and incidents_cfg.simulation_auto_documentation is not False
+    auto_resolve_enabled = simulated_mode and incidents_cfg.simulation_auto_resolve
     # Changing incidents is on by default in the simulated demo, but opt-in for real monitoring.
     actions_enabled = (simulated_mode if incidents_cfg.operator_actions is None
                        else incidents_cfg.operator_actions)
@@ -603,9 +612,24 @@ def create_app(
         report = inc.build_report(
             i, events, db.incident_evidence(i, now), cfg=incidents_cfg,
             device_type=device.type if device else "host", sim=device.sim if device else None,
-            poll_interval_s=inventory.poll_interval_s,
+            poll_interval_s=inventory.poll_interval_s, auto_doc=db.get_auto_doc(i.id),
         )
         return report, events
+
+    def auto_doc_builder(i: inc.Incident) -> dict:
+        device = devices_by_name.get(i.device)
+        return inc.build_auto_documentation(
+            i, device_type=device.type if device else "host", sim=device.sim if device else None,
+            poll_interval_s=inventory.poll_interval_s)
+
+    def auto_flags() -> dict:
+        return {"auto_documentation": auto_doc_enabled, "auto_resolve": auto_resolve_enabled}
+
+    def run_auto_resolution() -> list[int]:
+        if not auto_resolve_enabled:
+            return []
+        return db.auto_resolve_incidents(incidents_cfg, simulated_mode=simulated_mode,
+                                         now=clock())
 
     @app.get("/api/incidents")
     def list_incidents(
@@ -624,7 +648,8 @@ def create_app(
         base = {"enabled": incidents_cfg.enabled, "simulated": simulated_mode,
                 "server_time": clock(), **incident_access(request),
                 "correlation_window_s": incidents_cfg.correlation_window_s,
-                "flapping_recurrences": incidents_cfg.flapping_recurrences, "view": view}
+                "flapping_recurrences": incidents_cfg.flapping_recurrences, "view": view,
+                **auto_flags()}
         if not incidents_cfg.enabled:
             return {**base, "counts": {"active": 0, "history": 0, "awaiting_review": 0},
                     "incidents": []}
@@ -673,7 +698,7 @@ def create_app(
         found = require_incident(incident_id)
         now = clock()
         report, events = build_incident_report(found, now)
-        return {"server_time": now, **incident_access(request),
+        return {"server_time": now, **incident_access(request), **auto_flags(),
                 "incident": incident_summary(found, db.incident_alert_count(found.id)),
                 "report": report, "markdown": inc.render_markdown(report)}
 
@@ -693,9 +718,37 @@ def create_app(
 
     @app.post("/api/incidents/{incident_id}/acknowledge", dependencies=[Depends(require_change)])
     def acknowledge(incident_id: int, body: AckBody):
-        """Record that a person has seen this incident. Does not change monitoring state."""
-        db.acknowledge_incident(incident_id, body.actor, body.note, clock())
-        return changed(incident_id)
+        """Record that a person has seen this incident. Does not change monitoring state and does
+        not resolve it. In simulation mode only, it also stores the example documentation (once);
+        and only if the inventory enables automatic resolution may a recovered, documented
+        simulated incident then be resolved automatically (never by this call alone)."""
+        had_doc = db.get_auto_doc(incident_id) is not None
+        db.acknowledge_incident(incident_id, body.actor, body.note, clock(),
+                                auto_doc=auto_doc_builder if auto_doc_enabled else None)
+        resolved = run_auto_resolution()
+        return changed(incident_id, {
+            "auto_documentation": {
+                "enabled": auto_doc_enabled,
+                "generated": auto_doc_enabled and not had_doc
+                and db.get_auto_doc(incident_id) is not None},
+            "auto_resolved": incident_id in resolved})
+
+    @app.post("/api/incidents/{incident_id}/auto-documentation",
+              dependencies=[Depends(require_change)])
+    def generate_auto_documentation(incident_id: int, body: AutoDocBody):
+        """Simulation only: generate the example documentation for a simulated incident (for one
+        acknowledged before this existed, or with the feature off at the time). Idempotent: if it
+        already exists nothing changes. Never touches operator notes or write-ups."""
+        if not auto_doc_enabled:
+            raise inc.IncidentError(
+                inc.IncidentError.INVALID_TRANSITION,
+                "example documentation is a simulation-only feature and is off here (real mode, "
+                "or disabled in the inventory)")
+        generated = db.generate_auto_documentation(incident_id, auto_doc_builder, clock())
+        resolved = run_auto_resolution()
+        return changed(incident_id, {"auto_documentation": {"enabled": True,
+                                                            "generated": generated},
+                                     "auto_resolved": incident_id in resolved})
 
     @app.post("/api/incidents/{incident_id}/notes", dependencies=[Depends(require_change)])
     def add_note(incident_id: int, body: NoteBody):

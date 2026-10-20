@@ -39,7 +39,10 @@ _TOP_KEYS = {
     "mode", "poll_interval_s", "snmp_poll_interval_s", "qos_poll_interval_s",
     "qos_retention_hours", "quality", "wifi", "incidents", "devices",
 }
-_INCIDENTS_KEYS = {"enabled", "correlation_window_s", "flapping_recurrences", "operator_actions"}
+_INCIDENTS_KEYS = {
+    "enabled", "correlation_window_s", "flapping_recurrences", "operator_actions",
+    "simulation_auto_documentation", "simulation_auto_resolve",
+}
 _WIFI_KEYS = {
     "enabled", "poll_interval_s", "backend", "ssid_privacy", "low_signal_pct",
     "warn_after_polls", "retention_days", "sim",
@@ -184,7 +187,7 @@ def parse_inventory(raw: Any) -> Inventory:
 
     quality = _parse_quality(raw.get("quality"))
     wifi = _parse_wifi(raw.get("wifi"), mode)
-    incidents = _parse_incidents(raw.get("incidents"))
+    incidents = _parse_incidents(raw.get("incidents"), mode)
 
     qos_minimum = REAL_MIN_QOS_INTERVAL_S if mode == "real" else 1.0
     qos_interval = _number(
@@ -248,7 +251,7 @@ def _parse_quality(raw: Any) -> QualityConfig:
     )
 
 
-def _parse_incidents(raw: Any) -> IncidentsConfig:
+def _parse_incidents(raw: Any, mode: str = "simulated") -> IncidentsConfig:
     """The optional `incidents:` block: correlation window and whether operator actions exist."""
     if raw is None:
         return IncidentsConfig()
@@ -257,13 +260,25 @@ def _parse_incidents(raw: Any) -> IncidentsConfig:
     _reject_unknown(raw, _INCIDENTS_KEYS, "incidents")
     defaults = IncidentsConfig()
     flags = {}
-    for key in ("enabled", "operator_actions"):
+    for key in ("enabled", "operator_actions", "simulation_auto_documentation",
+                "simulation_auto_resolve"):
         value = raw.get(key, getattr(defaults, key))
         if value is not None and not isinstance(value, bool):
             raise InventoryError(f"incidents.{key} must be true or false")
         flags[key] = value
     if flags["enabled"] is None:
         raise InventoryError("incidents.enabled must be true or false")
+    if flags["simulation_auto_resolve"] is None:
+        raise InventoryError("incidents.simulation_auto_resolve must be true or false")
+    for key in ("simulation_auto_documentation", "simulation_auto_resolve"):
+        if mode == "real" and flags[key] is True:
+            raise InventoryError(
+                f"incidents.{key} is a simulation-only feature and cannot be enabled in real "
+                "mode: it would write example (fictional) documentation about real devices")
+    if flags["simulation_auto_resolve"] and flags["simulation_auto_documentation"] is False:
+        raise InventoryError(
+            "incidents.simulation_auto_resolve needs incidents.simulation_auto_documentation "
+            "(an incident is only auto-resolved once its example documentation exists)")
     window = _number(
         raw.get("correlation_window_s", defaults.correlation_window_s),
         "incidents.correlation_window_s", minimum=60, maximum=86400,
@@ -277,6 +292,8 @@ def _parse_incidents(raw: Any) -> IncidentsConfig:
     return IncidentsConfig(
         enabled=flags["enabled"], correlation_window_s=window,
         flapping_recurrences=int(recurrences), operator_actions=flags["operator_actions"],
+        simulation_auto_documentation=flags["simulation_auto_documentation"],
+        simulation_auto_resolve=flags["simulation_auto_resolve"],
     )
 
 

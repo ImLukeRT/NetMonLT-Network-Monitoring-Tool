@@ -181,6 +181,13 @@ class IncidentsConfig:
     # True/False sets it. None (not configured) means on in the simulated demo and OFF in real
     # mode: changing incidents on real monitoring is opt-in. Off means the views are read-only.
     operator_actions: bool | None = None
+    # SIMULATION ONLY. Example documentation is generated when a simulated incident is
+    # acknowledged. None (not configured) means on in the simulated demo; never applies to real
+    # monitoring (an explicit True in real mode is rejected when the inventory loads).
+    simulation_auto_documentation: bool | None = None
+    # SIMULATION ONLY and OFF unless explicitly enabled: an acknowledged simulated incident whose
+    # recovery monitoring has confirmed is resolved automatically (as "simulation-auto").
+    simulation_auto_resolve: bool = False
 
 
 @dataclass(frozen=True)

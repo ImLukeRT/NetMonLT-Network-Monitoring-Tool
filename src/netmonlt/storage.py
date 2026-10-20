@@ -202,6 +202,24 @@ CREATE TABLE IF NOT EXISTS incident_cursor (
 );
 INSERT OR IGNORE INTO incident_cursor(id, last_alert_id)
     SELECT 1, COALESCE(MAX(id), 0) FROM alerts;
+-- Simulation only: the example documentation generated when a SIMULATED incident is acknowledged.
+-- One row per incident (the primary key makes it idempotent) and append-only. It is kept apart
+-- from everything a person writes: it never touches incidents.report or operator notes.
+CREATE TABLE IF NOT EXISTS incident_auto_docs (
+    incident_id       INTEGER PRIMARY KEY REFERENCES incidents(id),
+    generated_ts      REAL NOT NULL,
+    generator_version INTEGER NOT NULL,
+    monitoring_state  TEXT NOT NULL,
+    doc               TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS incident_auto_docs_no_update BEFORE UPDATE ON incident_auto_docs
+BEGIN SELECT RAISE(ABORT, 'auto-generated documentation is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS incident_auto_docs_no_delete BEFORE DELETE ON incident_auto_docs
+BEGIN SELECT RAISE(ABORT, 'auto-generated documentation is append-only'); END;
+-- At most one automatic documentation event and one automatic resolution event per incident,
+-- however often, or from however many places, they are attempted.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_events_auto
+    ON incident_events(incident_id, kind) WHERE kind IN ('auto_documented', 'auto_resolved');
 -- QoS telemetry (opt-in, read-only SNMPv3). Raw counters are kept only for the LATEST poll of each
 -- element (needed to derive the next rate); history holds derived rates, one row per element
 -- per poll, for a bounded time. Counters are TEXT because a Counter64 can exceed signed 64-bit.
@@ -921,7 +939,96 @@ class Database:
             text=json.dumps(changes, ensure_ascii=False),
         )
 
-    def acknowledge_incident(self, incident_id: int, actor, note, now: float) -> inc.Incident:
+    # ---- simulation-only auto-documentation and auto-resolution
+    def get_auto_doc(self, incident_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT generated_ts, generator_version, monitoring_state, doc "
+                "FROM incident_auto_docs WHERE incident_id=?", (incident_id,)).fetchone()
+        if row is None:
+            return None
+        return {"generated_ts": row["generated_ts"], "version": row["generator_version"],
+                "monitoring_state": row["monitoring_state"], "doc": _json_dict(row["doc"])}
+
+    def _create_auto_doc(self, incident: inc.Incident, build, now: float) -> bool:
+        """Store the example documentation once (lock and transaction held by the caller).
+        Returns whether it was created. Only ever for an incident flagged as simulated."""
+        if not incident.simulated:
+            return False
+        done = self._conn.execute(
+            "SELECT 1 FROM incident_auto_docs WHERE incident_id=?", (incident.id,)).fetchone()
+        if done is not None:
+            return False
+        doc = build(incident)
+        created = self._conn.execute(
+            "INSERT OR IGNORE INTO incident_auto_docs(incident_id, generated_ts, "
+            "generator_version, monitoring_state, doc) VALUES (?, ?, ?, ?, ?)",
+            (incident.id, now, doc["version"], incident.monitoring_state,
+             json.dumps(doc, ensure_ascii=False))).rowcount
+        if created:
+            self._insert_incident_event(
+                incident.id, now, inc.SRC_SIMULATION, inc.EV_AUTO_DOC,
+                text=f"{inc.AUTO_MARKER}: example documentation stored. It was not observed or "
+                     "performed by anyone.")
+        return bool(created)
+
+    def generate_auto_documentation(self, incident_id: int, build, now: float) -> bool:
+        """Generate the example documentation for a simulated incident (idempotent: False if it
+        already exists). Refused for an incident that is not a simulated one."""
+        with self._lock, self._conn:
+            incident = self._load_for_update(incident_id)
+            if not incident.simulated:
+                raise inc.IncidentError(
+                    inc.IncidentError.INVALID_TRANSITION,
+                    "example documentation is only available for simulated incidents")
+            return self._create_auto_doc(incident, build, now)
+
+    def auto_resolve_incidents(
+        self, cfg: IncidentsConfig, *, simulated_mode: bool, now: float
+    ) -> list[int]:
+        """Resolve the simulated incidents that qualify, as the reserved "simulation-auto" actor.
+
+        Qualifying (see inc.auto_resolve_blocker): enabled, simulation mode, acknowledged, never
+        reopened, example documentation present and monitoring's recovery confirmed. Never an
+        active fault or an unknown recovery. It writes no operator field, and it is idempotent:
+        an incident gets at most one automatic resolution. Returns the ids it resolved."""
+        if not (simulated_mode and cfg.simulation_auto_resolve):
+            return []
+        resolved: list[int] = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                f"SELECT {_INCIDENT_COLUMNS} FROM incidents WHERE simulated=1 "
+                "AND review_state=? AND monitoring_state=? AND reopened_count=0 ORDER BY id",
+                (inc.REV_ACKNOWLEDGED, inc.MON_RECOVERED)).fetchall()
+            for row in rows:
+                incident = _incident_from_row(row)
+                has_doc = self._conn.execute(
+                    "SELECT 1 FROM incident_auto_docs WHERE incident_id=?",
+                    (incident.id,)).fetchone() is not None
+                done = self._conn.execute(
+                    "SELECT 1 FROM incident_events WHERE incident_id=? AND kind=?",
+                    (incident.id, inc.EV_AUTO_RESOLVED)).fetchone() is not None
+                if done or inc.auto_resolve_blocker(
+                        incident, has_doc=has_doc, simulated_mode=simulated_mode,
+                        enabled=cfg.simulation_auto_resolve) is not None:
+                    continue
+                self._insert_incident_event(
+                    incident.id, now, inc.SRC_SIMULATION, inc.EV_AUTO_RESOLVED,
+                    actor=inc.AUTO_ACTOR, text=inc.auto_resolution_text(incident))
+                self._conn.execute(
+                    "UPDATE incidents SET review_state=?, resolved_ts=?, resolved_by=? "
+                    "WHERE id=? AND review_state=?",
+                    (inc.REV_RESOLVED, now, inc.AUTO_ACTOR, incident.id, inc.REV_ACKNOWLEDGED))
+                self._store_evidence(incident.id, incident.device, incident.opened_ts,
+                                     incident.recovered_ts, incident.recovered_ts)
+                resolved.append(incident.id)
+        return resolved
+
+    def acknowledge_incident(
+        self, incident_id: int, actor, note, now: float, *, auto_doc=None,
+    ) -> inc.Incident:
+        """Record that a person has seen it. `auto_doc` (simulation only) is a function that
+        builds the example documentation, stored once as part of the same transaction."""
         actor = inc.clean_actor(actor)
         note = inc.clean_text(note, "note", max_len=inc.MAX_NOTE_LEN)
         with self._lock, self._conn:
@@ -933,7 +1040,10 @@ class Database:
             )
             self._insert_incident_event(incident_id, now, inc.SRC_OPERATOR, inc.EV_ACK,
                                         actor=actor, text=note or None)
-            return self._load_for_update(incident_id)
+            incident = self._load_for_update(incident_id)
+            if auto_doc is not None:
+                self._create_auto_doc(incident, auto_doc, now)
+            return incident
 
     def add_incident_note(self, incident_id: int, actor, text, now: float) -> inc.IncidentEvent:
         actor = inc.clean_actor(actor)

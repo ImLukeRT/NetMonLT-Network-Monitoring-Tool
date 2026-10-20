@@ -295,6 +295,7 @@ Shown together as one lifecycle label:
 | **Monitoring recovered — acknowledged** | Recovered, and a person has acknowledged it. |
 | **Recovery unknown — awaiting review** | An imported historical fault whose stored alerts end without a recovery alert. NetMonLT does not know whether or when it ended, and does not assume either way. |
 | **Resolved** | A person closed it with a written resolution summary. It leaves the Active view and stays in History. |
+| **Auto-resolved (simulation)** | **Simulation only, and only if enabled:** the simulation closed an acknowledged, documented, recovered simulated incident. **No person investigated or resolved it** (see below). |
 | **Reopened** | A person reopened a resolved incident (with a reason). |
 
 A user action can never falsify telemetry: acknowledging, noting, resolving and reopening change
@@ -326,13 +327,70 @@ resolution and timestamp, lessons learned), viewable on the dashboard and as cop
 - **Operator-entered** — blank until a person writes it. It is never pre-filled, and a root cause
   cannot be marked *confirmed* without stating one. Edits are appended to the audit trail, so
   earlier wording is never lost.
-- **Simulated example** (simulated mode only) — a deterministic, fictional illustration generated
-  from the simulator's known events: a cause **only if the simulator defines one** (a scripted
-  outage covering the detection time, or a configured loss or latency profile), otherwise it says
-  none is defined; illustrative troubleshooting steps, a resolution summary, recommendations and
-  lessons, every line labelled as an example that was not performed by anyone.
+- **Simulated example, headed `SIMULATED EXAMPLE — AUTO-GENERATED`** (simulated mode only) — a
+  deterministic, fictional illustration generated from the simulator's known events: a cause
+  **only if the simulator defines one** (a scripted outage covering the detection time, or a
+  configured loss or latency profile), otherwise it says none is defined; example investigation
+  notes, illustrative steps, a resolution summary, recommendations and lessons, every line
+  labelled as an example that was not observed or performed by anyone. It is stored once when
+  the incident is acknowledged (next section).
 
 Real incidents get only the first two. Nothing is invented for them.
+
+### Simulation-only auto-documentation and auto-resolution
+
+These two features exist **only in simulated mode**, so the whole incident workflow can be
+demonstrated without writing every report by hand. They are separate settings, and neither can
+ever apply to real monitoring: the inventory loader **rejects** enabling either in real mode, the
+API only offers them in simulated mode, the data layer only acts on incidents flagged as simulated,
+and the engine only runs auto-resolution in simulation.
+
+**Auto-documentation** (on by default in simulation; `simulation_auto_documentation: false`
+turns it off). When you **Acknowledge** a simulated incident, NetMonLT stores example
+documentation once: example investigation notes, a scenario cause only if the simulator defines
+one, and recommendations, all marked `SIMULATED EXAMPLE — AUTO-GENERATED`. Acknowledging does
+**not** resolve anything.
+
+- The report's observed facts (incident id, device, severity, type, detection time, the original
+  alert timeline, the real check counts, the recovery time and state) are always read live from
+  the stored alerts and checks. The generated text copies none of them and invents no observation,
+  troubleshooting action, confirmed root cause or repair; its notes are instructions and
+  explicit examples ("Example check — ..."), never statements that something was done.
+- It is **idempotent**: one document per incident (a primary key and a unique index), however many
+  times you acknowledge, reopen, refresh or restart, and with concurrent requests.
+- It is kept apart from everything a person writes: it never reads or writes your notes or
+  write-up fields, and the timeline, evidence and audit events are only ever added to. It is
+  stored in `incident_auto_docs` (append-only) plus one timeline event of source `simulation`.
+- **Generate example documentation** (button, or `POST /api/incidents/{id}/auto-documentation`)
+  does the same for a simulated incident that was acknowledged before this feature existed. It
+  changes nothing if the documentation already exists.
+- For an imported historical incident it says the incident was reconstructed from historical
+  monitoring events and that nothing missing was filled in.
+
+**Auto-resolution** (**off by default, including after upgrading**; `simulation_auto_resolve:
+true` enables it, and it needs auto-documentation). An incident is resolved automatically **only
+if all of these hold**: simulated mode, a simulated incident, acknowledged, example documentation
+exists, **monitoring has confirmed recovery**, and it has **never been reopened**. It never applies
+to an active fault or to an incident whose recovery is unknown, and a person's own resolution always
+takes priority. It runs right after an acknowledge and on the incident engine's 2-second tick, so
+it also covers a recovery that arrives after you acknowledged.
+
+- It is recorded as the reserved actor `simulation-auto` with a `simulation` event source (people
+  cannot use that name), and a statement that "this incident recovered in simulation without any
+  verified repair ... No human investigation, root cause or repair was performed or verified".
+- It writes **no** operator field, so it never overwrites a note, write-up or resolution summary.
+- At most one automatic resolution per incident (a unique index), so it is safe across restarts and
+  concurrent processing.
+
+How the dashboard and Markdown report tell these five things apart:
+
+| What | Where it shows | How it is marked |
+|---|---|---|
+| Monitoring observations | "Observed by NetMonLT", `Monitoring: recovered`, the evidence | tag **NetMonLT** |
+| Auto-generated simulated example | dashed block, report section `SIMULATED EXAMPLE — AUTO-GENERATED` | dashed border and the marker, with when it was generated |
+| Human-entered investigation notes and write-up | notes, "Operator write-up" | tag **Operator**, labelled *human-entered* |
+| Human resolution | "Resolved by operator alice", `## 9. Resolution (operator)` | green box |
+| Simulation auto-resolution | "Auto-resolved (simulation)", `## 9. Resolution (SIMULATION AUTO-RESOLUTION: not an operator)` | dashed badge and box, tag **Simulation (auto)** |
 
 ### Using it
 
@@ -955,6 +1013,7 @@ Every endpoint is read-only JSON except the incident operator actions listed las
 | `GET /api/incidents?view=active\|history\|all&status=S&severity=V&device=D&limit=N` | Incidents built from the alerts, newest activity first. `view` defaults to `active` (not resolved); `status` is `open`, `acknowledged`, `recovered`, `unknown`, `reopened` or `resolved`; `severity` is `critical`, `warning` or `info`. Each has a `lifecycle` (`monitoring`, `review`, `label`, `awaiting_review`), `flapping`, times, and `simulated`; also `counts`, `can_modify` and the correlation settings. |
 | `GET /api/incidents/{id}` | One incident with its full `report` (observed evidence and timeline, operator fields, and for simulated incidents a labelled `simulated_example`) and the same write-up as `markdown`. |
 | `GET /api/incidents/{id}/report?format=markdown\|json` | The write-up alone, as `text/markdown` (default) or JSON. |
+| `POST /api/incidents/{id}/auto-documentation` | Simulation only: generate the example documentation for a simulated incident (idempotent; 409 in real mode or when switched off). Acknowledge also returns `auto_documentation` and `auto_resolved`. |
 | `POST /api/incidents/{id}/acknowledge`, `/notes`, `/resolve`, `/reopen`, `PUT /api/incidents/{id}/report` | Operator actions (JSON bodies; unknown fields rejected). Local machine only, with the page's token (see Incident management); 403 otherwise, 409 for a transition that is not allowed, 422 for invalid input. No endpoint deletes anything. Resolving a historical "recovery unknown" incident needs `"confirm_unknown_recovery": true`. |
 | `GET /healthz` | `{"ok": true}` |
 
@@ -975,6 +1034,8 @@ incidents:                 # optional; ON by default, this block only tunes it (
   correlation_window_s: 900   # recurrence window, 60 to 86400
   flapping_recurrences: 2     # recurrences that mark an incident "flapping" (1 to 100)
   operator_actions: true      # default: true when simulated, false (opt-in) in real mode
+  simulation_auto_documentation: true  # simulation only; default on; REJECTED in real mode
+  simulation_auto_resolve: false       # simulation only; default OFF; REJECTED in real mode
 qos_poll_interval_s: 30    # QoS telemetry polling; default 30; minimum 1 simulated, 10 real
 qos_retention_hours: 24    # QoS history kept; 1 to 168
 devices:
@@ -1060,7 +1121,13 @@ and reopen moving alerts, unmatched alerts staying visible, and no alert ever ch
 buttons and that incident requests can never carry an undefined view, plus a Chromium test that
 clicks every tab, switches Active and History, waits for the periodic refreshes and asserts that no
 request fails (skipped automatically where Node.js, playwright or a Chromium build is not
-installed, such as CI). None touch a network, run a real
+installed, such as CI). For the simulation auto-documentation and auto-resolution: the generated text (deterministic,
+no claims of repairs or actions), acknowledge storing it once, repeated, concurrent, reopened and
+restarted generation, preserved operator notes and write-ups and an untouched audit trail,
+auto-resolution only when enabled and every blocker (active, unknown recovery, reopened,
+unacknowledged, undocumented, not simulated, real mode, disabled), a person's resolution winning,
+the reserved actor, imported incidents, upgrading with the defaults, strict real-mode isolation at
+every layer, and a Chromium test of the whole workflow (both settings and real mode). None touch a network, run a real
 `ping` or need an SNMP device.
 
 **What has and hasn't been verified**
@@ -1150,6 +1217,10 @@ JavaScript framework or build step.
   default `127.0.0.1` binding.
 - **Alerts:** shown and logged only; no notifications. Thresholds are fixed (3 pings, 20% loss,
   150 ms, 3 confirming checks).
+- **Simulation auto-documentation and auto-resolution** are fictional by design: they demonstrate
+  the workflow and are never a substitute for a person's investigation. They cannot be enabled for
+  real monitoring. An incident acknowledged before this feature has no documentation until you
+  press **Generate example documentation**.
 - **Incidents:** only ICMP up/down/degraded alerts create incidents (SNMP, Wi-Fi and QoS do not).
   Alerts from before you upgraded become incidents only if you import them, and an imported
   incident is reconstructed afterwards, so its timeline cannot show who looked at it at the time.

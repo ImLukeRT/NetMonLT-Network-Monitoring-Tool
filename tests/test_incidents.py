@@ -251,12 +251,12 @@ def test_a_simulated_report_is_clearly_labelled_and_deterministic():
     assert first == second
     assert first["data_label"].startswith("SIMULATED")
     example = first["simulated_example"]
-    assert example["label"] == "SIMULATED / ILLUSTRATIVE EXAMPLE"
+    assert example["label"] == "SIMULATED EXAMPLE — AUTO-GENERATED"
     assert "fictional" in example["notice"] and "no real device" in example["notice"]
     assert all("EXAMPLE ONLY" in example[k] for k in ("illustrative_resolution_summary",))
     assert example["illustrative_troubleshooting_steps"][0].startswith("Check the switch")
     text = inc.render_markdown(first)
-    assert "SIMULATED / ILLUSTRATIVE EXAMPLE" in text and "fictional, not performed" in text
+    assert "SIMULATED EXAMPLE — AUTO-GENERATED" in text and "fictional, not performed" in text
     assert "NetMonLT performed no repair" in text
     assert all(first["operator"][f] == "" for f in inc.REPORT_TEXT_FIELDS)  # not pre-filled
 

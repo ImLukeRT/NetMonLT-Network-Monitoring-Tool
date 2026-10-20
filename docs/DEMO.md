@@ -116,15 +116,15 @@ starts, so don't leave it for later (if you miss it, the history is still there;
        apart (`Monitoring: recovered`, `Review: open`).
     2. **Read the write-up.** *Observed by NetMonLT* is counted from stored checks (in the demo roughly 6 down
        and 3 up checks, about two thirds of the probes unanswered) and says NetMonLT repaired nothing. The
-       dashed **SIMULATED / ILLUSTRATIVE EXAMPLE** block is fictional: it names the scripted
+       dashed **SIMULATED EXAMPLE — AUTO-GENERATED** block is fictional: it names the scripted
        outage as the cause because the simulator defines one (a device with no scripted cause
        says none is defined), and its troubleshooting steps are labelled as not performed.
 
        ![An incident write-up](images/incident-report.png)
 
-    3. **Acknowledge** it, then **Add a note** such as *"Checked the uplink: looks fine"*. Both
-       appear in the timeline with a timestamp and the actor label (self-declared, there are no
-       accounts). Try a note containing `<b>bold</b>` or `<script>alert(1)</script>`: it is shown
+    3. **Acknowledge** it (in this simulated demo that also stores the example documentation; see
+       step 12), then **Add a note** such as *"Checked the uplink: looks fine"*. Both appear in
+       the timeline with a timestamp and the actor label (self-declared, there are no accounts). Try a note containing `<b>bold</b>` or `<script>alert(1)</script>`: it is shown
        as literal text.
     4. **Fill in the operator write-up**: set *Root cause status* to **Suspected** and write the
        cause, then **Save write-up**. The status *Confirmed* is refused without a stated cause.
@@ -169,7 +169,42 @@ starts, so don't leave it for later (if you miss it, the history is still there;
        Alerts that no incident covers stay in Unresolved until they are in an incident that is
        resolved, and other alerts from the same device are never hidden.
 
-12. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
+12. **Automatic example documentation, and optional auto-resolution (simulation only).**
+    This step needs no hand-written report: it shows the whole workflow from the demo alone. It
+    only exists in simulated mode; real mode never generates anything.
+
+    1. Wait for the `access-switch` incident to show **Auto-recovered — awaiting review**, open
+       **View report**, and note the dashed block says **Preview only: not stored yet**.
+    2. Click **Acknowledge**. The message says *"Example documentation generated (SIMULATED
+       EXAMPLE — AUTO-GENERATED)"*. The block now says *"Generated automatically at ..."* and lists
+       **example investigation notes** (each an instruction or an explicit example, such as
+       "Example check — Check the switch's power and the status LEDs", never a claim that
+       anything was done), the scenario cause only because the simulator defines one, and an
+       example resolution statement. The timeline gets a dashed **Simulation (auto)** entry.
+    3. Notice what did **not** happen: the incident is **not resolved** (status *Monitoring
+       recovered — acknowledged*), and the **Operator write-up** fields are still blank. Add your
+       own note: it appears tagged **Operator**, next to the **Simulation (auto)** and
+       **NetMonLT** entries, so a reader can tell human-entered text, automatic examples and
+       monitoring observations apart. Acknowledging again, reloading or restarting never adds a
+       second document.
+    4. **Copy report** and read the Markdown: `[NetMonLT]`, `[operator]` and `[simulation (auto)]`
+       tags on the timeline, a section headed `SIMULATED EXAMPLE — AUTO-GENERATED`, and
+       `## 9. Resolution (operator)` once a person resolves it.
+    5. For an incident you acknowledged **before** this feature existed (or with it switched off),
+       open its report and press **Generate example documentation**: it adds the document once
+       and touches nothing you wrote.
+    6. **Optional auto-resolution**, off by default. Add `simulation_auto_resolve: true` under
+       `incidents:` in a copy of `config/devices.sim.yaml`, restart with `--inventory`, and
+       acknowledge an incident whose recovery is confirmed. The simulation resolves it at once
+       (or on the next tick if the recovery arrives after your acknowledgement). It appears in
+       **History** as **Auto-resolved (simulation)** with a dashed badge, a box saying *no human
+       investigation or repair was verified*, and `## 9. Resolution (SIMULATION AUTO-RESOLUTION:
+       not an operator)` in the report. It never resolves an active fault, an incident with
+       unknown recovery or one you reopened, and your own notes and write-up are untouched.
+    7. Try `simulation_auto_resolve: true` in `config/devices.real.example.yaml` (a copy): the app
+       refuses to start, because this is a simulation-only feature.
+
+13. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
    pings only your own computer (loopback). The badge changes to **LIVE · ICMP** and the data goes
    to a separate database. Latencies are tiny (well under 1 ms) because it is local.
 
@@ -217,6 +252,10 @@ PowerShell, `rm -r data` elsewhere).
   same correlation rules, only adds incidents, never touches an existing incident or alert, and
   cannot duplicate. Where history is incomplete it says "recovery unknown" instead of guessing, and
   it never turns a recovery with no fault into an outage.
+- **Simulation helpers are fictional, labelled and walled off.** Example documentation and the
+  optional auto-resolution are generated only in simulated mode, are marked `SIMULATED EXAMPLE —
+  AUTO-GENERATED` / `simulation-auto`, never claim a repair, root cause or investigation, never
+  overwrite a person's text, and are rejected outright in real mode.
 - **Resolved alerts are archived, not deleted.** The default alert view hides only alerts of
   resolved incidents; the full history stays one click away and in each incident's report.
 - **Real monitoring is opt-in and bounded.** It needs a separate file, `authorized: true` per

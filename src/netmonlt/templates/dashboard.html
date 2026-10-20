@@ -237,6 +237,13 @@
   .inc-src { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.04em;
              padding:1px 6px; border-radius:4px; background:var(--none-bg); color:var(--none); margin-right:6px; }
   .inc-src.operator { background:var(--good-bg); color:var(--good); }
+  .inc-timeline li.simulation { border-left:3px dashed var(--deg); }
+  .inc-src.simulation { background:transparent; color:var(--deg); border:1px dashed var(--deg); }
+  .badge.auto { background:transparent; color:var(--deg); border:1px dashed var(--deg); }
+  .inc-resolution { font-size:13px; padding:8px 10px; border-radius:6px; margin:8px 0; }
+  .inc-resolution.operator { background:var(--up-bg); color:var(--up); }
+  .inc-resolution.auto { border:2px dashed var(--deg); color:var(--deg); }
+  .inc-human { border-left:3px solid var(--accent); padding-left:10px; }
   .inc-example { border:2px dashed var(--deg); border-radius:8px; padding:10px 14px; margin:14px 0; }
   .inc-example h4 { margin-top:0; color:var(--deg); }
   .inc-detail textarea, .inc-detail select, .inc-detail input[type="text"] {
@@ -350,6 +357,7 @@
       </div>
       <div id="inc-d-badges" class="inc-badges"></div>
       <div id="inc-d-label" class="inc-banner"></div>
+      <div id="inc-d-resolution" class="inc-resolution" hidden></div>
       <div id="inc-d-msg" role="status"></div>
       <div class="actions">
         <button type="button" class="inc-btn primary" id="inc-b-ack">Acknowledge</button>
@@ -361,7 +369,7 @@
       <h4>Timeline</h4>
       <ol class="inc-timeline" id="inc-d-timeline"></ol>
       <div class="inc-example" id="inc-d-example" hidden></div>
-      <h4>Operator write-up</h4>
+      <h4>Operator write-up <span class="inc-src operator">human-entered</span></h4>
       <p class="inc-hint" id="inc-d-opnote">Entered by a person, and blank until they write it: NetMonLT never fills these in or guesses a cause.</p>
       <form id="inc-f-report">
         <label for="inc-f-status">Root cause status</label>
@@ -1137,7 +1145,7 @@ const INC_TOKEN = (document.querySelector('meta[name="netmonlt-token"]') || {}).
 const INC_STATUS_CLASS = {
   open: "down", acknowledged: "degraded", recovered_awaiting_review: "q-good",
   recovered_acknowledged: "q-good", reopened: "down", reopened_recovered: "degraded", resolved: "up",
-  unknown_awaiting_review: "unknown", unknown_acknowledged: "unknown", reopened_unknown: "degraded",
+  auto_resolved: "auto", unknown_awaiting_review: "unknown", unknown_acknowledged: "unknown", reopened_unknown: "degraded",
 };
 const INC_REPORT_FIELDS = ["root_cause", "actions_taken", "impact_assessment", "recovery_verification", "lessons_learned"];
 const INC_VIEWS = ["active", "history"];
@@ -1323,6 +1331,13 @@ async function refreshIncidents() {
   }
 }
 
+function ackMessage(data) {
+  let text = "Acknowledged.";
+  if (data.auto_documentation && data.auto_documentation.generated) text += " Example documentation generated (SIMULATED EXAMPLE — AUTO-GENERATED).";
+  if (data.auto_resolved) text += " The simulation then auto-resolved it (no operator resolution).";
+  return text;
+}
+
 async function quickAcknowledge(id) {
   try {
     await incSend("POST", "/api/incidents/" + id + "/acknowledge", {});
@@ -1370,7 +1385,8 @@ function renderIncidentDetail(d) {
   badges.replaceChildren(
     el("span", "badge " + (INC_STATUS_CLASS[life.code] || "unknown"), life.label),
     el("span", "badge " + (life.monitoring === "recovered" ? "up" : life.monitoring === "unknown" ? "unknown" : "down"), "Monitoring: " + (life.monitoring === "unknown" ? "recovery unknown" : life.monitoring)),
-    el("span", "badge " + (life.review === "resolved" ? "up" : life.review === "acknowledged" ? "degraded" : "unknown"), "Review: " + life.review),
+    el("span", "badge " + (life.auto_resolved ? "auto" : life.review === "resolved" ? "up" : life.review === "acknowledged" ? "degraded" : "unknown"),
+       life.auto_resolved ? "Resolution: simulation auto-resolved (no operator)" : life.review === "resolved" ? "Review: resolved by operator" : "Review: " + life.review),
   );
   if (r.flapping) badges.appendChild(el("span", "badge degraded", "Flapping: recurred " + r.flap_count + "×"));
   if (r.imported) badges.appendChild(el("span", "badge unknown", "Imported from alert history"));
@@ -1379,6 +1395,12 @@ function renderIncidentDetail(d) {
   const label = document.getElementById("inc-d-label");
   label.textContent = r.data_label;
   label.className = "inc-banner" + (r.simulated ? "" : " real");
+  const resBox = document.getElementById("inc-d-resolution");
+  resBox.hidden = !r.resolved_at;
+  resBox.className = "inc-resolution " + (r.resolution.kind === "simulation-auto" ? "auto" : "operator");
+  resBox.textContent = r.resolution.kind === "simulation-auto"
+    ? "SIMULATION AUTO-RESOLUTION: monitoring confirmed recovery in simulation, and the simulation closed this incident. No human investigation or repair was verified, and no operator reviewed it. (" + (r.resolution.auto_statement || "") + ")"
+    : "Resolved by operator " + (r.resolution.by || "") + ". Monitoring's own recovery record is shown separately above.";
 
   const obs = document.getElementById("inc-d-observed");
   obs.replaceChildren();
@@ -1386,7 +1408,7 @@ function renderIncidentDetail(d) {
   const ev = r.observed.evidence, list = el("dl", "inc-kv");
   kv(list, "Detected", r.detected_at);
   kv(list, "Monitoring recovered", r.recovered_at || (r.recovery_unknown ? "unknown: no recovery alert was recorded" : "not confirmed"));
-  kv(list, "Resolved", r.resolved_at || "not resolved");
+  kv(list, "Resolved", r.resolved_at ? r.resolved_at + (r.resolution.kind === "simulation-auto" ? " (simulation auto-resolution)" : " (operator " + r.resolution.by + ")") : "not resolved");
   kv(list, "ICMP checks", ev.checks_total + " (" + ev.checks_down + " down, " + ev.checks_degraded + " degraded, " + ev.checks_up + " up)");
   kv(list, "Probes", ev.probes_sent + " sent, " + ev.probes_received + " answered" + (ev.loss_pct === null ? "" : " (loss " + ev.loss_pct + "%)"));
   kv(list, "Detection to recovery", ev.time_to_recovery_s === null ? "not recovered" : fmtDuration(ev.time_to_recovery_s));
@@ -1403,9 +1425,10 @@ function renderIncidentDetail(d) {
   const tl = document.getElementById("inc-d-timeline");
   tl.replaceChildren();
   for (const e of r.observed.timeline) {
-    const li = el("li", e.source === "monitoring" ? "" : "operator");
+    const li = el("li", e.source === "monitoring" ? "" : e.source === "simulation" ? "simulation" : "operator");
     li.appendChild(el("span", "when", e.time));
-    li.appendChild(el("span", "inc-src" + (e.source === "monitoring" ? "" : " operator"), e.source === "monitoring" ? "NetMonLT" : "Operator"));
+    li.appendChild(el("span", "inc-src" + (e.source === "monitoring" ? "" : e.source === "simulation" ? " simulation" : " operator"),
+                      e.source === "monitoring" ? "NetMonLT" : e.source === "simulation" ? "Simulation (auto)" : "Operator"));
     li.append(e.label + (e.actor ? " (" + e.actor + ")" : ""));
     if (e.text) li.appendChild(el("div", "inc-text", e.text));
     tl.appendChild(li);
@@ -1418,16 +1441,25 @@ function renderIncidentDetail(d) {
     const x = r.simulated_example;
     ex.appendChild(el("h4", null, x.label));
     ex.appendChild(el("p", "inc-text", x.notice));
-    ex.appendChild(el("p", "inc-text", "Known scenario cause (defined by the simulator): " + (x.known_scenario_cause ? x.known_scenario_cause.text : x.no_cause_note)));
-    ex.appendChild(el("p", null, "Illustrative troubleshooting steps (fictional, not performed by anyone):"));
-    const steps = el("ul", "inc-text");
-    for (const t of x.illustrative_troubleshooting_steps) steps.appendChild(el("li", null, t));
-    ex.appendChild(steps);
-    ex.appendChild(el("p", "inc-text", "Illustrative resolution summary: " + x.illustrative_resolution_summary));
-    ex.appendChild(el("p", null, "Illustrative recommendations and lessons learned (examples):"));
+    ex.appendChild(el("p", "inc-text", x.stored
+      ? "Generated automatically at " + x.generated_at + " when this incident was acknowledged, and stored once. Nothing here was written by a person."
+      : "Preview only: not stored yet. It is generated and stored when the incident is acknowledged" + (d.auto_documentation ? "." : " (example documentation is switched off here).")));
+    if (x.imported) ex.appendChild(el("p", "inc-text", "This incident was reconstructed from historical monitoring events; nothing missing from them has been filled in."));
+    ex.appendChild(el("p", null, "Example investigation notes (not performed by anyone):"));
+    const notes = el("ul", "inc-text");
+    for (const t of x.investigation_notes) notes.appendChild(el("li", null, t));
+    ex.appendChild(notes);
+    ex.appendChild(el("p", "inc-text", "Example resolution summary: " + x.illustrative_resolution_summary));
+    ex.appendChild(el("p", null, "Example recommendations and lessons learned:"));
     const recs = el("ul", "inc-text");
     for (const t of x.illustrative_recommendations.concat(x.illustrative_lessons_learned)) recs.appendChild(el("li", null, t));
     ex.appendChild(recs);
+    if (!x.stored && d.can_modify && d.auto_documentation) {
+      ex.appendChild(incButton("Generate example documentation", () => incAction(
+        [(data) => data.auto_documentation.generated ? "Example documentation generated (SIMULATED EXAMPLE — AUTO-GENERATED)." : "Example documentation already existed; nothing changed.",
+         "Could not generate the example documentation"],
+        "POST", "/api/incidents/" + incSelected + "/auto-documentation", {}), "primary"));
+    }
     ex.appendChild(incButton("Use the example as a resolution-summary draft", () => {
       const box = document.getElementById("inc-f-resolution");
       if (!box.value) box.value = "[Illustrative example text, not a real action] " + x.illustrative_resolution_summary;
@@ -1474,8 +1506,8 @@ function incReportFields() {
 
 async function incAction(labels, method, path, body, after) {
   try {
-    await incSend(method, path, body);
-    incShow(labels[0], "good");
+    const data = await incSend(method, path, body);
+    incShow(typeof labels[0] === "function" ? labels[0](data) : labels[0], "good");
     if (after) after();
     await refreshIncidents();
     await refreshIncidentDetail();
@@ -1486,7 +1518,7 @@ async function incAction(labels, method, path, body, after) {
 }
 
 document.getElementById("inc-d-close").addEventListener("click", () => { incSelected = null; incDetail.hidden = true; });
-document.getElementById("inc-b-ack").addEventListener("click", () => incAction(["Acknowledged.", "Could not acknowledge"], "POST", "/api/incidents/" + incSelected + "/acknowledge", {}));
+document.getElementById("inc-b-ack").addEventListener("click", () => incAction([ackMessage, "Could not acknowledge"], "POST", "/api/incidents/" + incSelected + "/acknowledge", {}));
 document.getElementById("inc-f-report").addEventListener("submit", (ev) => {
   ev.preventDefault();
   incAction(["Write-up saved.", "Could not save the write-up"], "PUT", "/api/incidents/" + incSelected + "/report", incReportFields());
