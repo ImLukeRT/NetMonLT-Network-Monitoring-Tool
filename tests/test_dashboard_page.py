@@ -36,7 +36,8 @@ def test_labels_tick_every_second_from_a_single_timer():
 
 def test_the_data_refresh_intervals_are_unchanged():
     assert [(n, int(ms)) for n, ms in intervals() if n != "tickAges"] == [
-        ("refreshChart", 5000), ("refreshInterfaces", 5000), ("refresh", 3000),
+        ("refreshChart", 5000), ("refreshQuality", 5000), ("refreshInterfaces", 5000),
+        ("refresh", 3000),
     ]
 
 
@@ -59,6 +60,32 @@ def test_every_age_shown_is_a_live_label():
     for call in ("setAge(ageCell, d.age_s", "setAge(timeCell, a.age_s", "setAge(updated, i.age_s",
                  "setAge(why, snmp.last_ok_age_s"):
         assert call in PAGE, call
+
+
+# ------------------------------------------------------------------ the network-quality section
+def test_the_quality_section_states_what_the_figures_are_and_are_not():
+    text = " ".join(PAGE.split())  # the caption wraps across source lines
+    for needle in ('id="q-panel"', "Network quality", 'id="q-jitter"', 'id="q-loss"',
+                   "not RFC 3550 RTP jitter", "not one-way delay", "never counted as 0 ms",
+                   "application-level heuristics, not a QoS standard",
+                   "does not verify or enforce QoS"):
+        assert needle in text, needle
+
+
+def test_the_quality_section_follows_the_existing_device_and_window_controls():
+    # one set of controls: the quality requests use the same window and device as the latency chart
+    assert '"/api/quality?" + q' in PAGE and "/quality?" in PAGE
+    assert 'const q = "window_s=" + chartWindow' in PAGE
+    assert "resetQuality();" in function_body("resetChart")
+
+
+def test_quality_is_drawn_with_text_nodes_only():
+    assert "innerHTML" not in PAGE  # values from the API are never parsed as markup
+
+
+def test_missing_quality_figures_are_shown_as_dashes_not_zero():
+    assert 'v === null || v === undefined ? "–"' in PAGE
+    assert "const fmtOptMs" in PAGE and "const fmtPct" in PAGE
 
 
 # ------------------------------------------------------------------ the arithmetic, in Node.js

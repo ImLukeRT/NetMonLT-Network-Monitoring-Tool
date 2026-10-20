@@ -67,6 +67,32 @@ class SnmpConfig:
     retries: int = 1
 
 
+QUALITY_LEVELS = ("excellent", "good", "fair", "poor")  # best to worst; "unknown" is separate
+
+
+@dataclass(frozen=True)
+class QualityThresholds:
+    """Upper bounds (inclusive) of the Excellent, Good and Fair bands; anything above is Poor."""
+
+    excellent: float
+    good: float
+    fair: float
+
+
+@dataclass(frozen=True)
+class QualityConfig:
+    """How measurements are graded. These are application-level heuristics, not a QoS standard:
+    change them to suit the link being monitored."""
+
+    latency_ms: QualityThresholds = QualityThresholds(30.0, 80.0, 150.0)
+    jitter_ms: QualityThresholds = QualityThresholds(5.0, 15.0, 30.0)
+    loss_pct: QualityThresholds = QualityThresholds(0.5, 2.0, 5.0)
+    window_s: int = 900  # the period the summary covers by default
+    min_checks: int = 10  # fewer checks in the window: the grade is Unknown
+    min_jitter_pairs: int = 3  # jitter needs this many pairs of consecutive successful checks
+    max_gap_fraction: float = 0.5  # more of the window than this unmeasured: Unknown
+
+
 @dataclass(frozen=True)
 class Device:
     name: str

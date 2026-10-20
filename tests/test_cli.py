@@ -24,7 +24,7 @@ def test_main_syncs_inventory_and_starts_server(tmp_path, served):
     assert rc == 0
     assert served == [{"host": "127.0.0.1", "port": 9999, "log_level": "warning"}]
     db = Database(db_path)
-    assert len(db.latest_status()) == 6
+    assert len(db.latest_status()) == 7
     db.close()
 
 

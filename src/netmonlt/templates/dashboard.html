@@ -9,12 +9,14 @@
   :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#667085; --line:#e4e7ec;
           --up:#067647; --up-bg:#d1fadf; --deg:#93370d; --deg-bg:#fef0c7;
           --down:#b42318; --down-bg:#fee4e2; --none:#475467; --none-bg:#eaecf0; --accent:#2563eb;
-          --f-up:#12b76a; --f-deg:#f79009; --f-down:#d92d20; }
+          --f-up:#12b76a; --f-deg:#f79009; --f-down:#d92d20;
+          --good:#175cd3; --good-bg:#d1e0ff; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#0f1318; --card:#171c23; --fg:#e6e9ee; --muted:#98a2b3; --line:#2a313b;
             --up:#6ce9a6; --up-bg:#0b3a24; --deg:#fec84b; --deg-bg:#4a2f06;
             --down:#fda29b; --down-bg:#55160f; --none:#cbd5e1; --none-bg:#2a313b; --accent:#7cacf8;
-            --f-up:#32d583; --f-deg:#fdb022; --f-down:#f97066; }
+            --f-up:#32d583; --f-deg:#fdb022; --f-down:#f97066;
+            --good:#84adff; --good-bg:#102a56; }
   }
   body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg);
          font:15px/1.5 system-ui, sans-serif; }
@@ -77,7 +79,7 @@
   #chart-tip { position:absolute; top:6px; pointer-events:none; background:var(--fg); color:var(--bg);
                font-size:12px; line-height:1.4; padding:6px 8px; border-radius:6px; white-space:pre;
                z-index:2; }
-  #chart-summary { color:var(--muted); font-size:13px; margin-top:6px; }
+  #chart-summary, .chart-summary-line { color:var(--muted); font-size:13px; margin-top:6px; }
   .legend { display:flex; flex-wrap:wrap; gap:4px 14px; color:var(--muted); font-size:12px; margin-top:6px; }
   .legend i { display:inline-block; width:14px; height:10px; margin-right:5px; vertical-align:-1px;
               border-radius:2px; }
@@ -88,6 +90,38 @@
   .sw-up { background:var(--f-up); }
   .sw-gap { background:repeating-linear-gradient(45deg, var(--muted) 0 1.5px, transparent 1.5px 4px);
             border:1px solid var(--line); }
+  #q-panel[hidden] { display:none; }
+  .q-excellent { background:var(--up-bg); color:var(--up); }
+  .q-good { background:var(--good-bg); color:var(--good); }
+  .q-fair { background:var(--deg-bg); color:var(--deg); }
+  .q-poor { background:var(--down-bg); color:var(--down); }
+  .q-unknown { background:var(--none-bg); color:var(--none); }
+  #q-wrap th, #q-wrap td { padding-left:10px; padding-right:10px; }
+  #q-wrap td.basis { white-space:normal; min-width:200px; color:var(--muted); font-size:13px; }
+  #q-note { font-size:13px; padding:6px 10px; border-radius:6px; margin:0 0 8px;
+            background:var(--down-bg); color:var(--down); }
+  #q-note:empty { display:none; }
+  .q-caption { color:var(--muted); font-size:12px; padding:8px 14px; }
+  .q-charts { margin-top:12px; }
+  .q-chart-title { font-size:13px; font-weight:600; margin:8px 0 2px; }
+  .qbox { position:relative; min-height:60px; }
+  .qchart { display:block; }
+  .qchart text { fill:var(--muted); font-size:11px; }
+  .qchart .grid { stroke:var(--line); }
+  .qchart .line { fill:none; stroke:var(--accent); stroke-width:1.75; stroke-linejoin:round; }
+  .qchart .dot { fill:var(--card); stroke:var(--accent); stroke-width:1.75; }
+  .qchart .lossbar { fill:var(--f-down); }
+  .qchart .noloss { fill:var(--f-up); }
+  .qchart .ref { stroke:var(--muted); stroke-dasharray:4 3; opacity:.7; }
+  .qchart .gapzone { stroke:var(--line); }
+  .qchart .cross { stroke:var(--fg); opacity:.45; pointer-events:none; }
+  .qchart .hatch-line { stroke:var(--muted); stroke-width:1.5; opacity:.6; }
+  .qmsg { color:var(--muted); padding:22px 12px; text-align:center; font-size:13px; }
+  .qtip { position:absolute; top:6px; pointer-events:none; background:var(--fg); color:var(--bg);
+          font-size:12px; line-height:1.4; padding:6px 8px; border-radius:6px; white-space:pre;
+          z-index:2; }
+  .sw-ref { height:0 !important; border-top:2px dashed var(--muted); vertical-align:3px !important; }
+  .sw-noloss { background:var(--f-up); }
   #if-panel[hidden] { display:none; }
   .if-head { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:center; margin:28px 0 8px; }
   .if-head h2 { margin:0; }
@@ -152,6 +186,52 @@
       <span>Strip: <i class="sw-up"></i>up <i class="sw-deg"></i>degraded <i class="sw-down"></i>down</span>
     </div>
   </div>
+  <section id="q-panel">
+    <h2>Network quality</h2>
+    <div id="q-note" role="status"></div>
+    <div class="wrap" id="q-wrap">
+      <table>
+        <thead><tr>
+          <th>Quality</th><th>Device</th><th>Latency</th><th>Jitter</th><th>Loss</th>
+          <th>Checks</th><th>Basis</th>
+        </tr></thead>
+        <tbody id="q-rows"></tbody>
+      </table>
+      <div class="q-caption" id="q-caption">
+        Measured with ICMP echo over <span id="q-window">the selected window</span>, using the
+        device and window chosen in Latency history above. Latency is the mean round-trip time of
+        replies received. Jitter is the mean absolute difference between the average round-trip
+        times of consecutive checks that both got replies (not RFC 3550 RTP jitter, and not
+        one-way delay). Loss is probes without a reply as a share of probes sent. Time with no
+        checks is a gap, never counted as 0 ms or as loss. A grade is the worst of the three
+        figures against thresholds set in the inventory: application-level heuristics, not a QoS
+        standard. This shows network performance; it does not verify or enforce QoS (DSCP
+        marking, shaping or queueing).
+      </div>
+    </div>
+    <div class="wrap chart-card q-charts" id="q-charts">
+      <div class="q-chart-title" id="q-jitter-title">Jitter over time</div>
+      <div class="qbox" id="q-jitter-box">
+        <svg class="qchart" id="q-jitter" role="img" aria-label="Jitter over time"></svg>
+        <div class="qmsg" id="q-jitter-msg">Loading…</div>
+        <div class="qtip" id="q-jitter-tip" hidden></div>
+      </div>
+      <div class="q-chart-title" id="q-loss-title">Packet loss over time</div>
+      <div class="qbox" id="q-loss-box">
+        <svg class="qchart" id="q-loss" role="img" aria-label="Packet loss over time"></svg>
+        <div class="qmsg" id="q-loss-msg">Loading…</div>
+        <div class="qtip" id="q-loss-tip" hidden></div>
+      </div>
+      <div id="q-summary" class="chart-summary-line"></div>
+      <div class="legend" aria-hidden="true">
+        <span><i class="sw-line"></i>Jitter (mean change between consecutive checks)</span>
+        <span><i class="sw-down"></i>Loss</span>
+        <span><i class="sw-noloss"></i>Measured, no loss</span>
+        <span><i class="sw-ref"></i>Your Excellent / Good / Fair limits</span>
+        <span><i class="sw-gap"></i>No data: not measured</span>
+      </div>
+    </div>
+  </section>
   <section id="if-panel" hidden>
     <div class="if-head">
       <h2>Interfaces (SNMP)</h2>
@@ -410,6 +490,7 @@ function resetChart() {
   chartBox.classList.remove("offline");
   showChartMessage("Loading…");
   refreshChart();
+  resetQuality();
 }
 
 async function refreshChart() {
@@ -632,6 +713,232 @@ window.addEventListener("resize", () => {
   requestAnimationFrame(() => { resizeQueued = false; if (chartData) drawChart(chartData); });
 });
 setInterval(refreshChart, 5000);
+
+// ---- network quality: latency, jitter and packet loss from the stored ICMP checks --------------
+// The server does the maths (see netmonlt/quality.py); this only displays it. Values it does not
+// have are null and shown as a dash, never as 0. The device and window follow the chart above.
+const qRows = document.getElementById("q-rows");
+const qNote = document.getElementById("q-note");
+const qWrap = document.getElementById("q-wrap");
+const qCharts = document.getElementById("q-charts");
+const qSummary = document.getElementById("q-summary");
+const QLEVELS = {excellent: "Excellent", good: "Good", fair: "Fair", poor: "Poor", unknown: "Unknown"};
+const QFIGURES = {latency: "latency", jitter: "jitter", loss: "loss"};
+let qReq = 0, qDetail = null, qLoaded = false;
+
+const fmtPct = (v) => (v === null || v === undefined ? "–" : (v < 10 ? v.toFixed(1) : String(Math.round(v))) + "%");
+const fmtOptMs = (v) => (v === null || v === undefined ? "–" : fmtMs(v));
+
+function qBasis(q) {
+  if (q.reason) return q.reason;
+  if (!q.grades) return "";
+  return Object.keys(QFIGURES).filter((k) => q.grades[k])
+    .map((k) => QFIGURES[k] + " " + QLEVELS[q.grades[k]]).join(" · ");
+}
+
+function renderQuality(data) {
+  document.getElementById("q-window").textContent = "the last " + windowLabel(data.window_s);
+  qRows.replaceChildren();
+  for (const entry of data.devices) {
+    const badgeCell = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "badge q-" + entry.level;
+    badge.textContent = QLEVELS[entry.level] || entry.level;
+    badge.title = entry.level === "unknown" ? "Not enough trustworthy data to grade" : "Worst of latency, jitter and loss";
+    badgeCell.appendChild(badge);
+    const basis = cell(qBasis(entry), "basis");
+    const tr = document.createElement("tr");
+    tr.append(badgeCell, cell(entry.device), cell(fmtOptMs(entry.latency_ms), "num"),
+              cell(fmtOptMs(entry.jitter_ms), "num"), cell(fmtPct(entry.loss_pct), "num"),
+              cell(String(entry.checks), "num"), basis);
+    qRows.appendChild(tr);
+  }
+}
+
+function qSummaryText(d) {
+  const s = d.summary;
+  const parts = ["Last " + windowLabel(d.window_s), s.checks + (s.checks === 1 ? " check" : " checks") +
+                 " (" + s.probes_sent + " probes sent, " + s.probes_received + " replies)"];
+  parts.push(s.jitter_pairs + (s.jitter_pairs === 1 ? " pair" : " pairs") + " of consecutive successful checks for jitter");
+  parts.push("each bar or point covers " + fmtDuration(d.bucket_s));
+  if (s.gap_count) parts.push(s.gap_count + (s.gap_count === 1 ? " gap" : " gaps") + " with no measurements");
+  return parts.join(" · ");
+}
+
+// One chart: kind "line" (jitter) or "bars" (loss). Missing data is never drawn as zero: buckets
+// with nothing to show are left out, gaps are hatched, and an unmeasurable jitter breaks the line.
+function drawQualityChart(c, d) {
+  const svg = document.getElementById(c.id), box = document.getElementById(c.id + "-box");
+  const msg = document.getElementById(c.id + "-msg"), tip = document.getElementById(c.id + "-tip");
+  const show = (text) => { svg.replaceChildren(); svg.style.display = "none"; tip.hidden = true; msg.textContent = text; msg.hidden = false; };
+  if (d.first_check_ts === null) return show("No measurements yet for this device.");
+  const pts = d.points.filter((p) => c.value(p) !== null && c.value(p) !== undefined);
+  if (d.points.length === 0) return show("No measurements in the last " + windowLabel(d.window_s) + ".");
+  if (pts.length === 0) return show(c.empty);
+  msg.hidden = true;
+  svg.style.display = "block";
+  svg.replaceChildren();
+
+  const W = Math.max(320, box.clientWidth), H = 170;
+  const m = {l: 58, r: 14, t: 10, b: 28};
+  const pw = W - m.l - m.r, ph = H - m.t - m.b, bottom = m.t + ph;
+  const x0 = Math.min(Math.max(d.start, d.first_check_ts), d.end - 30), x1 = d.end, span = x1 - x0;
+  const xs = (t) => m.l + Math.min(1, Math.max(0, (t - x0) / span)) * pw;
+  const limits = d.thresholds[c.limits];
+  const scale = niceScale(Math.max(pts.reduce((a, p) => Math.max(a, c.value(p)), 0), limits.excellent));
+  if (c.cap && scale.max > c.cap) { scale.max = c.cap; scale.step = c.cap / 4; }   // a percentage stops at 100
+  const ys = (v) => bottom - (v / scale.max) * ph;
+  const pid = c.id + "-hatch";
+  svg.setAttribute("width", W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.setAttribute("aria-label", c.title + " for " + d.device + ". " + qSummaryText(d));
+
+  const defs = svgEl("defs", {}, svg);
+  const hatch = svgEl("pattern", {id: pid, width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}, defs);
+  svgEl("line", {x1: 0, y1: 0, x2: 0, y2: 6, class: "hatch-line"}, hatch);
+  for (let v = 0; v <= scale.max + scale.step / 1000; v += scale.step) {
+    svgEl("line", {x1: m.l, x2: m.l + pw, y1: ys(v), y2: ys(v), class: "grid"}, svg);
+    const label = svgEl("text", {x: m.l - 6, y: ys(v) + 4, "text-anchor": "end"}, svg);
+    label.textContent = Number(v.toFixed(2)) + " " + c.unit;
+  }
+  for (const g of d.gaps) {
+    const a = xs(Math.max(g.start, x0)), b = xs(Math.min(g.end, x1));
+    if (b - a < 0.5) continue;
+    svgEl("rect", {x: a, y: m.t, width: b - a, height: ph, fill: "url(#" + pid + ")", class: "gapzone", "data-kind": "gap"}, svg);
+  }
+  // Your thresholds, only where they fall inside the scale (so a tiny jitter isn't squashed).
+  let lastLabelY = -Infinity;
+  for (const level of ["fair", "good", "excellent"]) {
+    if (limits[level] > scale.max) continue;
+    const y = ys(limits[level]);
+    svgEl("line", {x1: m.l, x2: m.l + pw, y1: y, y2: y, class: "ref", "data-kind": "limit"}, svg);
+    if (y - lastLabelY < 13) continue;   // lines this close together share one label
+    lastLabelY = y;
+    const t = svgEl("text", {x: m.l + pw - 2, y: y - 3, "text-anchor": "end"}, svg);
+    t.textContent = QLEVELS[level] + " limit";
+  }
+
+  const centre = (p) => (p.start + p.end) / 2;
+  if (c.kind === "bars") {
+    for (const p of d.points) {
+      const v = p.loss_pct;
+      if (v === null) continue;
+      const a = xs(p.start) + 0.5, w = Math.max(1.5, xs(p.end) - xs(p.start) - 1);
+      if (v === 0) svgEl("rect", {x: a, y: bottom - 2, width: w, height: 2, class: "noloss", "data-kind": "noloss"}, svg);
+      else svgEl("rect", {x: a, y: ys(v), width: w, height: bottom - ys(v), class: "lossbar", "data-kind": "bar", "data-loss": v}, svg);
+    }
+  } else {
+    const hasGapBetween = (a, b) => d.gaps.some((g) => g.start < centre(b) && g.end > centre(a));
+    let run = [];
+    const flush = () => {
+      if (run.length > 1) svgEl("polyline", {points: run.map((p) => xs(centre(p)) + "," + ys(c.value(p))).join(" "), class: "line", "data-kind": "line"}, svg);
+      if (run.length === 1 || pts.length <= 80) {
+        for (const p of run) svgEl("circle", {cx: xs(centre(p)), cy: ys(c.value(p)), r: 3, class: "dot", "data-kind": "point", "data-value": c.value(p)}, svg);
+      }
+      run = [];
+    };
+    let prev = null;
+    for (const p of d.points) {
+      if (c.value(p) === null) { flush(); prev = null; continue; }   // not measurable: break the line
+      if (prev && (Math.abs(p.start - prev.end) > 0.5 || hasGapBetween(prev, p))) flush();
+      run.push(p);
+      prev = p;
+    }
+    flush();
+  }
+
+  const ticks = Math.max(1, Math.min(4, Math.floor(pw / 110)));
+  for (let i = 0; i <= ticks; i++) {
+    const t = x0 + (span * i) / ticks;
+    const label = svgEl("text", {x: xs(t), y: bottom + 18, "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle", "data-kind": "tick"}, svg);
+    label.textContent = fmtTick(t, span);
+  }
+
+  const cross = svgEl("line", {y1: m.t, y2: bottom, class: "cross", visibility: "hidden"}, svg);
+  const overlay = svgEl("rect", {x: m.l, y: m.t, width: pw, height: ph, fill: "transparent"}, svg);
+  overlay.addEventListener("pointermove", (ev) => {
+    const px = ev.clientX - svg.getBoundingClientRect().left;
+    const t = x0 + ((px - m.l) / pw) * span;
+    const p = d.points.find((q) => t >= q.start && t < q.end);
+    const gap = d.gaps.find((g) => t >= g.start && t <= g.end);
+    let lines = null, at = px;
+    if (p) {
+      lines = [new Date(p.start * 1000).toLocaleTimeString() + " to " + new Date(p.end * 1000).toLocaleTimeString(),
+               p.jitter_ms === null ? "Jitter: not measurable (no consecutive successful checks)"
+                 : "Jitter: " + fmtMs(p.jitter_ms) + " (" + p.jitter_pairs + (p.jitter_pairs === 1 ? " pair)" : " pairs)"),
+               "Loss: " + fmtPct(p.loss_pct) + " (" + (p.sent - p.received) + " of " + p.sent + " probes unanswered)",
+               p.checks + (p.checks === 1 ? " check" : " checks")];
+      at = xs(centre(p));
+    } else if (gap) {
+      lines = ["No measurements", fmtDuration(gap.end - gap.start) + " without a check",
+               "(not zero jitter and not zero loss)"];
+    }
+    if (!lines) { tip.hidden = true; cross.setAttribute("visibility", "hidden"); return; }
+    tip.textContent = lines.join("\n");
+    tip.hidden = false;
+    tip.style.left = Math.max(0, Math.min(at + 12, box.clientWidth - tip.offsetWidth)) + "px";
+    cross.setAttribute("x1", at);
+    cross.setAttribute("x2", at);
+    cross.setAttribute("visibility", "visible");
+  });
+  overlay.addEventListener("pointerleave", () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+}
+
+const Q_CHARTS = [
+  {id: "q-jitter", kind: "line", unit: "ms", title: "Jitter", limits: "jitter_ms", value: (p) => p.jitter_ms,
+   empty: "Not enough consecutive successful checks to measure jitter in this window."},
+  {id: "q-loss", kind: "bars", unit: "%", title: "Packet loss", limits: "loss_pct", cap: 100, value: (p) => p.loss_pct,
+   empty: "No probes were sent in this window."},
+];
+
+function drawQuality(d) {
+  qDetail = d;
+  for (const c of Q_CHARTS) drawQualityChart(c, d);
+  qSummary.textContent = qSummaryText(d);
+}
+
+function resetQuality() {
+  qDetail = null;
+  qSummary.textContent = "";
+  for (const c of Q_CHARTS) {
+    document.getElementById(c.id + "-msg").textContent = "Loading…";
+    document.getElementById(c.id + "-msg").hidden = false;
+    document.getElementById(c.id).style.display = "none";
+  }
+  refreshQuality();
+}
+
+async function refreshQuality() {
+  if (!chartDevice) return;
+  const req = ++qReq;   // a response for an earlier device/window must not overwrite this one
+  const q = "window_s=" + chartWindow;
+  try {
+    const [overview, detail] = await Promise.all([
+      getJson("/api/quality?" + q),
+      getJson("/api/devices/" + encodeURIComponent(chartDevice) + "/quality?" + q),
+    ]);
+    if (req !== qReq) return;
+    renderQuality(overview);
+    drawQuality(detail);
+    qLoaded = true;
+    qNote.textContent = "";
+    qWrap.classList.remove("offline");
+    qCharts.classList.remove("offline");
+  } catch (err) {
+    if (req !== qReq) return;
+    qNote.textContent = "Could not load network quality (" + err.message + ")." +
+      (qLoaded ? " Showing the last data received, which is out of date." : "");
+    if (qLoaded) { qWrap.classList.add("offline"); qCharts.classList.add("offline"); }
+  }
+}
+let qResizeQueued = false;
+window.addEventListener("resize", () => {
+  if (qResizeQueued || !qDetail) return;
+  qResizeQueued = true;
+  requestAnimationFrame(() => { qResizeQueued = false; if (qDetail) drawQuality(qDetail); });
+});
+setInterval(refreshQuality, 5000);
 
 // ---- interface statistics (SNMP) ----------------------------------------------------------
 // Values the server doesn't know are null and shown as a dash with the reason, never as 0.

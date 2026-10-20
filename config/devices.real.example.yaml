@@ -15,6 +15,13 @@
 mode: real
 poll_interval_s: 10      # minimum 5 in real mode
 # snmp_poll_interval_s: 30   # how often interfaces are polled; default 30, minimum 10
+# Optional: how the Network quality section grades latency, jitter and loss. The defaults are
+# shown; they are application-level heuristics, not a QoS standard. Tune them for your links.
+# quality:
+#   latency_ms: {excellent: 30, good: 80, fair: 150}
+#   jitter_ms: {excellent: 5, good: 15, fair: 30}
+#   loss_pct: {excellent: 0.5, good: 2, fair: 5}
+#   window_s: 900
 
 devices:
   # Your own computer over the loopback interface: always safe to try.

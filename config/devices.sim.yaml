@@ -6,6 +6,20 @@ poll_interval_s: 5
 # How often the simulated SNMP interface counters are read (real devices: minimum 10).
 snmp_poll_interval_s: 10
 
+# How the Network quality section grades each device. These are this application's own
+# heuristics, not an industry QoS standard: tune them for the link you monitor. Each figure is
+# graded by upper bounds (inclusive): up to `excellent` is Excellent, up to `good` is Good, up to
+# `fair` is Fair, above that Poor. A device's grade is the worst of its three figures, and it is
+# Unknown when there is too little trustworthy data. These are the built-in defaults.
+quality:
+  latency_ms: {excellent: 30, good: 80, fair: 150}
+  jitter_ms: {excellent: 5, good: 15, fair: 30}
+  loss_pct: {excellent: 0.5, good: 2, fair: 5}
+  window_s: 900            # default period the summary covers (the dashboard can change it)
+  min_checks: 10           # fewer checks in the window: Unknown (insufficient samples)
+  min_jitter_pairs: 3      # jitter needs this many pairs of consecutive successful checks
+  max_gap_fraction: 0.5    # more of the window than this unmeasured: Unknown (sparse history)
+
 devices:
   - name: core-router
     address: 192.0.2.1
@@ -66,3 +80,9 @@ devices:
     type: vpn-gateway
     # High latency over a WAN link: also "degraded".
     sim: {rtt_ms: 170, jitter_ms: 15}
+
+  - name: voice-gateway
+    address: 192.0.2.50
+    type: voip-gateway
+    # Low latency but an unsteady one: it is graded Fair because of jitter, not latency or loss.
+    sim: {rtt_ms: 15, jitter_ms: 45}

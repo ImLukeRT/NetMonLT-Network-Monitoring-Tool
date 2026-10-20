@@ -12,6 +12,7 @@ from pathlib import Path
 from netmonlt.alerts import Alert, AlertState
 from netmonlt.domain import CheckResult, Device, Status
 from netmonlt.ifstats import STATUS_OK, InterfaceState, SnmpStatus
+from netmonlt.quality import CheckSample
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -268,6 +269,29 @@ class Database:
                 "points": points, "gaps": gaps, "checks": count, "bucket_s": bucket_s,
                 "first_check_ts": first_ts, "last_check_ts": last_ts,
             }
+
+    def quality_samples(
+        self, device: str, start: float, end: float
+    ) -> tuple[list[CheckSample], float | None, float | None] | None:
+        """The stored checks in [start, end], oldest first, for network-quality figures.
+
+        Returns (samples, first_check_ts, last_check_ts), where the last two cover the device's
+        whole history, or None if there is no such device. Reads the existing `checks` table;
+        nothing extra is stored.
+        """
+        with self._lock:
+            if not self._conn.execute("SELECT 1 FROM devices WHERE name=?", (device,)).fetchone():
+                return None
+            first_ts, last_ts = self._conn.execute(
+                "SELECT MIN(ts), MAX(ts) FROM checks WHERE device=?", (device,)
+            ).fetchone()
+            rows = self._conn.execute(
+                "SELECT ts, sent, received, rtt_avg_ms FROM checks "
+                "WHERE device=? AND ts BETWEEN ? AND ? ORDER BY ts, id",
+                (device, start, end),
+            ).fetchall()
+        samples = [CheckSample(r["ts"], r["sent"], r["received"], r["rtt_avg_ms"]) for r in rows]
+        return samples, first_ts, last_ts
 
     # ---- SNMP interface statistics
     def get_snmp_status(self, device: str) -> SnmpStatus | None:

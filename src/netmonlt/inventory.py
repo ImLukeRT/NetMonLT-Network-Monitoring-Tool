@@ -6,7 +6,7 @@ The YAML file is the source of truth for which devices exist. Validation is stri
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,8 @@ from netmonlt.domain import (
     SNMP_PRIV_PROTOCOLS,
     SNMP_SECURITY_LEVELS,
     Device,
+    QualityConfig,
+    QualityThresholds,
     SimInterface,
     SimProfile,
     SnmpConfig,
@@ -24,7 +26,13 @@ from netmonlt.domain import (
 from netmonlt.probes.icmp import TargetError, validate_target
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # used in URLs, so keep it URL-safe
-_TOP_KEYS = {"mode", "poll_interval_s", "snmp_poll_interval_s", "devices"}
+_TOP_KEYS = {"mode", "poll_interval_s", "snmp_poll_interval_s", "quality", "devices"}
+_QUALITY_KEYS = {
+    "latency_ms", "jitter_ms", "loss_pct", "window_s", "min_checks", "min_jitter_pairs",
+    "max_gap_fraction",
+}
+_THRESHOLD_KEYS = ("excellent", "good", "fair")
+MAX_QUALITY_WINDOW_S = 7 * 86400  # the longest history window the API serves
 _DEVICE_KEYS = {"name", "address", "type", "sim", "authorized", "snmp"}
 _MODES = ("simulated", "real")
 # Real probing sends traffic to someone's equipment, so don't allow hammering it.
@@ -88,6 +96,7 @@ class Inventory:
     poll_interval_s: float
     devices: tuple[Device, ...]
     snmp_poll_interval_s: float = 30.0
+    quality: QualityConfig = field(default_factory=QualityConfig)
 
     @property
     def snmp_devices(self) -> tuple[Device, ...]:
@@ -129,6 +138,8 @@ def parse_inventory(raw: Any) -> Inventory:
         raw.get("snmp_poll_interval_s", 30), "snmp_poll_interval_s", minimum=snmp_minimum
     )
 
+    quality = _parse_quality(raw.get("quality"))
+
     raw_devices = raw.get("devices")
     if not isinstance(raw_devices, list) or not raw_devices:
         raise InventoryError("'devices' must be a non-empty list")
@@ -146,7 +157,56 @@ def parse_inventory(raw: Any) -> Inventory:
         poll_interval_s=interval,
         devices=tuple(devices),
         snmp_poll_interval_s=snmp_interval,
+        quality=quality,
     )
+
+
+def _parse_quality(raw: Any) -> QualityConfig:
+    """The optional `quality:` block: grading thresholds and the minimum data needed to grade."""
+    if raw is None:
+        return QualityConfig()
+    if not isinstance(raw, dict):
+        raise InventoryError("quality must be a mapping")
+    _reject_unknown(raw, _QUALITY_KEYS, "quality")
+    defaults = QualityConfig()
+
+    def whole(key: str, minimum: int, maximum: int | None = None) -> int:
+        value = _number(raw.get(key, getattr(defaults, key)), f"quality.{key}", minimum, maximum)
+        if value != int(value):
+            raise InventoryError(f"quality.{key} must be a whole number")
+        return int(value)
+
+    fraction = _number(
+        raw.get("max_gap_fraction", defaults.max_gap_fraction), "quality.max_gap_fraction", 0.01, 1
+    )
+    return QualityConfig(
+        latency_ms=_parse_thresholds(raw, "latency_ms", defaults.latency_ms, None),
+        jitter_ms=_parse_thresholds(raw, "jitter_ms", defaults.jitter_ms, None),
+        loss_pct=_parse_thresholds(raw, "loss_pct", defaults.loss_pct, 100.0),
+        window_s=whole("window_s", 60, MAX_QUALITY_WINDOW_S),
+        min_checks=whole("min_checks", 2, 100_000),
+        min_jitter_pairs=whole("min_jitter_pairs", 1, 100_000),
+        max_gap_fraction=fraction,
+    )
+
+
+def _parse_thresholds(
+    raw: dict, key: str, default: QualityThresholds, maximum: float | None
+) -> QualityThresholds:
+    block = raw.get(key)
+    if block is None:
+        return default
+    where = f"quality.{key}"
+    if not isinstance(block, dict):
+        raise InventoryError(f"{where} must be a mapping with excellent, good and fair")
+    _reject_unknown(block, set(_THRESHOLD_KEYS), where)
+    missing = [k for k in _THRESHOLD_KEYS if k not in block]
+    if missing:
+        raise InventoryError(f"{where}: missing {', '.join(missing)} (give all three bounds)")
+    values = [_number(block[k], f"{where}.{k}", 0.0, maximum) for k in _THRESHOLD_KEYS]
+    if not values[0] < values[1] < values[2]:
+        raise InventoryError(f"{where}: need excellent < good < fair (upper bounds, in order)")
+    return QualityThresholds(*values)
 
 
 def _parse_device(entry: Any, index: int, mode: str) -> Device:

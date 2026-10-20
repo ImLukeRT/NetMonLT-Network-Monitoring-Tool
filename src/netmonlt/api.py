@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -10,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from netmonlt import __version__
+from netmonlt import __version__, quality
 from netmonlt.collector import run_forever
 from netmonlt.collector import stale_after_s as compute_stale_after_s
 from netmonlt.inventory import Inventory
@@ -125,6 +126,90 @@ def create_app(
             "checks": series["checks"],
             "points": series["points"],
             "gaps": series["gaps"],
+        }
+
+    def quality_view(name: str, window_s: int, now: float):
+        """(summary, samples, first_ts, last_ts) for a device; None if it does not exist."""
+        found = db.quality_samples(name, now - window_s, now)
+        if found is None:
+            return None
+        samples, first, last = found
+        summary = quality.summarize(
+            samples, inventory.quality, start=now - window_s, end=now, gap_s=stale_after_s,
+            first_check_ts=first, last_check_ts=last,
+        )
+        return summary, samples, first, last
+
+    def quality_context(now: float, window_s: int) -> dict:
+        cfg = inventory.quality
+        return {
+            "mode": inventory.mode,
+            "simulated": inventory.mode == "simulated",
+            "server_time": now,
+            "window_s": window_s,
+            "start": now - window_s,
+            "end": now,
+            "poll_interval_s": inventory.poll_interval_s,
+            "gap_threshold_s": stale_after_s,
+            "thresholds": {
+                "latency_ms": dataclasses.asdict(cfg.latency_ms),
+                "jitter_ms": dataclasses.asdict(cfg.jitter_ms),
+                "loss_pct": dataclasses.asdict(cfg.loss_pct),
+            },
+            "min_checks": cfg.min_checks,
+            "min_jitter_pairs": cfg.min_jitter_pairs,
+            "max_gap_fraction": cfg.max_gap_fraction,
+            "definitions": quality.DEFINITIONS,
+            "scope": (
+                "Network performance measured with ICMP echo. It does not verify or enforce QoS "
+                "(DSCP marking, shaping, queueing); thresholds are heuristics, not a standard."
+            ),
+        }
+
+    @app.get("/api/quality")
+    def quality_overview(window_s: int | None = Query(None, ge=60, le=7 * 86400)):
+        """Network-quality summary (latency, jitter, packet loss, grade) for every device over
+        the last `window_s` seconds (default: the inventory's quality.window_s). Read-only."""
+        window = inventory.quality.window_s if window_s is None else window_s
+        now = clock()
+        devices = []
+        for device in inventory.devices:
+            view = quality_view(device.name, window, now)
+            if view is not None:
+                devices.append({"device": device.name, "type": device.type, **view[0]})
+        return {**quality_context(now, window), "devices": devices}
+
+    @app.get("/api/devices/{name}/quality")
+    def device_quality(
+        name: str,
+        window_s: int | None = Query(None, ge=60, le=7 * 86400),
+        max_points: int = Query(60, ge=10, le=500),
+    ):
+        """One device's network-quality summary plus packet loss and jitter over time.
+
+        `points` are equal time buckets (`bucket_s` wide, never zero-filled: empty buckets are
+        omitted); `gaps` are periods with no checks. See netmonlt.quality for the definitions.
+        """
+        window = inventory.quality.window_s if window_s is None else window_s
+        now = clock()
+        view = quality_view(name, window, now)
+        if view is None:
+            raise HTTPException(status_code=404, detail=f"unknown device {name!r}")
+        summary, samples, first, last = view
+        points, bucket_s = quality.series(
+            samples, start=now - window, end=now, gap_s=stale_after_s, first_check_ts=first,
+            poll_interval_s=inventory.poll_interval_s, max_points=max_points,
+        )
+        gaps = quality.find_gaps(samples, now - window, now, stale_after_s, first)
+        return {
+            **quality_context(now, window),
+            "device": name,
+            "first_check_ts": first,
+            "last_check_ts": last,
+            "summary": summary,
+            "bucket_s": bucket_s,
+            "points": points,
+            "gaps": [{"start": a, "end": b} for a, b in gaps],
         }
 
     @app.get("/api/interfaces")

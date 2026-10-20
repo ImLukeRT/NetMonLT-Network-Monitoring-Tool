@@ -4,8 +4,8 @@
 
 **A lightweight network monitoring platform in Python.** NetMonLT polls devices for
 reachability and latency, reads interface traffic and error counters over SNMP, stores the
-history in SQLite, raises alerts when a device changes state, and serves a live web dashboard
-with historical latency charts. It runs fully offline with simulated devices, and can optionally
+history in SQLite, grades network quality (latency, jitter and packet loss), raises alerts when
+a device changes state, and serves a live web dashboard with historical charts. It runs fully offline with simulated devices, and can optionally
 monitor real devices over ICMP and SNMPv3, restricted to targets you list explicitly and are
 authorised to monitor.
 
@@ -31,6 +31,10 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   counts from the standard IF-MIB. Simulated by default (including counter rollover, a device
   restart and a vanishing interface); real polling is opt-in, SNMPv3 only, with credentials taken
   from environment variables and never written to a file, the database, the API or the log.
+- **Network quality.** Average latency, jitter and packet loss per device, an Excellent / Good /
+  Fair / Poor / Unknown grade from thresholds you can configure, and historical jitter and loss
+  charts. All calculated from the ICMP checks already in SQLite, with the formulas stated and
+  missing data never counted as zero. It measures performance; it does not verify or enforce QoS.
 - **Alerts without alert storms.** A device's state changes only after 3 consecutive checks
   agree. Alerts are stored in SQLite, survive restarts, and never repeat while the state is
   unchanged.
@@ -39,7 +43,7 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   server.
 - **Dashboard with no framework.** Plain HTML, JavaScript and hand-built SVG, no CDN, so it works
   offline. Shows stale data and API failures clearly.
-- **Tested.** 545 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
+- **Tested.** 645 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
   network and never need an SNMP device.
 
 ## Quick start (simulated demo)
@@ -101,6 +105,8 @@ flowchart LR
     col -->|"each check"| alert["Alert state machine<br/>3 consecutive checks"]
     alert -->|"alerts, state"| db
     snmp -->|"rates, SNMP status"| db
+    db -->|"stored checks"| qual["Quality figures<br/>latency, jitter, loss, grade"]
+    qual --> api
     db --> api["FastAPI<br/>read-only JSON API"]
     api --> ui["Dashboard<br/>HTML, JS, SVG charts"]
 ```
@@ -112,6 +118,7 @@ flowchart LR
 | Collector | `collector.py` | Polls every device concurrently on a schedule, with a per-probe timeout. Stores each check, then feeds it to the alert state machine. |
 | Alerts | `alerts.py` | Pure state machine: confirms state changes, raises alerts, handles restarts and gaps. |
 | Interface maths | `ifstats.py` | Pure functions: IF-MIB table parsing and counter-to-rate maths (first sample, rollover, reset, gap, absent interfaces). |
+| Network quality | `quality.py` | Pure functions over stored checks: mean latency, jitter, packet loss, grading and the bucketed series for the charts. Reads existing rows; stores nothing. |
 | SNMP | `snmp.py`, `snmp_pysnmp.py`, `snmp_poller.py` | `SnmpClient` interface, the deterministic simulated client, the real SNMPv3 client (optional dependency) and a polling loop that is separate from the ICMP collector. |
 | Storage | `storage.py` | SQLite with plain SQL: one shared connection, a lock, WAL mode. Windowed and downsampled history queries. |
 | API and dashboard | `api.py`, `templates/dashboard.html` | Read-only JSON endpoints and a single-page dashboard that polls them. |
@@ -218,6 +225,100 @@ history is shorter than the window, the chart shows just that history. Long wind
 server-side into at most about 300 buckets; a bucket is `down` only if every check in it was
 down, so a shorter outage appears as an amber cell (hover for "N of M checks were down").
 Devices with no history, stale devices and API errors each have an explicit message.
+
+## Network quality
+
+The **Network quality** section turns the ICMP checks already stored in SQLite into three figures
+and a grade per device. Nothing is probed or stored for it: the collector and database are
+unchanged, and the figures are calculated on request from the `checks` table.
+
+| Figure | Calculation | Not counted |
+|---|---|---|
+| **Latency** | Mean round-trip time of the replies received in the window (each check's average weighted by its replies). | Checks with no reply have no latency; they are never treated as 0 ms. |
+| **Jitter** | Mean absolute difference, in ms, between the average round-trip times of two **consecutive checks that both received replies**: `mean(abs(rtt[n] - rtt[n-1]))`. | A pair is not formed across a down check or a monitoring gap (more than 3 poll intervals plus 10 s). |
+| **Packet loss** | `100 * (probes sent - replies received) / probes sent`, over the checks actually made (3 probes each). | Time with no checks (app stopped, probe errors) is a **gap**: neither loss nor success. |
+
+**What jitter is not.** It is a simple latency-variation figure, not the RFC 3550 interarrival
+jitter used for RTP media, and ICMP echo measures the round trip, so it says nothing about
+one-way delay. Each check averages up to 3 pings before the difference is taken, which smooths
+short bursts: it will read lower than a per-packet figure on the same link.
+
+### Grades
+
+Each figure is graded against upper bounds (inclusive): up to the `excellent` bound is
+Excellent, up to `good` is Good, up to `fair` is Fair, above that Poor. A device's grade is the
+**worst of its three figures**, and the dashboard shows which one limits it.
+
+| Figure | Excellent | Good | Fair | Poor |
+|---|---|---|---|---|
+| Latency (ms) | up to 30 | up to 80 | up to 150 | above 150 |
+| Jitter (ms) | up to 5 | up to 15 | up to 30 | above 30 |
+| Loss (%) | up to 0.5 | up to 2 | up to 5 | above 5 |
+
+**These are application-level heuristics, not a QoS standard.** They are reasonable starting
+points for a general-purpose link; a voice circuit, a satellite link and a LAN deserve different
+numbers. Change them in the inventory:
+
+```yaml
+quality:
+  latency_ms: {excellent: 30, good: 80, fair: 150}   # give all three, in increasing order
+  jitter_ms: {excellent: 5, good: 15, fair: 30}
+  loss_pct: {excellent: 0.5, good: 2, fair: 5}       # percent, at most 100
+  window_s: 900            # default period (60 to 604800); the dashboard can change it
+  min_checks: 10           # fewer checks in the window: Unknown
+  min_jitter_pairs: 3      # pairs of consecutive successful checks needed to grade jitter
+  max_gap_fraction: 0.5    # more of the window than this unmeasured: Unknown
+```
+
+The block is optional and every key is optional; bad values stop startup with a message.
+
+### When the grade is Unknown (or Poor because nothing replies)
+
+A grade is only given when there is enough trustworthy data, and the reason is shown:
+
+| Situation | Result |
+|---|---|
+| The device has never been checked, or has no checks in the window | Unknown |
+| The newest check is older than the stale limit (3 poll intervals plus 10 s) | Unknown, "stale" |
+| Fewer than `min_checks` checks in the window | Unknown, "insufficient samples" (figures are still shown) |
+| More than `max_gap_fraction` of the window has no checks | Unknown, "sparse history" |
+| Fewer than `min_jitter_pairs` pairs of consecutive successful checks | Unknown (loss and latency are still shown) |
+| Checks were made but **no probe was answered** | Poor, "no replies": latency and jitter show a dash, never 0 |
+| Part of the window was down | Those checks count as loss; latency and jitter use only the replies |
+
+A device whose history is shorter than the window is not penalised for the time before its
+first check.
+
+### Charts
+
+Under the table, **Jitter over time** (line) and **Packet loss over time** (bars) use the device
+and window chosen in Latency history. Each point or bar covers a bucket of at least six poll
+intervals, so it holds enough probes for a percentage to mean something. Missing data is never
+drawn as a value: empty buckets are left out, no-data periods are hatched, jitter that cannot
+be measured breaks the line, and "measured, no loss" is a thin green line, which differs from
+"not measured". Dashed lines mark your Excellent, Good and Fair limits. Hover for the exact
+values and probe counts.
+
+### Network performance is not QoS enforcement
+
+This feature observes how ICMP echo traffic performs. It does **not** verify that DSCP marking,
+traffic shaping, queue management or any other QoS policy is configured or working: ICMP may
+be treated differently from the traffic a policy targets, the probes carry no particular DSCP
+value, and routers often rate-limit or deprioritise ICMP. A good grade means "ping looked
+healthy", not "the voice class gets priority".
+
+### In the simulated demo
+
+After a minute or two of data (10 checks are needed), `config/devices.sim.yaml` shows every
+kind of grade, deterministically (the simulation is seeded):
+
+| Device | Grade | Why |
+|---|---|---|
+| `core-router`, `edge-firewall`, `file-server` | Excellent | Low latency, steady, no loss |
+| `voice-gateway` | Fair | About 30 ms latency (Excellent or Good) and no loss, but jitter of about 20 ms: **graded on jitter** |
+| `access-switch` | Poor, then Fair, then Excellent | The scripted 30 s outage counts as loss: Poor at first, Fair once the window holds about 10 minutes of checks (under 5% loss), Excellent again (via Good) as the outage leaves the 15-minute window |
+| `wifi-ap` | Poor | 40% simulated packet loss |
+| `branch-vpn` | Poor | 170 ms latency |
 
 ## SNMP interface monitoring
 
@@ -367,6 +468,8 @@ All endpoints are read-only JSON; interactive documentation is at `/docs`.
 | `GET /api/devices` | Each device's latest check, its age and a `stale` flag. |
 | `GET /api/devices/{name}/history?limit=N` | The newest N raw checks (1 to 1000, default 100). |
 | `GET /api/devices/{name}/latency?window_s=N&max_points=M` | Chart data: points (latency is `null` for a down check), `gaps`, first/last check, `stale`. `window_s` 60 to 604800 (default 900), `max_points` 10 to 1000 (default 300). |
+| `GET /api/quality?window_s=N` | Network-quality summary for every device over the last `window_s` seconds (60 to 604800, default `quality.window_s`): `level` (`excellent`, `good`, `fair`, `poor` or `unknown`), `reason`, per-figure `grades`, `limiting`, `latency_ms`, `jitter_ms`, `loss_pct` (each `null` when it cannot be calculated), check and probe counts, `jitter_pairs`, `gap_fraction`, `stale`, plus the thresholds, the definitions and a scope statement. |
+| `GET /api/devices/{name}/quality?window_s=N&max_points=M` | One device's summary plus `points` (time buckets with `loss_pct`, `jitter_ms`, probe counts; empty buckets are omitted) and `gaps`. |
 | `GET /api/interfaces?device=NAME` | Latest SNMP interface statistics per SNMP device (optionally one): SNMP `status` (`ok`, `pending`, `timeout`, `auth_failure`, `unsupported`, `error`), safe `message`, `stale`, and per interface `oper_status`, `present`, `in_bps`, `out_bps`, error and discard increases since the last poll, and a `rate_note` saying why a rate is `null`. Raw counters are never returned; `simulated` says whether the data is simulated. |
 | `GET /api/alerts?limit=N` | Newest alerts first (1 to 500, default 50) with `severity`, `from_status`, `to_status`, `message`, `age_s`. |
 | `GET /healthz` | `{"ok": true}` |
@@ -377,6 +480,9 @@ All endpoints are read-only JSON; interactive documentation is at `/docs`.
 mode: simulated            # simulated (default) or real
 poll_interval_s: 5         # default 5; minimum 0.1 simulated, 5 real
 snmp_poll_interval_s: 30   # interface polling; default 30; minimum 1 simulated, 10 real
+quality:                   # optional; grading thresholds and minimum data (see Network quality)
+  jitter_ms: {excellent: 5, good: 15, fair: 30}   # also latency_ms and loss_pct
+  min_checks: 10           # also window_s, min_jitter_pairs, max_gap_fraction
 devices:
   - name: access-switch    # 1-64 chars: letters, digits . _ -
     address: 192.0.2.10    # simulated: any label without spaces; real: one IPv4 address or hostname
@@ -411,14 +517,18 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-545 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
+645 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
 persistence, schema upgrade), the ICMP prober and its safety rules (with a fake command runner
 and recorded or constructed `ping` output), inventory validation, the collector's error handling,
 storage, the history and downsampling queries, the API and the CLI, and for SNMP: the counter
 and rate maths (rollover, reset, restart, gaps, unsupported counters, absent interfaces), table
 parsing, the simulated client, configuration and credential rules, storage (including counters
 above signed 64-bit), failure handling and isolation from ICMP, the interface API, and the real
-SNMP client's logic with its pysnmp calls replaced by fakes. None touch a network, run a real
+SNMP client's logic with its pysnmp calls replaced by fakes. For network quality: the jitter,
+latency and loss maths (consecutive pairs, down checks, gaps, weighting, a reference
+implementation on random data), grading and thresholds, the Unknown cases, the series buckets,
+the `quality:` configuration rules, the storage query and both endpoints, and the simulated
+demo's deterministic grades. None touch a network, run a real
 `ping` or need an SNMP device.
 
 **What has and hasn't been verified**
@@ -431,7 +541,8 @@ SNMP client's logic with its pysnmp calls replaced by fakes. None touch a networ
 | Real ICMP | Run against the real `ping` on Linux (iputils), loopback only. |
 | Real SNMPv3 | Run end to end (authPriv, SHA-256 and AES-128) against a **net-snmp agent on loopback on Linux**, including wrong key, wrong user and wrong privacy key, and a search of the log, API and database for the passphrases. **Not tested against real network hardware, other SNMP agents, other protocol combinations, or on Windows or macOS.** |
 | Windows and macOS `ping` parsing | Tested only against sample output built from each tool's documented format; **not run on real Windows or macOS.** |
-| Dashboard | Checked by hand in headless Chromium (desktop, 375 px wide, dark mode). **Not tested in Firefox, Safari or Edge;** there is no JavaScript test suite. |
+| Network quality | Grades observed on real runs of the simulated demo (see the table above) and on real ICMP against loopback on Linux (sub-millisecond latency, 0 loss). The Unknown, stale, sparse-history, no-reply, no-jitter-pairs and API-error displays were checked in Chromium by serving the real API's responses for each scenario to the page. **Not measured on real WAN or wireless links, and the grading thresholds are untuned heuristics.** |
+| Dashboard | Checked by hand in headless Chromium (desktop, 375 and 390 px wide, dark mode). **Not tested in Firefox, Safari or Edge;** the one-second "ago" labels have Node.js tests, the rest of the JavaScript has none. |
 | PowerShell commands | Not run on Windows by the author. |
 
 ## Project layout
@@ -444,6 +555,7 @@ src/netmonlt/
   inventory.py     YAML loading and validation
   collector.py     polling loop
   alerts.py        alert state machine
+  quality.py       latency, jitter, packet-loss maths and grading (pure functions)
   ifstats.py       interface counter maths and IF-MIB table parsing
   snmp.py          SNMP client interface, credentials, simulated client
   snmp_pysnmp.py   real SNMPv3 client (optional dependency)
@@ -462,6 +574,13 @@ JavaScript framework or build step.
 
 ## Limitations
 
+- **Network quality:** jitter is calculated from each check's average of 3 pings (stored data
+  only), so it is smoother than per-packet jitter and is neither RFC 3550 jitter nor one-way
+  delay. Loss resolution depends on the probes in the window (3 per check). ICMP can be
+  rate-limited or treated differently from real traffic, so grades describe how ping behaves,
+  not application experience or QoS policy. Default thresholds are generic heuristics. Quality is
+  not used for alerts, and each request reads the window's checks (about 120,000 rows for 7 days
+  at 5 s), which is fine for a lab but not for a large estate.
 - **Scope:** ICMP reachability and latency, plus SNMPv3 interface counters. No CPU, memory,
   traps, SNMPv1/v2c or other MIBs, and interface figures are the latest values only (no history
   or charts, and no alerts on them yet).
