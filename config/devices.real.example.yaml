@@ -39,6 +39,18 @@ poll_interval_s: 10      # minimum 5 in real mode
 #   warn_after_polls: 3       # ... for this many polls in a row
 #   retention_days: 7
 
+# Optional: incident management (acknowledge, investigate and close alerts, with a write-up).
+# It is ON by default and needs no configuration; this block only tunes it. It reads the alerts
+# NetMonLT already raises and never changes monitoring. Changes are accepted only from the
+# machine running NetMonLT.
+# incidents:
+#   enabled: true                 # false hides the whole feature
+#   correlation_window_s: 900     # a fault that returns within this many seconds of recovery
+#                                 # joins the same incident (60 to 86400)
+#   flapping_recurrences: 2       # this many recurrences mark an incident as flapping
+#   operator_actions: false       # OFF by default in real mode (incidents are read-only). Set
+#                                 # true to let this machine acknowledge, note and resolve them.
+
 devices:
   # Your own computer over the loopback interface: always safe to try.
   - name: this-machine

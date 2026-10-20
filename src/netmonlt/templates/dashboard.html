@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NetMonLT</title>
 <link rel="icon" href="data:,">
+<meta name="netmonlt-token" content="{{ incident_token }}">
 <style>
   :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#667085; --line:#e4e7ec;
           --up:#067647; --up-bg:#d1fadf; --deg:#93370d; --deg-bg:#fef0c7;
@@ -163,6 +164,70 @@
   .qchart .sdot { stroke-width:1.75; fill:var(--card); }
   #qos-legend { display:flex; flex-wrap:wrap; gap:4px 14px; color:var(--muted); font-size:12px; margin-top:6px; }
   #qos-legend i { display:inline-block; width:14px; height:3px; margin-right:5px; vertical-align:3px; border-radius:2px; }
+  #inc-panel[hidden] { display:none; }
+  #inc-note { font-size:13px; padding:6px 10px; border-radius:6px; margin:0 0 8px;
+              background:var(--down-bg); color:var(--down); }
+  #inc-note:empty { display:none; }
+  .inc-controls { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; padding:10px 14px;
+                  border-bottom:1px solid var(--line); }
+  .inc-controls label { color:var(--muted); font-size:13px; }
+  .inc-tabs { display:inline-flex; gap:4px; }
+  .inc-tabs button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+                     border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  .inc-tabs button[aria-selected="true"] { background:var(--fg); color:var(--bg); border-color:var(--fg); }
+  .inc-tabs .count { margin-left:6px; opacity:.75; }
+  #inc-wrap th, #inc-wrap td { padding-left:10px; padding-right:10px; }
+  #inc-wrap td.inc-cell { white-space:normal; }
+  #inc-wrap td small { display:block; color:var(--muted); font-size:12px; }
+  #inc-wrap .actions { display:flex; flex-wrap:wrap; gap:4px; }
+  @media (max-width:640px) {
+    /* the incident table becomes one card per incident, so every column and action stays visible */
+    #inc-wrap thead { display:none; }
+    #inc-wrap table, #inc-wrap tbody, #inc-wrap tr, #inc-wrap td { display:block; width:100%; box-sizing:border-box; }
+    #inc-wrap tr { padding:8px 0; border-bottom:1px solid var(--line); }
+    #inc-wrap tr:last-child { border-bottom:0; }
+    #inc-wrap td { border:0; padding:3px 12px; }
+    #inc-wrap td::before { content:attr(data-label); display:block; color:var(--muted); font-size:11px;
+                           text-transform:uppercase; letter-spacing:.04em; }
+  }
+  .inc-flap { display:inline-block; margin-top:4px; font-size:12px; font-weight:700; letter-spacing:.03em; }
+  .inc-btn { font:inherit; font-size:13px; color:var(--fg); background:var(--bg); cursor:pointer;
+             border:1px solid var(--line); border-radius:6px; padding:3px 9px; }
+  .inc-btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .inc-btn:disabled { opacity:.5; cursor:not-allowed; }
+  .inc-detail { margin-top:12px; padding:14px 16px; }
+  .inc-detail h3 { margin:0; font-size:17px; }
+  .inc-detail h4 { margin:18px 0 6px; font-size:14px; }
+  .inc-d-head { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; justify-content:space-between; }
+  .inc-badges { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+  .inc-banner { font-size:13px; padding:6px 10px; border-radius:6px; margin:8px 0; background:var(--deg-bg); color:var(--deg); }
+  .inc-banner.real { background:var(--up-bg); color:var(--up); }
+  #inc-d-msg { font-size:13px; padding:6px 10px; border-radius:6px; margin:8px 0; }
+  #inc-d-msg:empty { display:none; }
+  #inc-d-msg.bad { background:var(--down-bg); color:var(--down); }
+  #inc-d-msg.good { background:var(--up-bg); color:var(--up); }
+  .inc-text { white-space:pre-wrap; overflow-wrap:anywhere; margin:4px 0; }
+  .inc-kv { display:grid; grid-template-columns:minmax(120px, 200px) 1fr; gap:4px 12px; font-size:14px; margin:6px 0; }
+  .inc-kv dt { color:var(--muted); }
+  .inc-kv dd { margin:0; overflow-wrap:anywhere; }
+  .inc-timeline { list-style:none; margin:0; padding:0; font-size:14px; }
+  .inc-timeline li { padding:6px 0 6px 12px; border-left:3px solid var(--line); margin-left:4px; }
+  .inc-timeline li.operator { border-left-color:var(--accent); }
+  .inc-timeline .when { color:var(--muted); font-size:12px; display:block; }
+  .inc-src { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.04em;
+             padding:1px 6px; border-radius:4px; background:var(--none-bg); color:var(--none); margin-right:6px; }
+  .inc-src.operator { background:var(--good-bg); color:var(--good); }
+  .inc-example { border:2px dashed var(--deg); border-radius:8px; padding:10px 14px; margin:14px 0; }
+  .inc-example h4 { margin-top:0; color:var(--deg); }
+  .inc-detail textarea, .inc-detail select, .inc-detail input[type="text"] {
+      width:100%; box-sizing:border-box; font:inherit; font-size:14px; color:var(--fg); background:var(--bg);
+      border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  .inc-detail textarea { min-height:70px; resize:vertical; }
+  .inc-detail label { display:block; font-size:13px; color:var(--muted); margin:10px 0 3px; }
+  .inc-detail form { margin:0 0 8px; }
+  .inc-hint { color:var(--muted); font-size:13px; margin:4px 0; }
+  .inc-detail details { margin-top:14px; }
+  .inc-detail details textarea { min-height:160px; font-family:ui-monospace, monospace; font-size:12px; }
   #if-panel[hidden] { display:none; }
   .if-head { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:center; margin:28px 0 8px; }
   .if-head h2 { margin:0; }
@@ -200,6 +265,113 @@
       <tbody id="rows"></tbody>
     </table>
   </div>
+  <section id="inc-panel" hidden>
+    <div class="if-head">
+      <h2>Incidents</h2>
+      <span id="inc-badge" class="banner"></span>
+    </div>
+    <div id="inc-note" role="status"></div>
+    <div class="wrap" id="inc-wrap">
+      <div class="inc-controls">
+        <div class="inc-tabs" role="tablist" aria-label="Incident view">
+          <button type="button" role="tab" data-incview="active" aria-selected="true">Active <span class="count" id="inc-count-active"></span></button>
+          <button type="button" role="tab" data-incview="history" aria-selected="false">History <span class="count" id="inc-count-history"></span></button>
+        </div>
+        <label>Status
+          <select id="inc-status">
+            <option value="">All</option><option value="open">Open</option>
+            <option value="acknowledged">Acknowledged</option>
+            <option value="recovered">Monitoring recovered</option>
+            <option value="reopened">Reopened</option>
+          </select>
+        </label>
+        <label>Severity
+          <select id="inc-severity">
+            <option value="">All</option><option value="critical">Critical</option>
+            <option value="warning">Warning</option>
+          </select>
+        </label>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Incident</th><th>Device</th><th>Severity</th><th>Status</th><th>Detected</th>
+          <th>Alerts</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="inc-rows"></tbody>
+      </table>
+      <div class="empty" id="inc-empty" hidden></div>
+      <div class="q-caption" id="inc-caption">
+        An incident groups related alerts for one device. <b>Monitoring recovery is not closure:</b>
+        when monitoring confirms a device is back, the incident is marked "auto-recovered — awaiting
+        review", but nothing says anyone investigated or fixed it. A person closes it by writing a
+        resolution summary; a closed incident leaves the Active view but stays in History with all
+        its evidence, and can be reopened. NetMonLT itself repairs nothing. Changes can only be made
+        from the machine running NetMonLT.
+      </div>
+    </div>
+    <div class="wrap inc-detail" id="inc-detail" hidden>
+      <div class="inc-d-head">
+        <h3 id="inc-d-title"></h3>
+        <button type="button" class="inc-btn" id="inc-d-close">Close report</button>
+      </div>
+      <div id="inc-d-badges" class="inc-badges"></div>
+      <div id="inc-d-label" class="inc-banner"></div>
+      <div id="inc-d-msg" role="status"></div>
+      <div class="actions">
+        <button type="button" class="inc-btn primary" id="inc-b-ack">Acknowledge</button>
+        <button type="button" class="inc-btn" id="inc-b-copy">Copy report (Markdown)</button>
+      </div>
+      <h4>Observed by NetMonLT</h4>
+      <p class="inc-hint">Counted from stored monitoring data. Nothing here is entered or edited by a person.</p>
+      <div id="inc-d-observed"></div>
+      <h4>Timeline</h4>
+      <ol class="inc-timeline" id="inc-d-timeline"></ol>
+      <div class="inc-example" id="inc-d-example" hidden></div>
+      <h4>Operator write-up</h4>
+      <p class="inc-hint" id="inc-d-opnote">Entered by a person, and blank until they write it: NetMonLT never fills these in or guesses a cause.</p>
+      <form id="inc-f-report">
+        <label for="inc-f-status">Root cause status</label>
+        <select id="inc-f-status">
+          <option value="unconfirmed">Unconfirmed (not yet established)</option>
+          <option value="suspected">Suspected</option>
+          <option value="confirmed">Confirmed</option>
+        </select>
+        <label for="inc-f-root_cause">Root cause (suspected or confirmed)</label>
+        <textarea id="inc-f-root_cause" maxlength="2000"></textarea>
+        <label for="inc-f-actions_taken">Actions taken</label>
+        <textarea id="inc-f-actions_taken" maxlength="4000"></textarea>
+        <label for="inc-f-impact_assessment">Impact assessment</label>
+        <textarea id="inc-f-impact_assessment" maxlength="2000"></textarea>
+        <label for="inc-f-recovery_verification">Recovery verification (what you checked)</label>
+        <textarea id="inc-f-recovery_verification" maxlength="2000"></textarea>
+        <label for="inc-f-lessons_learned">Lessons learned and preventative actions</label>
+        <textarea id="inc-f-lessons_learned" maxlength="4000"></textarea>
+        <p><button type="submit" class="inc-btn primary" id="inc-b-save">Save write-up</button></p>
+      </form>
+      <h4>Investigation notes</h4>
+      <form id="inc-f-note">
+        <label for="inc-f-note-text">Add a note (kept permanently in the timeline)</label>
+        <textarea id="inc-f-note-text" maxlength="4000"></textarea>
+        <p><button type="submit" class="inc-btn" id="inc-b-note">Add note</button></p>
+      </form>
+      <h4 id="inc-d-close-title">Resolve or close</h4>
+      <form id="inc-f-resolve">
+        <p class="inc-hint" id="inc-d-resolve-hint"></p>
+        <label for="inc-f-resolution">Resolution summary (required, at least 10 characters)</label>
+        <textarea id="inc-f-resolution" maxlength="4000"></textarea>
+        <p><button type="submit" class="inc-btn primary" id="inc-b-resolve">Resolve incident</button></p>
+      </form>
+      <form id="inc-f-reopen" hidden>
+        <label for="inc-f-reopen-reason">Reason for reopening (required)</label>
+        <textarea id="inc-f-reopen-reason" maxlength="1000"></textarea>
+        <p><button type="submit" class="inc-btn" id="inc-b-reopen">Reopen incident</button></p>
+      </form>
+      <details>
+        <summary>Report text (Markdown, for copying)</summary>
+        <textarea readonly id="inc-d-markdown"></textarea>
+      </details>
+    </div>
+  </section>
   <h2>Latency history</h2>
   <div class="wrap chart-card" id="chart-card">
     <div class="chart-controls">
@@ -396,6 +568,8 @@
     </div>
   </section>
   <h2>Recent alerts</h2>
+  <p class="inc-hint" style="margin:-4px 0 8px">The event log: every monitoring alert, exactly as raised.
+    Incidents above group related alerts into one case.</p>
   <div class="wrap" id="alerts-wrap">
     <table>
       <thead><tr>
@@ -856,6 +1030,333 @@ window.addEventListener("resize", () => {
   requestAnimationFrame(() => { resizeQueued = false; if (chartData) drawChart(chartData); });
 });
 setInterval(refreshChart, 5000);
+
+// ---- incidents: a human workflow on top of the alert log ----------------------------------------
+// Monitoring state (set only by monitoring) and review state (set only by people) are shown apart.
+// Everything from the API, notes included, is untrusted: it is only ever put in with textContent.
+const incPanel = document.getElementById("inc-panel");
+const incRows = document.getElementById("inc-rows");
+const incNote = document.getElementById("inc-note");
+const incWrap = document.getElementById("inc-wrap");
+const incDetail = document.getElementById("inc-detail");
+const incMsg = document.getElementById("inc-d-msg");
+const INC_TOKEN = (document.querySelector('meta[name="netmonlt-token"]') || {}).content || "";
+const INC_STATUS_CLASS = {
+  open: "down", acknowledged: "degraded", recovered_awaiting_review: "q-good",
+  recovered_acknowledged: "q-good", reopened: "down", reopened_recovered: "degraded", resolved: "up",
+};
+const INC_REPORT_FIELDS = ["root_cause", "actions_taken", "impact_assessment", "recovery_verification", "lessons_learned"];
+let incView = "active", incStatus = "", incSeverity = "", incSelected = null, incFilled = null;
+let incCan = false, incLoaded = false, incReq = 0, incDetailReq = 0, incCurrent = null;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+
+function incButton(label, handler, cls) {
+  const b = el("button", "inc-btn" + (cls ? " " + cls : ""), label);
+  b.type = "button";
+  b.addEventListener("click", handler);
+  return b;
+}
+
+async function incSend(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: {"Content-Type": "application/json", "X-NetMonLT-Token": INC_TOKEN},
+    body: JSON.stringify(body || {}),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) {
+    const detail = data && data.detail;
+    throw new Error(Array.isArray(detail) ? detail.map((d) => d.msg).join("; ") : (typeof detail === "string" ? detail : "HTTP " + res.status));
+  }
+  return data;
+}
+
+function incShow(text, kind) {
+  incMsg.textContent = text || "";
+  incMsg.className = kind || "";
+}
+
+const INC_COLUMNS = ["Incident", "Device", "Severity", "Status", "Detected", "Alerts", "Actions"];
+
+function renderIncidentList(data) {
+  incPanel.hidden = !data.enabled;
+  if (!data.enabled) return;
+  incCan = data.can_modify;
+  const badge = document.getElementById("inc-badge");
+  badge.textContent = data.simulated ? "SIMULATED INCIDENTS" : (data.can_modify ? "REAL MONITORING · local changes allowed" : "REAL MONITORING · read-only here");
+  badge.className = "banner" + (data.simulated ? "" : " live");
+  document.getElementById("inc-count-active").textContent = data.counts.active + (data.counts.awaiting_review ? " (" + data.counts.awaiting_review + " to review)" : "");
+  document.getElementById("inc-count-history").textContent = data.counts.history;
+  incRows.replaceChildren();
+  for (const i of data.incidents) {
+    const tr = document.createElement("tr");
+    const id = el("td", "inc-cell", i.display_id);
+    if (i.simulated) id.appendChild(el("small", null, "simulated"));
+    if (i.previous_display_id) id.appendChild(el("small", null, "previous on this device: " + i.previous_display_id));
+    const sev = document.createElement("td");
+    sev.appendChild(el("span", "badge " + i.severity, i.severity));
+    const status = el("td", "inc-cell");
+    status.appendChild(el("span", "badge " + (INC_STATUS_CLASS[i.lifecycle.code] || "unknown"), i.lifecycle.label));
+    const when = el("td", "num inc-cell");
+    setAge(when, Math.max(0, data.server_time - i.opened_ts), "ago", new Date(i.opened_ts * 1000).toLocaleString() + " · ");
+    if (i.resolved_ts) when.appendChild(el("small", null, "resolved " + new Date(i.resolved_ts * 1000).toLocaleString()));
+    else if (i.recovered_ts) when.appendChild(el("small", null, "monitoring recovered " + fmtDuration(i.recovered_ts - i.opened_ts) + " after detection"));
+    const alerts = el("td", "inc-cell", String(i.alert_events));
+    if (i.flapping) {
+      const flap = el("span", "badge degraded inc-flap", "FLAPPING · " + i.flap_count + " recurrences");
+      flap.title = "The fault came back " + i.flap_count + " times within the correlation window; all of it is grouped in this incident.";
+      status.appendChild(flap);
+    } else if (i.flap_count) alerts.appendChild(el("small", null, "recurred " + i.flap_count + "×"));
+    const actions = document.createElement("td");
+    const box = el("div", "actions");
+    box.appendChild(incButton("View report", () => openIncident(i.id)));
+    if (data.can_modify && i.lifecycle.review === "open") box.appendChild(incButton("Acknowledge", () => quickAcknowledge(i.id), "primary"));
+    if (data.can_modify && i.lifecycle.review !== "resolved" && i.lifecycle.monitoring === "recovered") box.appendChild(incButton("Resolve…", () => openIncident(i.id, "resolve")));
+    if (data.can_modify && i.lifecycle.review === "resolved") box.appendChild(incButton("Reopen…", () => openIncident(i.id, "reopen")));
+    actions.appendChild(box);
+    tr.append(id, cell(i.device), sev, status, when, alerts, actions);
+    INC_COLUMNS.forEach((label, n) => { tr.children[n].dataset.label = label; });
+    incRows.appendChild(tr);
+  }
+  const empty = document.getElementById("inc-empty");
+  const filtered = incStatus || incSeverity;
+  empty.hidden = data.incidents.length > 0;
+  empty.textContent = filtered ? "No incidents match these filters."
+    : incView === "history" ? "No resolved incidents yet. Resolved incidents appear here with their full history."
+    : "No active incidents. When monitoring raises an alert for a device, an incident appears here.";
+}
+
+async function refreshIncidents() {
+  const req = ++incReq;
+  const q = new URLSearchParams({view: incView, limit: "100"});
+  if (incStatus) q.set("status", incStatus);
+  if (incSeverity) q.set("severity", incSeverity);
+  try {
+    const data = await getJson("/api/incidents?" + q.toString());
+    if (req !== incReq) return;
+    renderIncidentList(data);
+    incLoaded = true;
+    incNote.textContent = "";
+    incWrap.classList.remove("offline");
+    if (incSelected !== null && data.enabled) await refreshIncidentDetail(false);
+  } catch (err) {
+    if (req !== incReq) return;
+    if (incLoaded) {
+      incNote.textContent = "Could not load incidents (" + err.message + "). Showing the last data received, which is out of date.";
+      incWrap.classList.add("offline");
+    }
+  }
+}
+
+async function quickAcknowledge(id) {
+  try {
+    await incSend("POST", "/api/incidents/" + id + "/acknowledge", {});
+    await refreshIncidents();
+  } catch (err) {
+    incNote.textContent = "Could not acknowledge: " + err.message;
+  }
+}
+
+async function openIncident(id, focus) {
+  incSelected = id;
+  incFilled = null;   // fill the form fields from the server for this incident
+  await refreshIncidentDetail(true);
+  incDetail.hidden = false;
+  incDetail.scrollIntoView({behavior: "smooth", block: "start"});
+  if (focus === "resolve") document.getElementById("inc-f-resolution").focus();
+  if (focus === "reopen") document.getElementById("inc-f-reopen-reason").focus();
+}
+
+async function refreshIncidentDetail() {
+  const id = incSelected;
+  if (id === null) return;
+  const req = ++incDetailReq;
+  try {
+    const d = await getJson("/api/incidents/" + id);
+    if (req !== incDetailReq || id !== incSelected) return;
+    renderIncidentDetail(d);
+  } catch (err) {
+    if (req !== incDetailReq) return;
+    incShow("Could not load this incident (" + err.message + ").", "bad");
+  }
+}
+
+function kv(parent, label, value) {
+  const dt = el("dt", null, label), dd = el("dd", null, value === null || value === undefined || value === "" ? "–" : String(value));
+  parent.append(dt, dd);
+}
+
+function renderIncidentDetail(d) {
+  const r = d.report, life = r.lifecycle, inc = d.incident;
+  incCurrent = d;
+  incDetail.hidden = false;
+  document.getElementById("inc-d-title").textContent = r.title + " (" + r.severity + ")";
+  const badges = document.getElementById("inc-d-badges");
+  badges.replaceChildren(
+    el("span", "badge " + (INC_STATUS_CLASS[life.code] || "unknown"), life.label),
+    el("span", "badge " + (life.monitoring === "recovered" ? "up" : "down"), "Monitoring: " + life.monitoring),
+    el("span", "badge " + (life.review === "resolved" ? "up" : life.review === "acknowledged" ? "degraded" : "unknown"), "Review: " + life.review),
+  );
+  if (r.flapping) badges.appendChild(el("span", "badge degraded", "Flapping: recurred " + r.flap_count + "×"));
+  if (inc.reopened_count) badges.appendChild(el("span", "badge unknown", "Reopened " + inc.reopened_count + "×"));
+  if (inc.previous_display_id) badges.appendChild(el("span", "badge unknown", "Previous on this device: " + inc.previous_display_id));
+  const label = document.getElementById("inc-d-label");
+  label.textContent = r.data_label;
+  label.className = "inc-banner" + (r.simulated ? "" : " real");
+
+  const obs = document.getElementById("inc-d-observed");
+  obs.replaceChildren();
+  obs.appendChild(el("p", "inc-text", r.observed.summary));
+  const ev = r.observed.evidence, list = el("dl", "inc-kv");
+  kv(list, "Detected", r.detected_at);
+  kv(list, "Monitoring recovered", r.recovered_at || "not confirmed");
+  kv(list, "Resolved", r.resolved_at || "not resolved");
+  kv(list, "ICMP checks", ev.checks_total + " (" + ev.checks_down + " down, " + ev.checks_degraded + " degraded, " + ev.checks_up + " up)");
+  kv(list, "Probes", ev.probes_sent + " sent, " + ev.probes_received + " answered" + (ev.loss_pct === null ? "" : " (loss " + ev.loss_pct + "%)"));
+  kv(list, "Detection to recovery", ev.time_to_recovery_s === null ? "not recovered" : fmtDuration(ev.time_to_recovery_s));
+  obs.appendChild(list);
+  obs.appendChild(el("h4", null, "Automated monitoring actions"));
+  const actions = el("ul", "inc-text");
+  for (const a of r.observed.automated_actions) actions.appendChild(el("li", null, a));
+  obs.appendChild(actions);
+  obs.appendChild(el("h4", null, "Recovery verification (observed)"));
+  obs.appendChild(el("p", "inc-text", r.observed.recovery_verification));
+  obs.appendChild(el("h4", null, "Impact (observed)"));
+  obs.appendChild(el("p", "inc-text", r.observed.impact));
+
+  const tl = document.getElementById("inc-d-timeline");
+  tl.replaceChildren();
+  for (const e of r.observed.timeline) {
+    const li = el("li", e.source === "monitoring" ? "" : "operator");
+    li.appendChild(el("span", "when", e.time));
+    li.appendChild(el("span", "inc-src" + (e.source === "monitoring" ? "" : " operator"), e.source === "monitoring" ? "NetMonLT" : "Operator"));
+    li.append(e.label + (e.actor ? " (" + e.actor + ")" : ""));
+    if (e.text) li.appendChild(el("div", "inc-text", e.text));
+    tl.appendChild(li);
+  }
+
+  const ex = document.getElementById("inc-d-example");
+  ex.replaceChildren();
+  ex.hidden = !r.simulated_example;
+  if (r.simulated_example) {
+    const x = r.simulated_example;
+    ex.appendChild(el("h4", null, x.label));
+    ex.appendChild(el("p", "inc-text", x.notice));
+    ex.appendChild(el("p", "inc-text", "Known scenario cause (defined by the simulator): " + (x.known_scenario_cause ? x.known_scenario_cause.text : x.no_cause_note)));
+    ex.appendChild(el("p", null, "Illustrative troubleshooting steps (fictional, not performed by anyone):"));
+    const steps = el("ul", "inc-text");
+    for (const t of x.illustrative_troubleshooting_steps) steps.appendChild(el("li", null, t));
+    ex.appendChild(steps);
+    ex.appendChild(el("p", "inc-text", "Illustrative resolution summary: " + x.illustrative_resolution_summary));
+    ex.appendChild(el("p", null, "Illustrative recommendations and lessons learned (examples):"));
+    const recs = el("ul", "inc-text");
+    for (const t of x.illustrative_recommendations.concat(x.illustrative_lessons_learned)) recs.appendChild(el("li", null, t));
+    ex.appendChild(recs);
+    ex.appendChild(incButton("Use the example as a resolution-summary draft", () => {
+      const box = document.getElementById("inc-f-resolution");
+      if (!box.value) box.value = "[Illustrative example text, not a real action] " + x.illustrative_resolution_summary;
+    }));
+  }
+
+  // Form fields are filled once per opened incident, so a background refresh never overwrites typing.
+  if (incFilled !== d.incident.id) {
+    incFilled = d.incident.id;
+    document.getElementById("inc-f-status").value = r.operator.root_cause_status;
+    for (const f of INC_REPORT_FIELDS) document.getElementById("inc-f-" + f).value = r.operator[f];
+    document.getElementById("inc-f-resolution").value = r.operator.resolution_summary || "";
+    document.getElementById("inc-f-note-text").value = "";
+    document.getElementById("inc-f-reopen-reason").value = "";
+    incShow("");
+  }
+  const can = d.can_modify;
+  document.getElementById("inc-d-opnote").textContent = "Entered by a person, and blank until they write it: NetMonLT never fills these in or guesses a cause." + (can ? "" : " Read-only here: " + d.read_only_reason + ".");
+  for (const control of incDetail.querySelectorAll("form textarea, form select, form button")) control.disabled = !can;
+  document.getElementById("inc-b-ack").hidden = !(can && life.review === "open");
+  const resolved = life.review === "resolved";
+  document.getElementById("inc-f-resolve").hidden = resolved;
+  document.getElementById("inc-f-reopen").hidden = !resolved;
+  document.getElementById("inc-d-close-title").textContent = resolved ? "Reopen" : "Resolve or close";
+  const ready = life.monitoring === "recovered";
+  document.getElementById("inc-b-resolve").disabled = !(can && ready);
+  document.getElementById("inc-d-resolve-hint").textContent = ready
+    ? "Monitoring has confirmed recovery. Resolving documents the outcome and removes this from the Active view; its evidence stays in History."
+    : "Monitoring still reports this fault, so it cannot be resolved yet. Acknowledge it meanwhile, and resolve it once recovery is confirmed.";
+  document.getElementById("inc-d-markdown").value = d.markdown;
+}
+
+function incReportFields() {
+  const out = {root_cause_status: document.getElementById("inc-f-status").value};
+  for (const f of INC_REPORT_FIELDS) out[f] = document.getElementById("inc-f-" + f).value;
+  return out;
+}
+
+async function incAction(labels, method, path, body, after) {
+  try {
+    await incSend(method, path, body);
+    incShow(labels[0], "good");
+    if (after) after();
+    await refreshIncidents();
+    await refreshIncidentDetail();
+  } catch (err) {
+    incShow(labels[1] + ": " + err.message, "bad");
+  }
+}
+
+document.getElementById("inc-d-close").addEventListener("click", () => { incSelected = null; incDetail.hidden = true; });
+document.getElementById("inc-b-ack").addEventListener("click", () => incAction(["Acknowledged.", "Could not acknowledge"], "POST", "/api/incidents/" + incSelected + "/acknowledge", {}));
+document.getElementById("inc-f-report").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  incAction(["Write-up saved.", "Could not save the write-up"], "PUT", "/api/incidents/" + incSelected + "/report", incReportFields());
+});
+document.getElementById("inc-f-note").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  incAction(["Note added.", "Could not add the note"], "POST", "/api/incidents/" + incSelected + "/notes",
+            {text: document.getElementById("inc-f-note-text").value},
+            () => { document.getElementById("inc-f-note-text").value = ""; });
+});
+document.getElementById("inc-f-resolve").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  incAction(["Incident resolved and moved to History.", "Could not resolve"], "POST", "/api/incidents/" + incSelected + "/resolve",
+            {...incReportFields(), resolution_summary: document.getElementById("inc-f-resolution").value});
+});
+document.getElementById("inc-f-reopen").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  incAction(["Incident reopened.", "Could not reopen"], "POST", "/api/incidents/" + incSelected + "/reopen",
+            {reason: document.getElementById("inc-f-reopen-reason").value},
+            () => { incFilled = null; });
+});
+document.getElementById("inc-b-copy").addEventListener("click", async () => {
+  const area = document.getElementById("inc-d-markdown");
+  try {
+    await navigator.clipboard.writeText(area.value);
+    incShow("Report copied to the clipboard.", "good");
+  } catch (err) {
+    area.closest("details").open = true;
+    area.select();
+    incShow("Could not use the clipboard here: the report text is selected below, press Ctrl+C.", "bad");
+  }
+});
+for (const tab of document.querySelectorAll(".inc-tabs button")) {
+  tab.addEventListener("click", () => {
+    incView = tab.dataset.incview;
+    for (const other of document.querySelectorAll(".inc-tabs button")) other.setAttribute("aria-selected", String(other === tab));
+    const statusSelect = document.getElementById("inc-status");
+    statusSelect.disabled = incView === "history";
+    if (incView === "history") { statusSelect.value = ""; incStatus = ""; }
+    refreshIncidents();
+  });
+}
+document.getElementById("inc-status").addEventListener("change", (ev) => { incStatus = ev.target.value; refreshIncidents(); });
+document.getElementById("inc-severity").addEventListener("change", (ev) => { incSeverity = ev.target.value; refreshIncidents(); });
+refreshIncidents();
+setInterval(refreshIncidents, 5000);
 
 // ---- network quality: latency, jitter and packet loss from the stored ICMP checks --------------
 // The server does the maths (see netmonlt/quality.py); this only displays it. Values it does not

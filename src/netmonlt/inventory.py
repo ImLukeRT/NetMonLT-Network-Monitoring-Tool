@@ -19,6 +19,7 @@ from netmonlt.domain import (
     WIFI_BACKENDS,
     WIFI_SSID_PRIVACY,
     Device,
+    IncidentsConfig,
     QosConfig,
     QualityConfig,
     QualityThresholds,
@@ -36,8 +37,9 @@ from netmonlt.qos_adapters import ADAPTERS
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # used in URLs, so keep it URL-safe
 _TOP_KEYS = {
     "mode", "poll_interval_s", "snmp_poll_interval_s", "qos_poll_interval_s",
-    "qos_retention_hours", "quality", "wifi", "devices",
+    "qos_retention_hours", "quality", "wifi", "incidents", "devices",
 }
+_INCIDENTS_KEYS = {"enabled", "correlation_window_s", "flapping_recurrences", "operator_actions"}
 _WIFI_KEYS = {
     "enabled", "poll_interval_s", "backend", "ssid_privacy", "low_signal_pct",
     "warn_after_polls", "retention_days", "sim",
@@ -128,6 +130,7 @@ class Inventory:
     snmp_poll_interval_s: float = 30.0
     quality: QualityConfig = field(default_factory=QualityConfig)
     wifi: WifiConfig = field(default_factory=WifiConfig)
+    incidents: IncidentsConfig = field(default_factory=IncidentsConfig)
     qos_poll_interval_s: float = 30.0
     qos_retention_hours: float = 24.0
 
@@ -181,6 +184,7 @@ def parse_inventory(raw: Any) -> Inventory:
 
     quality = _parse_quality(raw.get("quality"))
     wifi = _parse_wifi(raw.get("wifi"), mode)
+    incidents = _parse_incidents(raw.get("incidents"))
 
     qos_minimum = REAL_MIN_QOS_INTERVAL_S if mode == "real" else 1.0
     qos_interval = _number(
@@ -209,6 +213,7 @@ def parse_inventory(raw: Any) -> Inventory:
         snmp_poll_interval_s=snmp_interval,
         quality=quality,
         wifi=wifi,
+        incidents=incidents,
         qos_poll_interval_s=qos_interval,
         qos_retention_hours=qos_retention,
     )
@@ -240,6 +245,38 @@ def _parse_quality(raw: Any) -> QualityConfig:
         min_checks=whole("min_checks", 2, 100_000),
         min_jitter_pairs=whole("min_jitter_pairs", 1, 100_000),
         max_gap_fraction=fraction,
+    )
+
+
+def _parse_incidents(raw: Any) -> IncidentsConfig:
+    """The optional `incidents:` block: correlation window and whether operator actions exist."""
+    if raw is None:
+        return IncidentsConfig()
+    if not isinstance(raw, dict):
+        raise InventoryError("incidents must be a mapping")
+    _reject_unknown(raw, _INCIDENTS_KEYS, "incidents")
+    defaults = IncidentsConfig()
+    flags = {}
+    for key in ("enabled", "operator_actions"):
+        value = raw.get(key, getattr(defaults, key))
+        if value is not None and not isinstance(value, bool):
+            raise InventoryError(f"incidents.{key} must be true or false")
+        flags[key] = value
+    if flags["enabled"] is None:
+        raise InventoryError("incidents.enabled must be true or false")
+    window = _number(
+        raw.get("correlation_window_s", defaults.correlation_window_s),
+        "incidents.correlation_window_s", minimum=60, maximum=86400,
+    )
+    recurrences = _number(
+        raw.get("flapping_recurrences", defaults.flapping_recurrences),
+        "incidents.flapping_recurrences", minimum=1, maximum=100,
+    )
+    if recurrences != int(recurrences):
+        raise InventoryError("incidents.flapping_recurrences must be a whole number")
+    return IncidentsConfig(
+        enabled=flags["enabled"], correlation_window_s=window,
+        flapping_recurrences=int(recurrences), operator_actions=flags["operator_actions"],
     )
 
 

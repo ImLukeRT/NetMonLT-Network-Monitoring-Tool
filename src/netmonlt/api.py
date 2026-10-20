@@ -3,17 +3,25 @@
 import asyncio
 import contextlib
 import dataclasses
+import hmac
+import ipaddress
+import secrets
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict, Field
 
 from netmonlt import __version__, qos, quality, wifi
+from netmonlt import incidents as inc
 from netmonlt.collector import run_forever
 from netmonlt.collector import stale_after_s as compute_stale_after_s
+from netmonlt.incident_engine import run_incidents_forever
 from netmonlt.inventory import Inventory
 from netmonlt.probes.base import Prober
 from netmonlt.qos import QosClient
@@ -25,6 +33,62 @@ from netmonlt.storage import Database
 from netmonlt.wifi_poller import WifiSource, run_wifi_forever, wifi_stale_after_s
 
 MAX_QOS_HISTORY_SERIES = 16
+LOOPBACK_NAMES = {"localhost"}
+TOKEN_HEADER = "x-netmonlt-token"
+
+
+class _Body(BaseModel):
+    """Request bodies reject unknown fields, so a typo or an injected field is an error."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AckBody(_Body):
+    actor: str | None = Field(None, max_length=40)
+    note: str | None = Field(None, max_length=inc.MAX_NOTE_LEN)
+
+
+class NoteBody(_Body):
+    actor: str | None = Field(None, max_length=40)
+    text: str = Field(max_length=inc.MAX_NOTE_LEN)
+
+
+class ReportBody(_Body):
+    actor: str | None = Field(None, max_length=40)
+    root_cause_status: str | None = Field(None, max_length=20)
+    root_cause: str | None = Field(None, max_length=inc.REPORT_TEXT_FIELDS["root_cause"])
+    actions_taken: str | None = Field(None, max_length=inc.REPORT_TEXT_FIELDS["actions_taken"])
+    impact_assessment: str | None = Field(
+        None, max_length=inc.REPORT_TEXT_FIELDS["impact_assessment"])
+    recovery_verification: str | None = Field(
+        None, max_length=inc.REPORT_TEXT_FIELDS["recovery_verification"])
+    lessons_learned: str | None = Field(None, max_length=inc.REPORT_TEXT_FIELDS["lessons_learned"])
+
+
+class ResolveBody(ReportBody):
+    resolution_summary: str = Field(max_length=inc.REPORT_TEXT_FIELDS["resolution_summary"])
+
+
+class ReopenBody(_Body):
+    actor: str | None = Field(None, max_length=40)
+    reason: str = Field(max_length=inc.MAX_REASON_LEN)
+
+
+def _is_loopback(host: str | None) -> bool:
+    """True only for a literal loopback address (never a hostname such as "testclient")."""
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def _local_name(name: str | None) -> bool:
+    return bool(name) and (name in LOOPBACK_NAMES or _is_loopback(name))
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
@@ -38,6 +102,7 @@ def create_app(
     snmp_client: SnmpClient | None = None,
     wifi_source: WifiSource | None = None,
     qos_client: QosClient | None = None,
+    start_incidents: bool | None = None,
 ) -> FastAPI:
     """Build the app. Tests pass start_collector=False to control polling themselves.
 
@@ -52,6 +117,14 @@ def create_app(
     wifi_cfg = inventory.wifi
     wifi_stale_s = wifi_stale_after_s(wifi_cfg.poll_interval_s)
     qos_stale_s = qos_stale_after_s(inventory.qos_poll_interval_s)
+    incidents_cfg = inventory.incidents
+    simulated_mode = inventory.mode == "simulated"
+    # Changing incidents is on by default in the simulated demo, but opt-in for real monitoring.
+    actions_enabled = (simulated_mode if incidents_cfg.operator_actions is None
+                       else incidents_cfg.operator_actions)
+    run_started_ts = clock()  # when this run began: lets a simulated incident be tied to its script
+    change_token = secrets.token_urlsafe(32)  # per process; only the local dashboard page gets it
+    devices_by_name = {d.name: d for d in inventory.devices}
     qos_devices = {d.name: d for d in inventory.qos_devices}
 
     @contextlib.asynccontextmanager
@@ -64,6 +137,10 @@ def create_app(
             if snmp_client is not None and inventory.snmp_devices:
                 tasks.append(asyncio.create_task(run_snmp_forever(
                     inventory.snmp_devices, snmp_client, db, inventory.snmp_poll_interval_s
+                )))
+            if (start_incidents if start_incidents is not None else True) and incidents_cfg.enabled:
+                tasks.append(asyncio.create_task(run_incidents_forever(
+                    db, incidents_cfg, simulated=simulated_mode, run_started_ts=run_started_ts
                 )))
             if qos_client is not None and qos_devices:
                 tasks.append(asyncio.create_task(run_qos_forever(
@@ -82,10 +159,55 @@ def create_app(
                     await task
 
     app = FastAPI(title="NetMonLT", version=__version__, lifespan=lifespan)
+    app.state.incident_token = change_token
+
+    def change_access(request: Request) -> tuple[bool, str | None]:
+        """Whether this request may change incidents, and why not. Changes are accepted only
+        from a loopback client addressed as localhost: the machine running NetMonLT."""
+        if not incidents_cfg.enabled:
+            return False, "incident management is disabled in the inventory"
+        if not actions_enabled:
+            if incidents_cfg.operator_actions is None:
+                return False, ("incident changes are off by default in real mode: set "
+                               "incidents.operator_actions: true in your inventory to allow them")
+            return False, "operator actions are disabled in the inventory (read-only)"
+        if not _is_loopback(request.client.host if request.client else None):
+            return False, "incident changes are only accepted from the machine running NetMonLT"
+        if not _local_name(urlsplit("//" + request.headers.get("host", "")).hostname):
+            return False, "open the dashboard as http://localhost or http://127.0.0.1 to change"
+        return True, None
+
+    def require_change(request: Request) -> None:
+        """Guard for every state-changing incident endpoint (raises HTTPException)."""
+        allowed, reason = change_access(request)
+        if not allowed:
+            raise HTTPException(status_code=403, detail=reason)
+        origin = request.headers.get("origin")
+        if origin is not None and not _local_name(urlsplit(origin).hostname):
+            raise HTTPException(status_code=403, detail="cross-site request refused")
+        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail="send Content-Type: application/json")
+        token = request.headers.get(TOKEN_HEADER, "")
+        if not hmac.compare_digest(token.encode(), change_token.encode()):
+            raise HTTPException(status_code=403, detail="missing or invalid change token")
+
+    @app.exception_handler(inc.IncidentError)
+    async def incident_error(_: Request, exc: inc.IncidentError):
+        status = {inc.IncidentError.NOT_FOUND: 404,
+                  inc.IncidentError.INVALID_TRANSITION: 409}.get(exc.code, 422)
+        return JSONResponse(status_code=status, content={"detail": exc.message, "code": exc.code})
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def dashboard(request: Request):
-        return TEMPLATES.TemplateResponse(request, "dashboard.html", {"mode": inventory.mode})
+        # The change token goes only to a page the machine running NetMonLT itself is viewing.
+        allowed, _ = change_access(request)
+        response = TEMPLATES.TemplateResponse(
+            request, "dashboard.html",
+            {"mode": inventory.mode, "incident_token": change_token if allowed else ""},
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/api/devices")
     def list_devices():
@@ -439,6 +561,130 @@ def create_app(
             "points": points,
             "gaps": [{"start": a, "end": b} for a, b in gaps],
         }
+
+    # ---- incident management (a workflow on top of the alert log)
+    def incident_summary(i: inc.Incident, alerts: int = 0) -> dict:
+        return {
+            "id": i.id, "display_id": inc.display_id(i.id), "device": i.device, "kind": i.kind,
+            "severity": i.severity, "lifecycle": inc.lifecycle(i),
+            "flapping": inc.is_flapping(i, incidents_cfg), "flap_count": i.flap_count,
+            "opened_ts": i.opened_ts, "last_alert_ts": i.last_alert_ts,
+            "recovered_ts": i.recovered_ts if i.monitoring_state == inc.MON_RECOVERED else None,
+            "acknowledged_ts": i.acknowledged_ts, "acknowledged_by": i.acknowledged_by,
+            "resolved_ts": i.resolved_ts, "resolved_by": i.resolved_by,
+            "reopened_count": i.reopened_count, "previous_incident_id": i.previous_incident_id,
+            "previous_display_id": (None if i.previous_incident_id is None
+                                    else inc.display_id(i.previous_incident_id)),
+            "simulated": i.simulated, "alert_events": alerts,
+        }
+
+    def incident_access(request: Request) -> dict:
+        allowed, reason = change_access(request)
+        return {"can_modify": allowed, "read_only_reason": reason}
+
+    def require_incident(incident_id: int) -> inc.Incident:
+        if not incidents_cfg.enabled:
+            raise inc.IncidentError(inc.IncidentError.NOT_FOUND, "incident management is disabled")
+        found = db.get_incident(incident_id)
+        if found is None:
+            raise inc.IncidentError(inc.IncidentError.NOT_FOUND, "no such incident")
+        return found
+
+    def build_incident_report(i: inc.Incident, now: float) -> tuple[dict, list]:
+        device = devices_by_name.get(i.device)
+        events = db.incident_events(i.id)
+        report = inc.build_report(
+            i, events, db.incident_evidence(i, now), cfg=incidents_cfg,
+            device_type=device.type if device else "host", sim=device.sim if device else None,
+            poll_interval_s=inventory.poll_interval_s,
+        )
+        return report, events
+
+    @app.get("/api/incidents")
+    def list_incidents(
+        request: Request,
+        view: Literal["active", "history", "all"] = "active",
+        status: Literal["open", "acknowledged", "recovered", "reopened", "resolved"] | None = None,
+        severity: Literal["critical", "warning", "info"] | None = None,
+        device: str | None = Query(None, max_length=64),
+        limit: int = Query(100, ge=1, le=500),
+    ):
+        """Incidents built from the alert log: `view` "active" (not resolved), "history"
+        (resolved) or "all", optionally filtered. Each has a `lifecycle` that keeps the monitoring
+        state (active or recovered, set only by monitoring) apart from the review state (open,
+        acknowledged or resolved, set only by people). Read-only."""
+        base = {"enabled": incidents_cfg.enabled, "simulated": simulated_mode,
+                "server_time": clock(), **incident_access(request),
+                "correlation_window_s": incidents_cfg.correlation_window_s,
+                "flapping_recurrences": incidents_cfg.flapping_recurrences, "view": view}
+        if not incidents_cfg.enabled:
+            return {**base, "counts": {"active": 0, "history": 0, "awaiting_review": 0},
+                    "incidents": []}
+        rows = db.list_incidents(view=view, status=status, severity=severity, device=device,
+                                 limit=limit)
+        return {**base, "counts": db.incident_counts(),
+                "incidents": [incident_summary(r, db.incident_alert_count(r.id)) for r in rows]}
+
+    @app.get("/api/incidents/{incident_id}")
+    def incident_detail(request: Request, incident_id: int):
+        """One incident with its full timeline, monitoring evidence and write-up (observed
+        evidence, operator-entered fields and, in simulated mode, a labelled fictional example)."""
+        found = require_incident(incident_id)
+        now = clock()
+        report, events = build_incident_report(found, now)
+        return {"server_time": now, **incident_access(request),
+                "incident": incident_summary(found, db.incident_alert_count(found.id)),
+                "report": report, "markdown": inc.render_markdown(report)}
+
+    @app.get("/api/incidents/{incident_id}/report")
+    def incident_report(incident_id: int, format: Literal["json", "markdown"] = "markdown"):
+        """The write-up on its own, as Markdown (for copying into a report) or JSON."""
+        found = require_incident(incident_id)
+        report, _ = build_incident_report(found, clock())
+        if format == "json":
+            return report
+        return PlainTextResponse(inc.render_markdown(report), media_type="text/markdown")
+
+    def changed(incident_id: int, extra: dict | None = None) -> dict:
+        found = db.get_incident(incident_id)
+        return {"incident": incident_summary(found, db.incident_alert_count(found.id)),
+                **(extra or {})}
+
+    @app.post("/api/incidents/{incident_id}/acknowledge", dependencies=[Depends(require_change)])
+    def acknowledge(incident_id: int, body: AckBody):
+        """Record that a person has seen this incident. Does not change monitoring state."""
+        db.acknowledge_incident(incident_id, body.actor, body.note, clock())
+        return changed(incident_id)
+
+    @app.post("/api/incidents/{incident_id}/notes", dependencies=[Depends(require_change)])
+    def add_note(incident_id: int, body: NoteBody):
+        """Add an investigation note (kept for good; notes are never edited or deleted)."""
+        event = db.add_incident_note(incident_id, body.actor, body.text, clock())
+        return changed(incident_id, {"event_id": event.id})
+
+    @app.put("/api/incidents/{incident_id}/report", dependencies=[Depends(require_change)])
+    def update_report(incident_id: int, body: ReportBody):
+        """Edit the operator-entered write-up fields. Every change is appended to the audit
+        trail with its new value, so earlier wording is never lost."""
+        updates = body.model_dump(exclude_unset=True, exclude={"actor"})
+        if not updates:
+            raise inc.IncidentError(inc.IncidentError.INVALID_INPUT, "no write-up fields given")
+        db.update_incident_report(incident_id, body.actor, updates, clock())
+        return changed(incident_id)
+
+    @app.post("/api/incidents/{incident_id}/resolve", dependencies=[Depends(require_change)])
+    def resolve(incident_id: int, body: ResolveBody):
+        """Close an incident. Needs a written resolution summary, and only works once monitoring
+        has confirmed recovery. Monitoring evidence is left exactly as it is."""
+        updates = body.model_dump(exclude_unset=True, exclude={"actor", "resolution_summary"})
+        db.resolve_incident(incident_id, body.actor, body.resolution_summary, updates, clock())
+        return changed(incident_id)
+
+    @app.post("/api/incidents/{incident_id}/reopen", dependencies=[Depends(require_change)])
+    def reopen(incident_id: int, body: ReopenBody):
+        """Reopen a resolved incident, with a reason. Its history stays."""
+        db.reopen_incident(incident_id, body.actor, body.reason, clock())
+        return changed(incident_id)
 
     @app.get("/api/interfaces")
     def list_interfaces(device: str | None = Query(None, max_length=64)):

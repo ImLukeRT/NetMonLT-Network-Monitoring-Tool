@@ -167,6 +167,23 @@ class QosConfig:
 
 
 @dataclass(frozen=True)
+class IncidentsConfig:
+    """Incident management layered on top of the alert log (it never changes monitoring).
+
+    Related alerts for one device become one incident while they fall within the correlation
+    window; operator actions (acknowledge, note, resolve, reopen) are local-only regardless.
+    """
+
+    enabled: bool = True
+    correlation_window_s: float = 900.0  # a fault returning within this long of a recovery is
+    #                                      the same incident; later, it is a new one
+    flapping_recurrences: int = 2  # this many recurrences in one incident: "repeatedly flapping"
+    # True/False sets it. None (not configured) means on in the simulated demo and OFF in real
+    # mode: changing incidents on real monitoring is opt-in. Off means the views are read-only.
+    operator_actions: bool | None = None
+
+
+@dataclass(frozen=True)
 class Device:
     name: str
     address: str

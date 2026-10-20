@@ -36,8 +36,9 @@ def test_labels_tick_every_second_from_a_single_timer():
 
 def test_the_data_refresh_intervals_are_unchanged():
     assert [(n, int(ms)) for n, ms in intervals() if n != "tickAges"] == [
-        ("refreshChart", 5000), ("refreshQuality", 5000), ("refreshWifi", 5000),
-        ("refreshQos", 5000), ("refreshInterfaces", 5000), ("refresh", 3000),
+        ("refreshChart", 5000), ("refreshIncidents", 5000), ("refreshQuality", 5000),
+        ("refreshWifi", 5000), ("refreshQos", 5000), ("refreshInterfaces", 5000),
+        ("refresh", 3000),
     ]
 
 

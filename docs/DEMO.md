@@ -23,6 +23,8 @@ starts, so don't leave it for later (if you miss it, the history is still there;
 | about 40 s | A **critical** alert: *"access-switch is DOWN: no reply to 3 pings (was up for 30s)"*. It waits for 3 consecutive failed checks. | Recent alerts, and the console |
 | 60 s | The switch answers again. | Device table |
 | about 70 s | An **info** alert: *"access-switch recovered ... (was down for 30s)"*, again after 3 consecutive good checks. | Recent alerts |
+| about 40 s | **Incident management:** the critical alert also opens incident **INC-0001** for `access-switch`, status **Open**. | Incidents section |
+| about 70 s | Monitoring confirms recovery: the incident becomes **Auto-recovered — awaiting review**. Nobody has investigated anything yet, so it stays in the Active view. | Incidents section |
 | about 50 s onward | **Network quality** grades appear (10 checks are needed first): `voice-gateway` Fair because of jitter, `wifi-ap` Poor (loss), `branch-vpn` Poor (latency), the rest Excellent. | Network quality table |
 | about 70 s | `access-switch` is Poor (its outage is counted as loss), then Fair after about 10 minutes, and Excellent again (via Good) as the outage leaves the 15-minute window. | Network quality table, loss chart |
 | 60 s | **Wi-Fi (simulated):** the simulated signal drops from about 80% to about 25%. | Wi-Fi signal panel |
@@ -102,7 +104,49 @@ starts, so don't leave it for later (if you miss it, the history is still there;
    DSCP markings observed in traffic (which NetMonLT never inspects); counters existing does not
    prove QoS is enforced.
 
-10. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
+10. **Incidents: from alert to closed (simulated).** Scroll to **Incidents**, badged **SIMULATED
+    INCIDENTS** (about 40 s in). It is built on top of the alerts, which are unchanged and still
+    appear under **Recent alerts** as an event log.
+
+    ![Incident list with a flapping incident](images/incidents-active.png)
+
+    1. **Monitoring recovery is not closure.** At about 70 s the incident's status reads
+       **Auto-recovered — awaiting review**. Monitoring (NetMonLT) says the device is back;
+       the review state (people) is still *open*. Select **View report** to see the two kept
+       apart (`Monitoring: recovered`, `Review: open`).
+    2. **Read the write-up.** *Observed by NetMonLT* is counted from stored checks (in the demo roughly 6 down
+       and 3 up checks, about two thirds of the probes unanswered) and says NetMonLT repaired nothing. The
+       dashed **SIMULATED / ILLUSTRATIVE EXAMPLE** block is fictional: it names the scripted
+       outage as the cause because the simulator defines one (a device with no scripted cause
+       says none is defined), and its troubleshooting steps are labelled as not performed.
+
+       ![An incident write-up](images/incident-report.png)
+
+    3. **Acknowledge** it, then **Add a note** such as *"Checked the uplink: looks fine"*. Both
+       appear in the timeline with a timestamp and the actor label (self-declared, there are no
+       accounts). Try a note containing `<b>bold</b>` or `<script>alert(1)</script>`: it is shown
+       as literal text.
+    4. **Fill in the operator write-up**: set *Root cause status* to **Suspected** and write the
+       cause, then **Save write-up**. The status *Confirmed* is refused without a stated cause.
+       Nothing here is pre-filled: those fields are for a person.
+    5. **Resolve.** Try **Resolve incident** with a short summary: it is refused (10 characters
+       minimum). Write a real one and resolve: the incident leaves **Active** and appears under
+       **History**, with its evidence frozen. It is never deleted.
+    6. **Copy report** (or open `/api/incidents/1/report`) to get the write-up as Markdown, ready
+       to paste into a ticket.
+    7. **Reopen** it from History with a reason: it returns to Active as **Reopened**, with the
+       earlier resolution kept in the timeline.
+    8. **Flapping.** A fault that returns within 15 minutes of recovery is grouped into the same
+       incident and marked **FLAPPING** once it has recurred twice; every alert keeps its own
+       timestamp in the timeline. To see this, stop the app (Ctrl+C) and start it again within
+       15 minutes without resolving the incident: the simulation replays its outage, and the
+       second outage joins the same incident as a recurrence. A fault after the incident is
+       **resolved** opens a *new* incident instead, linked to the earlier one.
+    9. **Security.** Only the machine running NetMonLT can change incidents. Another computer that
+       can reach the page sees everything but gets a read-only view (no buttons, and 403 from
+       the API), even if you bind to `0.0.0.0`.
+
+11. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
    pings only your own computer (loopback). The badge changes to **LIVE · ICMP** and the data goes
    to a separate database. Latencies are tiny (well under 1 ms) because it is local.
 
@@ -133,5 +177,18 @@ PowerShell, `rm -r data` elsewhere).
   Loss is probes unanswered over probes sent. Missing data is a gap, never a zero.
 - **Performance is not QoS.** The grades describe how ICMP behaves. They do not prove that any
   prioritisation, shaping or queueing is in place.
+- **Recovery is not resolution.** Monitoring state (set only by NetMonLT) and review state (set
+  only by people) are separate fields. A device coming back shows "Auto-recovered — awaiting
+  review", never "fixed", and a person cannot change what monitoring observed. Closing needs a
+  written summary and is refused while the fault is still active.
+- **Write-ups separate observed, operator-entered and example content.** Real incidents get
+  observed evidence plus blank operator fields and no invented cause or steps. Only simulated
+  incidents get a labelled fictional example, and it states a cause only if the simulator defines
+  one.
+- **Incident changes are local-only and non-destructive.** No endpoint deletes anything, the
+  event trail is append-only, and state changes need a loopback client and a per-process token.
+  In real mode, changes are off until your private inventory sets `incidents.operator_actions:
+  true`. Known limits: no accounts, so the actor label is self-declared; only ICMP alerts create
+  incidents; and the incident workflow has been tested against the simulator, not a real outage.
 - **Real monitoring is opt-in and bounded.** It needs a separate file, `authorized: true` per
   device and single-host targets only. There is no scanning or discovery.

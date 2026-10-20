@@ -4,14 +4,16 @@ One shared connection guarded by a lock: the collector (event loop) and the API
 (thread pool) both use it. WAL mode is enabled so readers don't block the writer.
 """
 
+import json
 import sqlite3
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from netmonlt import incidents as inc
 from netmonlt.alerts import Alert, AlertState
-from netmonlt.domain import CheckResult, Device, Status
+from netmonlt.domain import CheckResult, Device, IncidentsConfig, Status
 from netmonlt.ifstats import STATUS_OK, InterfaceState, SnmpStatus
 from netmonlt.qos import QosSample, QosSnapshot, QosState, QosStatus
 from netmonlt.quality import CheckSample
@@ -113,6 +115,66 @@ CREATE TABLE IF NOT EXISTS wifi_observations (
     source      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wifi_ts ON wifi_observations(ts);
+-- Incident management: a human workflow layered on the alert log. Incidents are plain text on
+-- `device` (no foreign key), so removing a device from the inventory never deletes its incident
+-- records. The event trail is append-only: triggers refuse any update or delete, so nothing an
+-- incident's evidence or an operator's notes recorded can be altered or removed.
+CREATE TABLE IF NOT EXISTS incidents (
+    id                   INTEGER PRIMARY KEY,
+    device               TEXT NOT NULL,
+    kind                 TEXT NOT NULL,
+    severity             TEXT NOT NULL,
+    opened_ts            REAL NOT NULL,
+    last_alert_ts        REAL NOT NULL,
+    monitoring_state     TEXT NOT NULL,
+    recovered_ts         REAL,
+    flap_count           INTEGER NOT NULL DEFAULT 0,
+    review_state         TEXT NOT NULL,
+    acknowledged_ts      REAL,
+    acknowledged_by      TEXT,
+    resolved_ts          REAL,
+    resolved_by          TEXT,
+    reopened_count       INTEGER NOT NULL DEFAULT 0,
+    previous_incident_id INTEGER,
+    simulated            INTEGER NOT NULL DEFAULT 0,
+    run_started_ts       REAL,
+    report               TEXT NOT NULL DEFAULT '{}',
+    evidence             TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_device ON incidents(device, opened_ts);
+CREATE INDEX IF NOT EXISTS idx_incidents_review ON incidents(review_state, last_alert_ts);
+CREATE TABLE IF NOT EXISTS incident_events (
+    id          INTEGER PRIMARY KEY,
+    incident_id INTEGER NOT NULL REFERENCES incidents(id),
+    ts          REAL NOT NULL,
+    source      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    actor       TEXT,
+    severity    TEXT,
+    from_status TEXT,
+    to_status   TEXT,
+    alert_id    INTEGER,
+    text        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_incident_events ON incident_events(incident_id, ts, id);
+-- One monitoring event per alert and kind, so reprocessing an alert can never duplicate it.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_events_alert
+    ON incident_events(alert_id, kind) WHERE alert_id IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS incident_events_no_update BEFORE UPDATE ON incident_events
+BEGIN SELECT RAISE(ABORT, 'incident events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS incident_events_no_delete BEFORE DELETE ON incident_events
+BEGIN SELECT RAISE(ABORT, 'incident events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS incidents_no_delete BEFORE DELETE ON incidents
+BEGIN SELECT RAISE(ABORT, 'incidents are never deleted'); END;
+-- How far through the alert log incidents have been built. On a database that already holds
+-- alerts it starts at the newest one: earlier alerts stay in the event log, unchanged, and are
+-- not retroactively turned into "awaiting review" incidents.
+CREATE TABLE IF NOT EXISTS incident_cursor (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    last_alert_id INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO incident_cursor(id, last_alert_id)
+    SELECT 1, COALESCE(MAX(id), 0) FROM alerts;
 -- QoS telemetry (opt-in, read-only SNMPv3). Raw counters are kept only for the LATEST poll of each
 -- element (needed to derive the next rate); history holds derived rates, one row per element
 -- per poll, for a bounded time. Counters are TEXT because a Counter64 can exceed signed 64-bit.
@@ -194,6 +256,47 @@ def _wifi_reading_from_row(row: sqlite3.Row) -> WifiReading:
         signal_pct=row["signal_pct"], rssi_dbm=row["rssi_dbm"], rssi_source=row["rssi_source"],
         rx_mbps=row["rx_mbps"], tx_mbps=row["tx_mbps"], radio_type=row["radio_type"],
         channel=row["channel"], source=row["source"],
+    )
+
+
+_INCIDENT_COLUMNS = (
+    "id, device, kind, severity, opened_ts, last_alert_ts, monitoring_state, recovered_ts, "
+    "flap_count, review_state, acknowledged_ts, acknowledged_by, resolved_ts, resolved_by, "
+    "reopened_count, previous_incident_id, simulated, run_started_ts, report, evidence"
+)
+_EVENT_COLUMNS = (
+    "id, incident_id, ts, source, kind, actor, severity, from_status, to_status, alert_id, text"
+)
+
+
+def _json_dict(text: str | None) -> dict:
+    try:
+        value = json.loads(text or "{}")
+    except ValueError:
+        return {}  # a damaged value is treated as empty, never guessed
+    return value if isinstance(value, dict) else {}
+
+
+def _incident_from_row(row: sqlite3.Row) -> inc.Incident:
+    return inc.Incident(
+        id=row["id"], device=row["device"], kind=row["kind"], severity=row["severity"],
+        opened_ts=row["opened_ts"], last_alert_ts=row["last_alert_ts"],
+        monitoring_state=row["monitoring_state"], recovered_ts=row["recovered_ts"],
+        flap_count=row["flap_count"], review_state=row["review_state"],
+        acknowledged_ts=row["acknowledged_ts"], acknowledged_by=row["acknowledged_by"],
+        resolved_ts=row["resolved_ts"], resolved_by=row["resolved_by"],
+        reopened_count=row["reopened_count"], previous_incident_id=row["previous_incident_id"],
+        simulated=bool(row["simulated"]), run_started_ts=row["run_started_ts"],
+        report=_json_dict(row["report"]), evidence=_json_dict(row["evidence"]),
+    )
+
+
+def _event_from_row(row: sqlite3.Row) -> inc.IncidentEvent:
+    return inc.IncidentEvent(
+        id=row["id"], incident_id=row["incident_id"], ts=row["ts"], source=row["source"],
+        kind=row["kind"], actor=row["actor"], severity=row["severity"],
+        from_status=row["from_status"], to_status=row["to_status"], alert_id=row["alert_id"],
+        text=row["text"],
     )
 
 
@@ -422,6 +525,308 @@ class Database:
             ).fetchall()
         samples = [CheckSample(r["ts"], r["sent"], r["received"], r["rtt_avg_ms"]) for r in rows]
         return samples, first_ts, last_ts
+
+    # ---- incident management (built from the alert log; never changes monitoring)
+    def process_new_alerts(
+        self, cfg: IncidentsConfig, *, simulated: bool, run_started_ts: float | None,
+        now: float, batch: int = 500,
+    ) -> int:
+        """Turn alerts not yet seen into incident events, in order, in one transaction with the
+        cursor, so a restart or a repeated call can never duplicate an incident or an event.
+        Returns the number of alerts processed. The alert log itself is only ever read."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "SELECT last_alert_id FROM incident_cursor WHERE id=1"
+            ).fetchone()[0]
+            alerts = self._conn.execute(
+                "SELECT id, device, ts, severity, from_status, to_status, message FROM alerts "
+                "WHERE id > ? ORDER BY id LIMIT ?", (cursor, batch),
+            ).fetchall()
+            for alert in alerts:
+                self._apply_alert(alert, cfg, simulated, run_started_ts)
+            if alerts:
+                self._conn.execute(
+                    "UPDATE incident_cursor SET last_alert_id=? WHERE id=1", (alerts[-1]["id"],)
+                )
+        return len(alerts)
+
+    def _apply_alert(self, alert, cfg, simulated, run_started_ts) -> None:
+        """Attach one alert to an incident (lock and transaction held by the caller)."""
+        device, ts, to_status = alert["device"], alert["ts"], alert["to_status"]
+        is_recovery = to_status == Status.UP.value
+        candidates = [
+            _incident_from_row(r) for r in self._conn.execute(
+                f"SELECT {_INCIDENT_COLUMNS} FROM incidents WHERE device=? AND kind=? "
+                "AND review_state != ? ORDER BY opened_ts DESC, id DESC",
+                (device, inc.KIND_ICMP, inc.REV_RESOLVED),
+            )
+        ]
+        match = inc.match_incident(candidates, ts, is_recovery, cfg.correlation_window_s)
+        severity = alert["severity"]
+
+        def event(incident_id, kind):
+            self._insert_incident_event(
+                incident_id, ts, inc.SRC_MONITORING, kind, severity=severity,
+                from_status=alert["from_status"], to_status=to_status, alert_id=alert["id"],
+                text=alert["message"],
+            )
+
+        if is_recovery:
+            if match is None or match.monitoring_state != inc.MON_ACTIVE:
+                return  # a recovery with no active incident (e.g. a fault from before upgrading)
+            self._conn.execute(
+                "UPDATE incidents SET monitoring_state=?, recovered_ts=?, last_alert_ts=? "
+                "WHERE id=?", (inc.MON_RECOVERED, ts, ts, match.id),
+            )
+            event(match.id, inc.EV_RECOVERED)
+            self._store_evidence(match.id, device, match.opened_ts, ts, ts)
+        elif match is None:
+            previous = self._conn.execute(
+                "SELECT id FROM incidents WHERE device=? AND kind=? ORDER BY opened_ts DESC, "
+                "id DESC LIMIT 1", (device, inc.KIND_ICMP),
+            ).fetchone()
+            new_id = self._conn.execute(
+                "INSERT INTO incidents(device, kind, severity, opened_ts, last_alert_ts, "
+                "monitoring_state, review_state, previous_incident_id, simulated, run_started_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (device, inc.KIND_ICMP, severity, ts, ts, inc.MON_ACTIVE, inc.REV_OPEN,
+                 None if previous is None else previous["id"], int(simulated), run_started_ts),
+            ).lastrowid
+            event(new_id, inc.EV_OPENED)
+            self._store_evidence(new_id, device, ts, None, ts)
+        elif match.monitoring_state == inc.MON_ACTIVE:
+            self._conn.execute(
+                "UPDATE incidents SET severity=?, last_alert_ts=? WHERE id=?",
+                (inc.worse(match.severity, severity), ts, match.id),
+            )
+            event(match.id, inc.EV_ALERT)
+        else:  # the fault is back within the correlation window: one incident, a recurrence
+            self._conn.execute(
+                "UPDATE incidents SET monitoring_state=?, flap_count=flap_count+1, severity=?, "
+                "last_alert_ts=? WHERE id=?",
+                (inc.MON_ACTIVE, inc.worse(match.severity, severity), ts, match.id),
+            )
+            event(match.id, inc.EV_RECURRED)
+            self._store_evidence(match.id, device, match.opened_ts, None, ts)
+
+    def _insert_incident_event(
+        self, incident_id: int, ts: float, source: str, kind: str, *, actor: str | None = None,
+        severity: str | None = None, from_status: str | None = None, to_status: str | None = None,
+        alert_id: int | None = None, text: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO incident_events(incident_id, ts, source, kind, actor, severity, "
+            "from_status, to_status, alert_id, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (incident_id, ts, source, kind, actor, severity, from_status, to_status, alert_id,
+             text),
+        )
+
+    def _compute_evidence(
+        self, device: str, opened_ts: float, recovered_ts: float | None, end_ts: float
+    ) -> dict:
+        """The incident's monitoring evidence, counted from the stored checks (lock held)."""
+        before = self._conn.execute(
+            "SELECT ts, status FROM checks WHERE device=? AND ts<=? ORDER BY ts DESC, id DESC "
+            "LIMIT 200", (device, opened_ts),
+        ).fetchall()
+        run_start = opened_ts
+        for row in before:  # walk back over the unbroken run of unhealthy checks
+            if row["status"] == Status.UP.value:
+                break
+            run_start = row["ts"]
+        rows = self._conn.execute(
+            "SELECT ts, status, sent, received, rtt_avg_ms FROM checks WHERE device=? AND ts>=? "
+            "AND ts<=? ORDER BY ts, id LIMIT ?",
+            (device, run_start, end_ts, inc.MAX_EVIDENCE_ROWS + 1),
+        ).fetchall()
+        truncated = len(rows) > inc.MAX_EVIDENCE_ROWS
+        return inc.summarize_checks(
+            [dict(r) for r in rows[:inc.MAX_EVIDENCE_ROWS]], opened_ts, recovered_ts, end_ts,
+            truncated=truncated,
+        )
+
+    def _store_evidence(self, incident_id, device, opened_ts, recovered_ts, end_ts) -> None:
+        evidence = self._compute_evidence(device, opened_ts, recovered_ts, end_ts)
+        self._conn.execute(
+            "UPDATE incidents SET evidence=? WHERE id=?", (json.dumps(evidence), incident_id)
+        )
+
+    def incident_evidence(self, incident: inc.Incident, now: float) -> dict:
+        """The evidence to show: counted live from the stored checks while the incident is
+        unresolved, and the stored snapshot once it is resolved (so it stays as it was)."""
+        if incident.review_state == inc.REV_RESOLVED and incident.evidence:
+            return incident.evidence
+        end = (incident.recovered_ts if incident.monitoring_state == inc.MON_RECOVERED
+               and incident.recovered_ts is not None else now)
+        recovered = (incident.recovered_ts if incident.monitoring_state == inc.MON_RECOVERED
+                     else None)
+        with self._lock:
+            live = self._compute_evidence(incident.device, incident.opened_ts, recovered, end)
+        # checks may have been removed with their device: fall back to what was stored then
+        return live if live["checks_total"] or not incident.evidence else incident.evidence
+
+    def get_incident(self, incident_id: int) -> inc.Incident | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_INCIDENT_COLUMNS} FROM incidents WHERE id=?", (incident_id,)
+            ).fetchone()
+        return None if row is None else _incident_from_row(row)
+
+    def incident_events(self, incident_id: int) -> list[inc.IncidentEvent]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_EVENT_COLUMNS} FROM incident_events WHERE incident_id=? "
+                "ORDER BY ts, id", (incident_id,),
+            ).fetchall()
+        return [_event_from_row(r) for r in rows]
+
+    def list_incidents(
+        self, *, view: str = "active", status: str | None = None, severity: str | None = None,
+        device: str | None = None, limit: int = 100,
+    ) -> list[inc.Incident]:
+        """Incidents, newest activity first. `view` is "active" (not resolved), "history"
+        (resolved) or "all"; `status` is one of inc.STATUS_FILTERS."""
+        where, args = [], []
+        if view == "active":
+            where.append("review_state != ?")
+            args.append(inc.REV_RESOLVED)
+        elif view == "history":
+            where.append("review_state = ?")
+            args.append(inc.REV_RESOLVED)
+        status_sql = {
+            "open": "review_state = 'open' AND reopened_count = 0",
+            "acknowledged": "review_state = 'acknowledged'",
+            "recovered": "monitoring_state = 'recovered' AND review_state != 'resolved'",
+            "reopened": "reopened_count > 0 AND review_state != 'resolved'",
+            "resolved": "review_state = 'resolved'",
+        }
+        if status is not None:
+            where.append(status_sql[status])
+        if severity is not None:
+            where.append("severity = ?")
+            args.append(severity)
+        if device is not None:
+            where.append("device = ?")
+            args.append(device)
+        order = "resolved_ts DESC, id DESC" if view == "history" else "last_alert_ts DESC, id DESC"
+        sql = f"SELECT {_INCIDENT_COLUMNS} FROM incidents"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        with self._lock:
+            rows = self._conn.execute(f"{sql} ORDER BY {order} LIMIT ?", (*args, limit)).fetchall()
+        return [_incident_from_row(r) for r in rows]
+
+    def incident_alert_count(self, incident_id: int) -> int:
+        """How many monitoring alerts (not operator actions) an incident groups."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM incident_events WHERE incident_id=? AND source=?",
+                (incident_id, inc.SRC_MONITORING),
+            ).fetchone()[0]
+
+    def incident_counts(self) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT SUM(review_state != 'resolved'), SUM(review_state = 'resolved'), "
+                "SUM(review_state = 'open' AND monitoring_state = 'recovered') FROM incidents"
+            ).fetchone()
+        return {"active": row[0] or 0, "history": row[1] or 0, "awaiting_review": row[2] or 0}
+
+    # ---- operator actions: each validates the transition, then records it in one transaction
+    def _load_for_update(self, incident_id: int) -> inc.Incident:
+        row = self._conn.execute(
+            f"SELECT {_INCIDENT_COLUMNS} FROM incidents WHERE id=?", (incident_id,)
+        ).fetchone()
+        if row is None:
+            raise inc.IncidentError(inc.IncidentError.NOT_FOUND, "no such incident")
+        return _incident_from_row(row)
+
+    def _apply_report_changes(self, incident: inc.Incident, changes: dict, actor, now) -> None:
+        if not changes:
+            return
+        merged = {**incident.report, **changes}
+        self._conn.execute(
+            "UPDATE incidents SET report=? WHERE id=?", (json.dumps(merged), incident.id)
+        )
+        self._insert_incident_event(
+            incident.id, now, inc.SRC_OPERATOR, inc.EV_REPORT, actor=actor,
+            text=json.dumps(changes, ensure_ascii=False),
+        )
+
+    def acknowledge_incident(self, incident_id: int, actor, note, now: float) -> inc.Incident:
+        actor = inc.clean_actor(actor)
+        note = inc.clean_text(note, "note", max_len=inc.MAX_NOTE_LEN)
+        with self._lock, self._conn:
+            incident = self._load_for_update(incident_id)
+            inc.check_acknowledge(incident)
+            self._conn.execute(
+                "UPDATE incidents SET review_state=?, acknowledged_ts=?, acknowledged_by=? "
+                "WHERE id=?", (inc.REV_ACKNOWLEDGED, now, actor, incident_id),
+            )
+            self._insert_incident_event(incident_id, now, inc.SRC_OPERATOR, inc.EV_ACK,
+                                        actor=actor, text=note or None)
+            return self._load_for_update(incident_id)
+
+    def add_incident_note(self, incident_id: int, actor, text, now: float) -> inc.IncidentEvent:
+        actor = inc.clean_actor(actor)
+        text = inc.clean_text(text, "text", max_len=inc.MAX_NOTE_LEN, min_len=1)
+        with self._lock, self._conn:
+            self._load_for_update(incident_id)
+            self._insert_incident_event(incident_id, now, inc.SRC_OPERATOR, inc.EV_NOTE,
+                                        actor=actor, text=text)
+            row = self._conn.execute(
+                f"SELECT {_EVENT_COLUMNS} FROM incident_events WHERE id=last_insert_rowid()"
+            ).fetchone()
+        return _event_from_row(row)
+
+    def update_incident_report(self, incident_id: int, actor, updates, now: float) -> inc.Incident:
+        actor = inc.clean_actor(actor)
+        with self._lock, self._conn:
+            incident = self._load_for_update(incident_id)
+            changes = inc.normalize_report_update(updates, incident.report)
+            self._apply_report_changes(incident, changes, actor, now)
+            return self._load_for_update(incident_id)
+
+    def resolve_incident(
+        self, incident_id: int, actor, summary, updates, now: float
+    ) -> inc.Incident:
+        """Close an incident. Needs a written resolution summary, and monitoring must already
+        have confirmed recovery. The monitoring state and evidence are left exactly as they are."""
+        actor = inc.clean_actor(actor)
+        summary = inc.clean_text(summary, "resolution_summary",
+                                 max_len=inc.REPORT_TEXT_FIELDS["resolution_summary"],
+                                 min_len=inc.MIN_SUMMARY_LEN)
+        with self._lock, self._conn:
+            incident = self._load_for_update(incident_id)
+            inc.check_resolve(incident)
+            changes = inc.normalize_report_update(
+                {**dict(updates or {}), "resolution_summary": summary}, incident.report
+            )
+            self._apply_report_changes(incident, changes, actor, now)
+            self._conn.execute(
+                "UPDATE incidents SET review_state=?, resolved_ts=?, resolved_by=? WHERE id=?",
+                (inc.REV_RESOLVED, now, actor, incident_id),
+            )
+            self._insert_incident_event(incident_id, now, inc.SRC_OPERATOR, inc.EV_RESOLVED,
+                                        actor=actor, text=summary)
+            self._store_evidence(incident_id, incident.device, incident.opened_ts,
+                                 incident.recovered_ts, incident.recovered_ts or now)
+            return self._load_for_update(incident_id)
+
+    def reopen_incident(self, incident_id: int, actor, reason, now: float) -> inc.Incident:
+        actor = inc.clean_actor(actor)
+        reason = inc.clean_text(reason, "reason", max_len=inc.MAX_REASON_LEN, min_len=5)
+        with self._lock, self._conn:
+            incident = self._load_for_update(incident_id)
+            inc.check_reopen(incident)
+            self._conn.execute(
+                "UPDATE incidents SET review_state=?, resolved_ts=NULL, resolved_by=NULL, "
+                "acknowledged_ts=NULL, acknowledged_by=NULL, reopened_count=reopened_count+1 "
+                "WHERE id=?", (inc.REV_OPEN, incident_id),
+            )
+            self._insert_incident_event(incident_id, now, inc.SRC_OPERATOR, inc.EV_REOPENED,
+                                        actor=actor, text=reason)
+            return self._load_for_update(incident_id)
 
     # ---- QoS telemetry
     def get_qos_status(self, device: str) -> QosStatus | None:

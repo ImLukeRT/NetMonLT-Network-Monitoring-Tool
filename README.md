@@ -48,6 +48,13 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   availability. A deterministic, clearly labelled simulation shows congestion with
   queue-specific drops. It is not the ICMP quality grade, not interface discards and not
   observed DSCP, and counters existing does not prove QoS works.
+- **Incident management.** A workflow layered on top of the alerts: acknowledge, add
+  investigation notes, resolve with a written summary, reopen, and keep every closed incident in
+  a History view. Monitoring recovery (set only by NetMonLT) and human review (set only by
+  people) are tracked separately, so a device that comes back shows as "Auto-recovered —
+  awaiting review", never as fixed. Flapping faults are grouped, every incident has a structured
+  write-up, and simulated incidents get a clearly labelled example write-up. Changes are accepted
+  only from the machine running NetMonLT.
 - **Alerts without alert storms.** A device's state changes only after 3 consecutive checks
   agree. Alerts are stored in SQLite, survive restarts, and never repeat while the state is
   unchanged.
@@ -56,7 +63,7 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   server.
 - **Dashboard with no framework.** Plain HTML, JavaScript and hand-built SVG, no CDN, so it works
   offline. Shows stale data and API failures clearly.
-- **Tested.** 1185 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
+- **Tested.** 1386 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
   network and never need an SNMP device.
 
 ## Quick start (simulated demo)
@@ -237,8 +244,130 @@ alerts** and logged to the console.
   and nothing is alerted twice. A device with no stored state gets a silent baseline. If the last
   check is older than the stale limit, the old state is discarded and re-baselined silently.
   Probe errors never produce alerts.
-- Not included: notifications (email, SMS, webhooks), acknowledgement, per-device rules,
-  configurable thresholds and alert pruning.
+- Not included: notifications (email, SMS, webhooks), per-device rules, configurable
+  thresholds and alert pruning. The **Recent alerts** table is an event log and is never edited:
+  acknowledging and closing happen on incidents (next section), which are built from these alerts.
+
+## Incident management
+
+Alerts say *what monitoring saw*. Incidents are a separate, lightweight workflow on top of them
+for *what a person did about it*. Nothing about alert generation changed: the 3-check
+confirmation, the UP/DOWN/DEGRADED detection and the **"device recovered"** alert work exactly as
+before. A background task only **reads** the alert log and groups the alerts into incidents; it
+cannot change a check, an alert or a device's state, and if it fails monitoring carries on.
+
+### Two states that are kept apart
+
+| State | Values | Set by |
+|---|---|---|
+| **Monitoring** | `active`, `recovered` | NetMonLT only, from its own alerts |
+| **Review** | `open`, `acknowledged`, `resolved` | A person only, through the dashboard or API |
+
+Shown together as one lifecycle label:
+
+| Label | Meaning |
+|---|---|
+| **Open** | Monitoring reports the fault and nobody has looked yet. |
+| **Acknowledged** | A person has seen it. This does not change what monitoring reports. |
+| **Auto-recovered — awaiting review** | Monitoring confirmed the device is back (3 good checks). **No person has investigated or fixed anything**; the incident stays in the Active view until someone reviews it. |
+| **Monitoring recovered — acknowledged** | Recovered, and a person has acknowledged it. |
+| **Resolved** | A person closed it with a written resolution summary. It leaves the Active view and stays in History. |
+| **Reopened** | A person reopened a resolved incident (with a reason). |
+
+A user action can never falsify telemetry: acknowledging, noting, resolving and reopening change
+only the review state. **Resolve** is refused while monitoring still reports the fault (you can
+acknowledge it meanwhile), so a live outage cannot be hidden by closing it.
+
+### Correlation and flapping
+
+Alerts for the same device (and alert type) belong to one incident while the fault is active. If
+the device recovers and the fault returns within the **correlation window** (default 15 minutes,
+boundary inclusive), that is a *recurrence* of the same incident, not a new one: the incident
+counts the recurrences and is marked **flapping** once there are `flapping_recurrences` (default
+2). Every original alert, with its own timestamp, stays in the timeline. A fault that returns after
+the window, or after the incident was resolved, opens a **new** incident that links to the
+previous one. Incidents of different devices are never merged.
+
+### The write-up
+
+Each incident has a structured write-up (incident ID, device, severity, detection time, summary,
+investigation timeline, monitoring evidence, automated monitoring actions, recovery verification,
+impact, root cause with a status of `unconfirmed`, `suspected` or `confirmed`, actions taken,
+resolution and timestamp, lessons learned), viewable on the dashboard and as copyable Markdown
+(`/api/incidents/{id}/report`). Every part is labelled by where it came from:
+
+- **Observed by NetMonLT** — counted from the stored checks and alerts (failed and successful
+  checks, probes sent and answered, detection and recovery times, the checks that confirmed
+  recovery). Never estimated. NetMonLT states that it performed **no repair**: it only observes.
+- **Operator-entered** — blank until a person writes it. It is never pre-filled, and a root cause
+  cannot be marked *confirmed* without stating one. Edits are appended to the audit trail, so
+  earlier wording is never lost.
+- **Simulated example** (simulated mode only) — a deterministic, fictional illustration generated
+  from the simulator's known events: a cause **only if the simulator defines one** (a scripted
+  outage covering the detection time, or a configured loss or latency profile), otherwise it says
+  none is defined; illustrative troubleshooting steps, a resolution summary, recommendations and
+  lessons, every line labelled as an example that was not performed by anyone.
+
+Real incidents get only the first two. Nothing is invented for them.
+
+### Using it
+
+1. Open the dashboard on the machine running NetMonLT (`http://127.0.0.1:8000`). In real mode,
+   first add `incidents: {operator_actions: true}` to your private inventory (see below); until
+   then incidents are read-only. The
+   **Incidents** section has **Active** and **History** tabs and status and severity filters.
+2. Select an incident to see its timeline, evidence and write-up.
+3. **Acknowledge**, optionally with a note. Add **investigation notes** as you go.
+4. Fill in root cause, actions taken, impact and lessons as you learn them (**Save write-up**).
+5. Once monitoring shows recovery, **Resolve** with a resolution summary (at least 10
+   characters). The incident moves to History with its evidence frozen.
+6. **Reopen** from History with a reason if it was closed too early. **Copy write-up** copies the
+   Markdown report.
+
+![Incident list with a flapping incident](docs/images/incidents-active.png)
+
+![An incident write-up with observed evidence](docs/images/incident-report.png)
+
+*Simulated data. The first screenshot is the Active view (a flapping incident, an open warning and
+a recurrence linked to its earlier, resolved incident); the second is the top of one write-up.*
+
+### Storage, restarts and your existing data
+
+Incidents live in three new SQLite tables created automatically on start-up
+(`CREATE TABLE IF NOT EXISTS`); your existing tables and alert history are never altered or
+deleted. A cursor, committed in the same transaction as the incident changes, records how far
+through the alert log incidents have been built, so a restart carries on where it stopped and
+repeated polls never create duplicate incidents or events. **Alerts that already existed when you
+upgraded are not turned into incidents** (the cursor starts at the newest alert); they stay in
+the event log. The event trail is append-only (database triggers refuse any update or delete),
+there is no delete endpoint, and incidents are keyed by device name, so removing a device from the
+inventory does not remove its incident records.
+
+### Security model
+
+- **Reading** incidents is like reading alerts. **Changing** them is accepted only from the
+  machine running NetMonLT: the client must be a loopback address, the request's `Host` must be
+  `localhost` or a loopback address (blocks DNS rebinding), any `Origin` must be local,
+  the body must be `application/json` (so a cross-site HTML form cannot send it), and it must
+  carry a random **per-process token** in `X-NetMonLT-Token`. The token is put in the page only
+  when the page is requested by a local client, and is never logged. These checks run before any
+  body validation, so an outsider learns nothing.
+- If you bind to another interface, remote browsers can **view** incidents (as they can view
+  everything else) but get 403 on every change. There are still no accounts or HTTPS.
+- The **actor** on an action is a self-declared label (letters, digits and a few punctuation
+  characters), not proof of identity. There is one trust domain: whoever can use the local
+  machine's browser can act. Do not treat the audit trail as non-repudiation.
+- Notes and write-ups are untrusted text: bounded in length, control and bidirectional
+  characters removed, stored with parameterised SQL, returned as JSON or `text/markdown`, and drawn
+  in the dashboard with `textContent` only (the script contains no `innerHTML`).
+- **Changing incidents is opt-in for real monitoring.** In the simulated demo the actions work
+  out of the box. In real mode, incidents are visible but **read-only** until your private
+  inventory says `incidents: {operator_actions: true}`; the dashboard explains this where the
+  buttons would be. (Nothing is configured by default, so an existing real inventory keeps
+  working and simply shows read-only incidents.) Set `operator_actions: false` to make incidents
+  read-only in the demo too.
+- Optional `incidents:` block in the inventory (all keys optional; see the configuration
+  reference): `enabled`, `correlation_window_s`, `flapping_recurrences`, `operator_actions`.
 
 ## Latency history chart
 
@@ -735,7 +864,7 @@ same settings as comments, disabled by default.
 
 ## API
 
-All endpoints are read-only JSON; interactive documentation is at `/docs`.
+Every endpoint is read-only JSON except the incident operator actions listed last; interactive documentation is at `/docs`.
 
 | Endpoint | Returns |
 |---|---|
@@ -750,6 +879,10 @@ All endpoints are read-only JSON; interactive documentation is at `/docs`.
 | `GET /api/qos/history?device=NAME&window_s=N&max_points=M` | Derived rates over time, one series per element, in time buckets (empty buckets omitted; a bucket with no valid rate has null rates, never zero) plus `gaps` where nothing was polled. |
 | `GET /api/interfaces?device=NAME` | Latest SNMP interface statistics per SNMP device (optionally one): SNMP `status` (`ok`, `pending`, `timeout`, `auth_failure`, `unsupported`, `error`), safe `message`, `stale`, and per interface `oper_status`, `present`, `in_bps`, `out_bps`, error and discard increases since the last poll, and a `rate_note` saying why a rate is `null`. Raw counters are never returned; `simulated` says whether the data is simulated. |
 | `GET /api/alerts?limit=N` | Newest alerts first (1 to 500, default 50) with `severity`, `from_status`, `to_status`, `message`, `age_s`. |
+| `GET /api/incidents?view=active\|history\|all&status=S&severity=V&device=D&limit=N` | Incidents built from the alerts, newest activity first. `view` defaults to `active` (not resolved); `status` is `open`, `acknowledged`, `recovered`, `reopened` or `resolved`; `severity` is `critical`, `warning` or `info`. Each has a `lifecycle` (`monitoring`, `review`, `label`, `awaiting_review`), `flapping`, times, and `simulated`; also `counts`, `can_modify` and the correlation settings. |
+| `GET /api/incidents/{id}` | One incident with its full `report` (observed evidence and timeline, operator fields, and for simulated incidents a labelled `simulated_example`) and the same write-up as `markdown`. |
+| `GET /api/incidents/{id}/report?format=markdown\|json` | The write-up alone, as `text/markdown` (default) or JSON. |
+| `POST /api/incidents/{id}/acknowledge`, `/notes`, `/resolve`, `/reopen`, `PUT /api/incidents/{id}/report` | Operator actions (JSON bodies; unknown fields rejected). Local machine only, with the page's token (see Incident management); 403 otherwise, 409 for a transition that is not allowed, 422 for invalid input. No endpoint deletes anything. |
 | `GET /healthz` | `{"ok": true}` |
 
 ## Configuration reference
@@ -764,6 +897,11 @@ quality:                   # optional; grading thresholds and minimum data (see 
 wifi:                      # optional; OFF unless enabled (see Wi-Fi signal monitoring)
   enabled: false           # also poll_interval_s, backend, ssid_privacy, low_signal_pct,
                            # warn_after_polls, retention_days and (simulated) sim: {...}
+incidents:                 # optional; ON by default, this block only tunes it (see Incident management)
+  enabled: true            # false hides incident management
+  correlation_window_s: 900   # recurrence window, 60 to 86400
+  flapping_recurrences: 2     # recurrences that mark an incident "flapping" (1 to 100)
+  operator_actions: true      # default: true when simulated, false (opt-in) in real mode
 qos_poll_interval_s: 30    # QoS telemetry polling; default 30; minimum 1 simulated, 10 real
 qos_retention_hours: 24    # QoS history kept; 1 to 168
 devices:
@@ -798,7 +936,7 @@ devices:
 ```
 
 Unknown or duplicate keys and invalid values are rejected at startup with a message naming the
-device. Removing a device from the file also removes its history and alerts. The shipped
+device. Removing a device from the file also removes its history and alerts (its incident records are kept). The shipped
 examples are `config/devices.sim.yaml` and `config/devices.real.example.yaml`; credentials never
 belong in either (`config/snmp.env.example` shows the variable names).
 
@@ -809,7 +947,7 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-1185 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
+1386 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
 persistence, schema upgrade), the ICMP prober and its safety rules (with a fake command runner
 and recorded or constructed `ping` output), inventory validation, the collector's error handling,
 storage, the history and downsampling queries, the API and the CLI, and for SNMP: the counter
@@ -832,7 +970,13 @@ every OID pinned to the verified MIB, the DIFFSERV-MIB parsing (pointers, ambigu
 values, nothing fabricated for unsupported devices), the simulated policy (allocation, congestion,
 rollover, restart, determinism), the `qos` configuration rules, storage and retention, the poller
 (failures, unsupported, hung client, isolation from ICMP, SNMP and Wi-Fi), the real client with its
-pysnmp calls faked, both endpoints and the dashboard section's rules. None touch a network, run a real
+pysnmp calls faked, both endpoints and the dashboard section's rules. For incidents: the lifecycle
+labels, correlation (window boundary inclusive and exclusive, recurrence, recurrence after closure,
+no merging across devices or alert types), restart persistence without duplicates, the upgrade from
+a database without incident tables, the append-only triggers, every valid and invalid transition,
+validation and SQL-metacharacter input, the write-protection model (remote client, missing or wrong
+token, foreign Origin or Host, non-JSON bodies, guard-before-validation), hostile notes, real versus
+simulated write-ups, and that monitoring data is untouched. None touch a network, run a real
 `ping` or need an SNMP device.
 
 **What has and hasn't been verified**
@@ -851,6 +995,7 @@ pysnmp calls faked, both endpoints and the dashboard section's rules. None touch
 | Wi-Fi (Windows backends) | **Not run on real Windows or Wi-Fi hardware by the author.** The `netsh` parser is tested against sample output built from the documented English format. The WLAN API structure sizes and offsets are checked against values worked out from the Windows headers, not against the DLL, and the decoding against synthetic buffers. The helper-process plumbing (JSON, timeouts, killing a hung child, validation) is exercised for real on Linux, where it correctly reports "unsupported". A test also runs the helper on whatever machine runs the tests, so a Windows CI runner will call the real `wlanapi.dll` (it has no Wi-Fi adapter, so it should report no adapter or service unavailable), but that has not been run yet. |
 | Wi-Fi (simulated, dashboard) | Checked in headless Chromium: the scripted dip, warning and disconnection, and each unavailable state (Ethernet-only, unsupported OS, timeout, stale, API error) using the real API's responses. |
 | Dashboard | Checked by hand in headless Chromium (desktop, 375 and 390 px wide, dark mode). **Not tested in Firefox, Safari or Edge;** the one-second "ago" labels have Node.js tests, the rest of the JavaScript has none. |
+| Incident management | 1386 tests (Python 3.11 and 3.13; 1240 passed and 7 skipped without the SNMP extra). Checked in headless Chromium against the live simulated demo (outage, incident opened, auto-recovered, acknowledge, note, write-up, resolve, History, reopen, copy, restart persistence, a recurrence grouped after a restart) and against seeded states (flapping, filters, recurrence after closure), at desktop and 390 px width and in dark mode, plus a hostile note that executed nothing. The local-only rule was checked with a real non-loopback connection to the container's own address (read-only page, 403 on changes). **Not verified on real devices or a real outage, on Windows, or in Firefox, Safari or Edge.** |
 | PowerShell commands | Not run on Windows by the author. |
 
 ## Project layout
@@ -863,6 +1008,8 @@ src/netmonlt/
   inventory.py     YAML loading and validation
   collector.py     polling loop
   alerts.py        alert state machine
+  incidents.py     incident lifecycle, correlation, input cleaning and write-up (pure functions)
+  incident_engine.py  background task that builds incidents from the alert log
   quality.py       latency, jitter, packet-loss maths and grading (pure functions)
   qos.py           QoS counter maths: rates, rollover, reset, discontinuity (pure functions)
   qos_adapters.py  the explicit QoS adapter registry and the DIFFSERV-MIB adapter
@@ -914,10 +1061,18 @@ JavaScript framework or build step.
   traps, SNMPv1/v2c or other MIBs, and interface figures are the latest values only (no history
   or charts, and no alerts on them yet).
 - **Data:** history and alerts are never pruned (fine for a demo, not for long-running use).
-- **Security:** no authentication or HTTPS. In real mode the page lists your device addresses, so
-  keep the default `127.0.0.1` binding.
-- **Alerts:** shown and logged only; no notifications or acknowledgement. Thresholds are fixed
-  (3 pings, 20% loss, 150 ms, 3 confirming checks).
+- **Security:** no authentication or HTTPS; incident changes are restricted to the local machine
+  (see Incident management). In real mode the page lists your device addresses, so keep the
+  default `127.0.0.1` binding.
+- **Alerts:** shown and logged only; no notifications. Thresholds are fixed (3 pings, 20% loss,
+  150 ms, 3 confirming checks).
+- **Incidents:** only ICMP up/down/degraded alerts create incidents (SNMP, Wi-Fi and QoS do not).
+  Alerts from before you upgraded are not turned into incidents. There are no user accounts: the
+  "actor" is a self-declared label and anyone using the local machine's browser can act. Changes
+  are local-only by design, so a remote team cannot acknowledge from their own machines. Evidence
+  is counted from stored checks, so it is only as complete as those (a check that could not run is
+  not counted). Incidents are never deleted or pruned. This has been tested with automated
+  tests and a browser against the simulator, **not** against real devices or a real outage.
 - **Scale:** one `ping` process per device per check, at most 64 at once. It is meant for a home
   or lab network, not thousands of devices.
 - **Charts:** no zoom, pan or export; alerts aren't marked on the chart; axis times use the
@@ -928,5 +1083,5 @@ JavaScript framework or build step.
 ## What I would build next
 
 1. Interface history charts and alerts on interface status or error rates.
-2. Alert notifications (for example a webhook) and acknowledgement.
+2. Alert notifications (for example a webhook), and incidents from SNMP, Wi-Fi and QoS signals.
 3. Data retention, and authentication before any non-localhost use.
