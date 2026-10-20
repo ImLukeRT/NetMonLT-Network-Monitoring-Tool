@@ -191,6 +191,26 @@
                            text-transform:uppercase; letter-spacing:.04em; }
   }
   .inc-flap { display:inline-block; margin-top:4px; font-size:12px; font-weight:700; letter-spacing:.03em; }
+  .inc-import { padding:10px 14px; border-bottom:1px solid var(--line); font-size:14px; }
+  .inc-import p { margin:0 0 8px; }
+  .inc-import-list { margin:6px 0 10px; padding-left:18px; font-size:13px; max-height:220px; overflow:auto; }
+  #inc-import-msg { font-size:13px; margin-top:6px; }
+  #inc-import-msg:empty { display:none; }
+  #inc-import-msg.bad { color:var(--down); }
+  #inc-import-msg.good { color:var(--up); }
+  .inc-warn { font-size:13px; padding:8px 10px; border-radius:6px; margin:8px 0; background:var(--deg-bg); color:var(--deg); }
+  .inc-warn label.inc-check { display:flex; gap:8px; align-items:flex-start; margin-top:8px; color:inherit; }
+  small.inc-ref { display:block; color:var(--muted); font-size:12px; }
+  @media (max-width:640px) {
+    /* the alert table becomes one card per alert on a phone */
+    #alerts-wrap thead { display:none; }
+    #alerts-wrap table, #alerts-wrap tbody, #alerts-wrap tr, #alerts-wrap td { display:block; width:100%; box-sizing:border-box; }
+    #alerts-wrap tr { padding:6px 0; border-bottom:1px solid var(--line); }
+    #alerts-wrap td { border:0; padding:2px 12px; white-space:normal; min-width:0; }
+    #alerts-wrap td::before { content:attr(data-label); display:inline-block; min-width:70px; color:var(--muted);
+                              font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+    #alerts-wrap td.msg small.inc-ref { margin-left:74px; }
+  }
   .inc-btn { font:inherit; font-size:13px; color:var(--fg); background:var(--bg); cursor:pointer;
              border:1px solid var(--line); border-radius:6px; padding:3px 9px; }
   .inc-btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -282,6 +302,7 @@
             <option value="">All</option><option value="open">Open</option>
             <option value="acknowledged">Acknowledged</option>
             <option value="recovered">Monitoring recovered</option>
+            <option value="unknown">Recovery unknown</option>
             <option value="reopened">Reopened</option>
           </select>
         </label>
@@ -291,6 +312,19 @@
             <option value="warning">Warning</option>
           </select>
         </label>
+      </div>
+      <div class="inc-import" id="inc-import" hidden>
+        <p id="inc-import-text"></p>
+        <div class="actions"><button type="button" class="inc-btn" id="inc-import-preview">Preview import…</button></div>
+        <div id="inc-import-panel" hidden>
+          <p id="inc-import-summary"></p>
+          <ul id="inc-import-list" class="inc-import-list"></ul>
+          <div class="actions">
+            <button type="button" class="inc-btn primary" id="inc-import-go">Import</button>
+            <button type="button" class="inc-btn" id="inc-import-cancel">Cancel</button>
+          </div>
+        </div>
+        <div id="inc-import-msg" role="status"></div>
       </div>
       <table>
         <thead><tr>
@@ -357,6 +391,12 @@
       <h4 id="inc-d-close-title">Resolve or close</h4>
       <form id="inc-f-resolve">
         <p class="inc-hint" id="inc-d-resolve-hint"></p>
+        <div class="inc-warn" id="inc-d-unknown-warn" hidden>
+          <b>Recovery was never confirmed.</b> Monitoring recorded no recovery alert for this fault,
+          so NetMonLT does not know whether or when it ended. Resolving records your statement; it
+          does not change what monitoring recorded.
+          <label class="inc-check"><input type="checkbox" id="inc-f-confirm-unknown"> I understand that NetMonLT never confirmed recovery, and my summary says how I know it ended.</label>
+        </div>
         <label for="inc-f-resolution">Resolution summary (required, at least 10 characters)</label>
         <textarea id="inc-f-resolution" maxlength="4000"></textarea>
         <p><button type="submit" class="inc-btn primary" id="inc-b-resolve">Resolve incident</button></p>
@@ -569,18 +609,25 @@
   </section>
   <h2>Recent alerts</h2>
   <p class="inc-hint" style="margin:-4px 0 8px">The event log: every monitoring alert, exactly as raised.
-    Incidents above group related alerts into one case.</p>
+    Incidents above group related alerts into one case. Resolving an incident moves its alerts out
+    of the default view; nothing is ever deleted.</p>
   <div class="wrap" id="alerts-wrap">
+    <div class="inc-controls">
+      <div class="inc-tabs" role="tablist" aria-label="Alert view" id="alert-tabs">
+        <button type="button" role="tab" data-alertview="unresolved" aria-selected="true">Unresolved <span class="count" id="alert-count-unresolved"></span></button>
+        <button type="button" role="tab" data-alertview="archived" aria-selected="false">Archived / resolved <span class="count" id="alert-count-archived"></span></button>
+        <button type="button" role="tab" data-alertview="all" aria-selected="false">All alerts <span class="count" id="alert-count-all"></span></button>
+      </div>
+    </div>
     <table>
       <thead><tr>
         <th>Time</th><th>Severity</th><th>Device</th><th>Change</th><th>Message</th>
       </tr></thead>
       <tbody id="alerts"></tbody>
     </table>
-    <div class="empty" id="no-alerts" hidden>
-      No alerts yet. An alert is raised when a device's state changes and stays changed for 3
-      consecutive checks.
-    </div>
+    <div class="empty" id="no-alerts" hidden></div>
+    <div class="q-caption" id="alert-caption"></div>
+    <div class="actions" style="padding:0 14px 12px"><button type="button" class="inc-btn" id="alert-more" hidden>Show more</button></div>
   </div>
 </main>
 <script>
@@ -665,6 +712,19 @@ function render(data) {
   syncChartDevices(data.devices);
 }
 
+const ALERT_VIEW_TEXT = {
+  unresolved: "Hides only the alerts that belong to a resolved incident. Alerts that no incident covers stay here until they are placed in one and it is resolved. Reopening an incident brings its alerts back.",
+  archived: "Alerts that belong to a resolved incident. They are also in the incident's report and in All alerts.",
+  all: "The complete original alert history, exactly as raised.",
+};
+const ALERT_EMPTY_TEXT = {
+  unresolved: "No unresolved alerts. Alerts of resolved incidents are under Archived / resolved, and the full history is under All alerts.",
+  archived: "No archived alerts yet. When you resolve an incident, its alerts appear here.",
+  all: "No alerts yet. An alert is raised when a device's state changes and stays changed for 3 consecutive checks.",
+};
+const ALERT_COLUMNS = ["Time", "Severity", "Device", "Change", "Message"];
+let alertView = "unresolved", alertLimit = 20, alertReq = 0;
+
 function renderAlerts(data) {
   alertRows.replaceChildren();
   for (const a of data.alerts) {
@@ -680,11 +740,39 @@ function renderAlerts(data) {
     const timeCell = cell("", "num");
     setAge(timeCell, a.age_s, "ago", when + " · ");
     timeCell.title = at.toLocaleString();
-    tr.append(timeCell, sevCell, cell(a.device),
-              cell(a.from_status + " → " + a.to_status), cell(a.message, "msg"));
+    const msgCell = cell(a.message, "msg");
+    const ref = el("small", "inc-ref", a.incident_display_id
+      ? a.incident_display_id + (a.incident_review === "resolved" ? " (resolved)" : "")
+      : "not in an incident");
+    if (!a.incident_display_id) {
+      ref.title = a.skipped_reason
+        ? "Left out of the historical import: a recovery with no recorded fault before it"
+        : "No incident covers this alert yet";
+    }
+    msgCell.appendChild(ref);
+    tr.append(timeCell, sevCell, cell(a.device), cell(a.from_status + " → " + a.to_status), msgCell);
+    ALERT_COLUMNS.forEach((label, n) => { tr.children[n].dataset.label = label; });
     alertRows.appendChild(tr);
   }
-  document.getElementById("no-alerts").hidden = data.alerts.length > 0;
+  for (const tab of document.querySelectorAll("#alert-tabs button")) {
+    tab.setAttribute("aria-selected", String(tab.dataset.alertview === data.view));
+    const n = document.getElementById("alert-count-" + tab.dataset.alertview);
+    n.textContent = data.counts[tab.dataset.alertview];
+  }
+  const none = document.getElementById("no-alerts");
+  none.hidden = data.alerts.length > 0;
+  none.textContent = ALERT_EMPTY_TEXT[data.view] || "";
+  document.getElementById("alert-caption").textContent =
+    (data.incidents_enabled ? ALERT_VIEW_TEXT[data.view] + " " : "") +
+    "Showing " + (data.offset + data.alerts.length) + " of " + data.total + ".";
+  const more = document.getElementById("alert-more");
+  more.hidden = !data.has_more;
+  more.textContent = "Show " + Math.min(20, data.total - data.offset - data.alerts.length) + " more";
+}
+
+document.getElementById("alert-more").addEventListener("click", () => { alertLimit = Math.min(500, alertLimit + 20); refresh(); });
+for (const tab of document.querySelectorAll("#alert-tabs button")) {
+  tab.addEventListener("click", () => { alertView = tab.dataset.alertview; alertLimit = 20; refresh(); });
 }
 
 function ago(seconds) {
@@ -701,11 +789,12 @@ async function getJson(url) {
 
 async function refresh() {
   try {
+    const req = ++alertReq, view = alertView;
     const [devices, alerts] = await Promise.all([
-      getJson("/api/devices"), getJson("/api/alerts?limit=20"),
+      getJson("/api/devices"), getJson("/api/alerts?limit=" + alertLimit + "&view=" + view),
     ]);
     render(devices);
-    renderAlerts(alerts);
+    if (req === alertReq && view === alertView) renderAlerts(alerts);
     wrap.classList.remove("offline");
     alertsWrap.classList.remove("offline");
     document.getElementById("error").textContent = "";
@@ -1044,6 +1133,7 @@ const INC_TOKEN = (document.querySelector('meta[name="netmonlt-token"]') || {}).
 const INC_STATUS_CLASS = {
   open: "down", acknowledged: "degraded", recovered_awaiting_review: "q-good",
   recovered_acknowledged: "q-good", reopened: "down", reopened_recovered: "degraded", resolved: "up",
+  unknown_awaiting_review: "unknown", unknown_acknowledged: "unknown", reopened_unknown: "degraded",
 };
 const INC_REPORT_FIELDS = ["root_cause", "actions_taken", "impact_assessment", "recovery_verification", "lessons_learned"];
 let incView = "active", incStatus = "", incSeverity = "", incSelected = null, incFilled = null;
@@ -1083,6 +1173,76 @@ function incShow(text, kind) {
   incMsg.className = kind || "";
 }
 
+// ---- historical import: preview first, then confirm exactly what was previewed -------------------
+const incImport = document.getElementById("inc-import");
+const incImportMsg = document.getElementById("inc-import-msg");
+let incImportPlan = null;
+
+function renderImportNotice(data) {
+  const n = data.counts.import_candidates || 0;
+  incImport.hidden = n === 0 && !incImportMsg.textContent;
+  const text = document.getElementById("inc-import-text");
+  const button = document.getElementById("inc-import-preview");
+  if (n === 0) {
+    text.textContent = "";
+    button.hidden = true;
+    document.getElementById("inc-import-panel").hidden = true;
+    return;
+  }
+  text.textContent = n + (n === 1 ? " earlier alert is" : " earlier alerts are") +
+    " not part of any incident (raised before incident management, or recoveries with no recorded fault). " +
+    "They stay in Recent alerts either way. You can import them as incidents to investigate and document." +
+    (data.can_modify ? "" : " Importing is not available here: " + data.read_only_reason + ".");
+  button.hidden = !data.can_modify;
+}
+
+document.getElementById("inc-import-preview").addEventListener("click", async () => {
+  incImportMsg.textContent = ""; incImportMsg.className = "";
+  try {
+    const p = await getJson("/api/incidents/import/preview");
+    incImportPlan = p;
+    const panel = document.getElementById("inc-import-panel");
+    panel.hidden = false;
+    const parts = [p.alerts_considered + " alerts would become " + p.incidents_to_create + " incidents: " +
+      p.recovered + " auto-recovered, " + p.recovery_unknown + " with recovery unknown, " + p.flapping_groups + " flapping."];
+    if (p.alerts_to_skip) parts.push(p.alerts_to_skip + " alert(s) cannot be placed in an incident (a recovery with no recorded fault before it): they are left unchanged, recorded as skipped and stay visible in Recent alerts.");
+    parts.push("Original alert times, severities and messages are kept. Nothing is invented: causes, actions and notes stay blank, and a fault with no recovery alert is shown as recovery unknown.");
+    document.getElementById("inc-import-summary").textContent = parts.join(" ");
+    const list = document.getElementById("inc-import-list");
+    list.replaceChildren();
+    for (const i of p.incidents.slice(0, 50)) {
+      list.appendChild(el("li", null, i.device + " · " + i.severity + " · " + new Date(i.opened_ts * 1000).toLocaleString() +
+        " · " + i.alerts + (i.alerts === 1 ? " alert" : " alerts") + " · " + i.label + (i.flap_count ? " · flapping x" + i.flap_count : "")));
+    }
+    if (p.incidents.length > 50) list.appendChild(el("li", null, "… and " + (p.incidents.length - 50) + " more"));
+    const go = document.getElementById("inc-import-go");
+    go.textContent = p.incidents_to_create ? "Import " + p.incidents_to_create + " incidents" : "Record " + p.alerts_to_skip + " alerts as skipped";
+    go.disabled = !(p.can_modify && p.alerts_considered);
+  } catch (err) {
+    incImportMsg.textContent = "Could not preview the import: " + err.message;
+    incImportMsg.className = "bad";
+  }
+});
+document.getElementById("inc-import-cancel").addEventListener("click", () => {
+  incImportPlan = null; document.getElementById("inc-import-panel").hidden = true;
+});
+document.getElementById("inc-import-go").addEventListener("click", async () => {
+  if (!incImportPlan) return;
+  try {
+    const r = await incSend("POST", "/api/incidents/import", {confirm: incImportPlan.fingerprint});
+    incImportPlan = null;
+    document.getElementById("inc-import-panel").hidden = true;
+    incImportMsg.textContent = "Imported " + r.incidents_created + " incidents from " + r.alerts_linked + " alerts" +
+      (r.alerts_skipped ? " (" + r.alerts_skipped + " left out and recorded as skipped)" : "") + ". The alerts themselves are unchanged.";
+    incImportMsg.className = "good";
+    await refreshIncidents();
+    refresh();
+  } catch (err) {
+    incImportMsg.textContent = "Could not import: " + err.message;
+    incImportMsg.className = "bad";
+  }
+});
+
 const INC_COLUMNS = ["Incident", "Device", "Severity", "Status", "Detected", "Alerts", "Actions"];
 
 function renderIncidentList(data) {
@@ -1094,11 +1254,13 @@ function renderIncidentList(data) {
   badge.className = "banner" + (data.simulated ? "" : " live");
   document.getElementById("inc-count-active").textContent = data.counts.active + (data.counts.awaiting_review ? " (" + data.counts.awaiting_review + " to review)" : "");
   document.getElementById("inc-count-history").textContent = data.counts.history;
+  renderImportNotice(data);
   incRows.replaceChildren();
   for (const i of data.incidents) {
     const tr = document.createElement("tr");
     const id = el("td", "inc-cell", i.display_id);
     if (i.simulated) id.appendChild(el("small", null, "simulated"));
+    if (i.origin === "imported") id.appendChild(el("small", null, "imported from alert history"));
     if (i.previous_display_id) id.appendChild(el("small", null, "previous on this device: " + i.previous_display_id));
     const sev = document.createElement("td");
     sev.appendChild(el("span", "badge " + i.severity, i.severity));
@@ -1107,6 +1269,7 @@ function renderIncidentList(data) {
     const when = el("td", "num inc-cell");
     setAge(when, Math.max(0, data.server_time - i.opened_ts), "ago", new Date(i.opened_ts * 1000).toLocaleString() + " · ");
     if (i.resolved_ts) when.appendChild(el("small", null, "resolved " + new Date(i.resolved_ts * 1000).toLocaleString()));
+    else if (i.lifecycle.recovery_unknown) when.appendChild(el("small", null, "no recovery was recorded"));
     else if (i.recovered_ts) when.appendChild(el("small", null, "monitoring recovered " + fmtDuration(i.recovered_ts - i.opened_ts) + " after detection"));
     const alerts = el("td", "inc-cell", String(i.alert_events));
     if (i.flapping) {
@@ -1118,7 +1281,7 @@ function renderIncidentList(data) {
     const box = el("div", "actions");
     box.appendChild(incButton("View report", () => openIncident(i.id)));
     if (data.can_modify && i.lifecycle.review === "open") box.appendChild(incButton("Acknowledge", () => quickAcknowledge(i.id), "primary"));
-    if (data.can_modify && i.lifecycle.review !== "resolved" && i.lifecycle.monitoring === "recovered") box.appendChild(incButton("Resolve…", () => openIncident(i.id, "resolve")));
+    if (data.can_modify && i.lifecycle.review !== "resolved" && i.lifecycle.monitoring !== "active") box.appendChild(incButton("Resolve…", () => openIncident(i.id, "resolve")));
     if (data.can_modify && i.lifecycle.review === "resolved") box.appendChild(incButton("Reopen…", () => openIncident(i.id, "reopen")));
     actions.appendChild(box);
     tr.append(id, cell(i.device), sev, status, when, alerts, actions);
@@ -1201,10 +1364,11 @@ function renderIncidentDetail(d) {
   const badges = document.getElementById("inc-d-badges");
   badges.replaceChildren(
     el("span", "badge " + (INC_STATUS_CLASS[life.code] || "unknown"), life.label),
-    el("span", "badge " + (life.monitoring === "recovered" ? "up" : "down"), "Monitoring: " + life.monitoring),
+    el("span", "badge " + (life.monitoring === "recovered" ? "up" : life.monitoring === "unknown" ? "unknown" : "down"), "Monitoring: " + (life.monitoring === "unknown" ? "recovery unknown" : life.monitoring)),
     el("span", "badge " + (life.review === "resolved" ? "up" : life.review === "acknowledged" ? "degraded" : "unknown"), "Review: " + life.review),
   );
   if (r.flapping) badges.appendChild(el("span", "badge degraded", "Flapping: recurred " + r.flap_count + "×"));
+  if (r.imported) badges.appendChild(el("span", "badge unknown", "Imported from alert history"));
   if (inc.reopened_count) badges.appendChild(el("span", "badge unknown", "Reopened " + inc.reopened_count + "×"));
   if (inc.previous_display_id) badges.appendChild(el("span", "badge unknown", "Previous on this device: " + inc.previous_display_id));
   const label = document.getElementById("inc-d-label");
@@ -1216,7 +1380,7 @@ function renderIncidentDetail(d) {
   obs.appendChild(el("p", "inc-text", r.observed.summary));
   const ev = r.observed.evidence, list = el("dl", "inc-kv");
   kv(list, "Detected", r.detected_at);
-  kv(list, "Monitoring recovered", r.recovered_at || "not confirmed");
+  kv(list, "Monitoring recovered", r.recovered_at || (r.recovery_unknown ? "unknown: no recovery alert was recorded" : "not confirmed"));
   kv(list, "Resolved", r.resolved_at || "not resolved");
   kv(list, "ICMP checks", ev.checks_total + " (" + ev.checks_down + " down, " + ev.checks_degraded + " degraded, " + ev.checks_up + " up)");
   kv(list, "Probes", ev.probes_sent + " sent, " + ev.probes_received + " answered" + (ev.loss_pct === null ? "" : " (loss " + ev.loss_pct + "%)"));
@@ -1268,6 +1432,7 @@ function renderIncidentDetail(d) {
   // Form fields are filled once per opened incident, so a background refresh never overwrites typing.
   if (incFilled !== d.incident.id) {
     incFilled = d.incident.id;
+    document.getElementById("inc-f-confirm-unknown").checked = false;
     document.getElementById("inc-f-status").value = r.operator.root_cause_status;
     for (const f of INC_REPORT_FIELDS) document.getElementById("inc-f-" + f).value = r.operator[f];
     document.getElementById("inc-f-resolution").value = r.operator.resolution_summary || "";
@@ -1277,16 +1442,21 @@ function renderIncidentDetail(d) {
   }
   const can = d.can_modify;
   document.getElementById("inc-d-opnote").textContent = "Entered by a person, and blank until they write it: NetMonLT never fills these in or guesses a cause." + (can ? "" : " Read-only here: " + d.read_only_reason + ".");
-  for (const control of incDetail.querySelectorAll("form textarea, form select, form button")) control.disabled = !can;
+  for (const control of incDetail.querySelectorAll("form textarea, form select, form button, form input")) control.disabled = !can;
   document.getElementById("inc-b-ack").hidden = !(can && life.review === "open");
   const resolved = life.review === "resolved";
   document.getElementById("inc-f-resolve").hidden = resolved;
   document.getElementById("inc-f-reopen").hidden = !resolved;
   document.getElementById("inc-d-close-title").textContent = resolved ? "Reopen" : "Resolve or close";
-  const ready = life.monitoring === "recovered";
+  const unknown = life.monitoring === "unknown";
+  const ready = life.monitoring === "recovered" || unknown;
+  document.getElementById("inc-d-unknown-warn").hidden = !unknown;
+  document.getElementById("inc-f-confirm-unknown").disabled = !can;
   document.getElementById("inc-b-resolve").disabled = !(can && ready);
-  document.getElementById("inc-d-resolve-hint").textContent = ready
+  document.getElementById("inc-d-resolve-hint").textContent = life.monitoring === "recovered"
     ? "Monitoring has confirmed recovery. Resolving documents the outcome and removes this from the Active view; its evidence stays in History."
+    : unknown
+    ? "This is a historical fault with no recorded recovery. You can resolve it with a summary and the confirmation below; it then moves to History, and the monitoring record stays as it is."
     : "Monitoring still reports this fault, so it cannot be resolved yet. Acknowledge it meanwhile, and resolve it once recovery is confirmed.";
   document.getElementById("inc-d-markdown").value = d.markdown;
 }
@@ -1304,6 +1474,7 @@ async function incAction(labels, method, path, body, after) {
     if (after) after();
     await refreshIncidents();
     await refreshIncidentDetail();
+    refresh();  // resolving or reopening moves the incident's alerts between the alert views
   } catch (err) {
     incShow(labels[1] + ": " + err.message, "bad");
   }
@@ -1324,7 +1495,8 @@ document.getElementById("inc-f-note").addEventListener("submit", (ev) => {
 document.getElementById("inc-f-resolve").addEventListener("submit", (ev) => {
   ev.preventDefault();
   incAction(["Incident resolved and moved to History.", "Could not resolve"], "POST", "/api/incidents/" + incSelected + "/resolve",
-            {...incReportFields(), resolution_summary: document.getElementById("inc-f-resolution").value});
+            {...incReportFields(), resolution_summary: document.getElementById("inc-f-resolution").value,
+             confirm_unknown_recovery: document.getElementById("inc-f-confirm-unknown").checked});
 });
 document.getElementById("inc-f-reopen").addEventListener("submit", (ev) => {
   ev.preventDefault();

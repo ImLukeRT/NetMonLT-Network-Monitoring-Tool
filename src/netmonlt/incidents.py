@@ -23,6 +23,7 @@ Everything in a report is labelled by where it came from: observed by NetMonLT, 
 operator, or (simulated mode only) fictional illustrative example content.
 """
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -36,6 +37,7 @@ from netmonlt.domain import DEGRADED_LOSS_PCT, DEGRADED_RTT_MS, IncidentsConfig,
 # ---- monitoring and review states
 MON_ACTIVE = "active"
 MON_RECOVERED = "recovered"
+MON_UNKNOWN = "unknown"  # imported history: a fault whose recovery was never recorded
 REV_OPEN = "open"
 REV_ACKNOWLEDGED = "acknowledged"
 REV_RESOLVED = "resolved"
@@ -46,16 +48,19 @@ KIND_ICMP = "icmp-status"  # the only alert type today; correlation never crosse
 SRC_MONITORING = "monitoring"
 SRC_OPERATOR = "operator"
 EV_OPENED, EV_ALERT, EV_RECOVERED, EV_RECURRED = "opened", "alert", "recovered", "recurred"
+EV_IMPORTED = "imported"  # the incident was reconstructed later from stored alerts
+ORIGIN_LIVE, ORIGIN_IMPORTED = "live", "imported"
 EV_ACK, EV_NOTE, EV_REPORT, EV_RESOLVED, EV_REOPENED = (
     "acknowledged", "note", "report_updated", "resolved", "reopened")
 EVENT_LABELS = {
     EV_OPENED: "Detected", EV_ALERT: "Further alert", EV_RECOVERED: "Monitoring recovered",
     EV_RECURRED: "Fault recurred", EV_ACK: "Acknowledged", EV_NOTE: "Investigation note",
     EV_REPORT: "Write-up updated", EV_RESOLVED: "Resolved", EV_REOPENED: "Reopened",
+    EV_IMPORTED: "Imported from alert history",
 }
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
-STATUS_FILTERS = ("open", "acknowledged", "recovered", "reopened", "resolved")
+STATUS_FILTERS = ("open", "acknowledged", "recovered", "unknown", "reopened", "resolved")
 MAX_EVIDENCE_ROWS = 5000
 
 # ---- operator input
@@ -77,6 +82,7 @@ class IncidentError(Exception):
     NOT_FOUND = "not_found"
     INVALID_TRANSITION = "invalid_transition"
     INVALID_INPUT = "invalid_input"
+    STALE = "stale_preview"
 
     def __init__(self, code: str, message: str):
         self.code = code
@@ -106,6 +112,8 @@ class Incident:
     run_started_ts: float | None  # when the simulation run that raised it began (simulated only)
     report: dict = field(default_factory=dict)  # operator-entered write-up fields
     evidence: dict = field(default_factory=dict)  # the stored snapshot of monitoring evidence
+    origin: str = ORIGIN_LIVE  # "imported": reconstructed afterwards from stored alert history
+    import_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -144,18 +152,30 @@ def display_id(incident_id: int) -> str:
 def lifecycle(inc: Incident) -> dict:
     """The combined, human-readable lifecycle of an incident (monitoring and review kept apart)."""
     recovered = inc.monitoring_state == MON_RECOVERED
+    unknown = inc.monitoring_state == MON_UNKNOWN
     reopened = inc.reopened_count > 0
     if inc.review_state == REV_RESOLVED:
         code, label = "resolved", "Resolved"
     elif inc.review_state == REV_ACKNOWLEDGED:
-        code, label = (("recovered_acknowledged", "Monitoring recovered — acknowledged")
-                       if recovered else ("acknowledged", "Acknowledged"))
+        if recovered:
+            code, label = "recovered_acknowledged", "Monitoring recovered — acknowledged"
+        elif unknown:
+            code, label = "unknown_acknowledged", "Recovery unknown — acknowledged"
+        else:
+            code, label = "acknowledged", "Acknowledged"
     elif reopened:
-        code, label = (("reopened_recovered", "Reopened — monitoring recovered")
-                       if recovered else ("reopened", "Reopened"))
+        if recovered:
+            code, label = "reopened_recovered", "Reopened — monitoring recovered"
+        elif unknown:
+            code, label = "reopened_unknown", "Reopened — recovery unknown"
+        else:
+            code, label = "reopened", "Reopened"
+    elif recovered:
+        code, label = "recovered_awaiting_review", "Auto-recovered — awaiting review"
+    elif unknown:
+        code, label = "unknown_awaiting_review", "Recovery unknown — awaiting review"
     else:
-        code, label = (("recovered_awaiting_review", "Auto-recovered — awaiting review")
-                       if recovered else ("open", "Open"))
+        code, label = "open", "Open"
     return {
         "monitoring": inc.monitoring_state,
         "review": inc.review_state,
@@ -163,6 +183,8 @@ def lifecycle(inc: Incident) -> dict:
         "code": code,
         "label": label,
         "awaiting_review": recovered and inc.review_state == REV_OPEN,
+        "recovery_unknown": unknown,
+        "imported": inc.origin == ORIGIN_IMPORTED,
         "in_active_view": inc.review_state != REV_RESOLVED,
     }
 
@@ -190,10 +212,133 @@ def match_incident(
     for inc in candidates:
         if inc.monitoring_state == MON_ACTIVE:
             return inc
-        if (not is_recovery and inc.recovered_ts is not None
-                and 0 <= alert_ts - inc.recovered_ts <= window_s):
+        if (not is_recovery and inc.monitoring_state == MON_RECOVERED
+                and inc.recovered_ts is not None and 0 <= alert_ts - inc.recovered_ts <= window_s):
             return inc
     return None
+
+
+# ------------------------------------------------------------------ historical import
+SKIP_RECOVERY_WITHOUT_FAULT = "recovery_without_recorded_fault"
+SKIP_REASONS = {
+    SKIP_RECOVERY_WITHOUT_FAULT:
+        "a recovery alert with no recorded fault before it to attach to (nothing is invented)",
+}
+
+
+@dataclass(frozen=True)
+class HistoricalAlert:
+    """One stored alert, exactly as raised (read from the alert log, never changed)."""
+
+    id: int
+    device: str
+    ts: float
+    severity: str
+    from_status: str
+    to_status: str
+    message: str
+
+
+@dataclass
+class DraftIncident:
+    """An incident the import would create: its alerts (each with the event kind it becomes)
+    and the state they imply. Built only from the alerts it was given."""
+
+    device: str
+    severity: str
+    opened_ts: float
+    last_alert_ts: float
+    monitoring_state: str
+    recovered_ts: float | None
+    flap_count: int
+    events: list[tuple[HistoricalAlert, str]]
+
+    def as_candidate(self, ref: int) -> Incident:
+        return Incident(
+            id=ref, device=self.device, kind=KIND_ICMP, severity=self.severity,
+            opened_ts=self.opened_ts, last_alert_ts=self.last_alert_ts,
+            monitoring_state=self.monitoring_state, recovered_ts=self.recovered_ts,
+            flap_count=self.flap_count, review_state=REV_OPEN, acknowledged_ts=None,
+            acknowledged_by=None, resolved_ts=None, resolved_by=None, reopened_count=0,
+            previous_incident_id=None, simulated=False, run_started_ts=None)
+
+
+@dataclass(frozen=True)
+class ImportPlan:
+    drafts: tuple[DraftIncident, ...]  # in the order they would be created
+    skipped: tuple[tuple[int, str], ...]  # (alert id, reason)
+    considered: int
+    fingerprint: str
+
+    def summary(self) -> dict:
+        recovered = sum(1 for d in self.drafts if d.monitoring_state == MON_RECOVERED)
+        return {
+            "alerts_considered": self.considered,
+            "incidents_to_create": len(self.drafts),
+            "recovered": recovered,
+            "recovery_unknown": len(self.drafts) - recovered,
+            "flapping_groups": sum(1 for d in self.drafts if d.flap_count > 0),
+            "alerts_in_incidents": sum(len(d.events) for d in self.drafts),
+            "alerts_to_skip": len(self.skipped),
+            "skipped": [{"alert_id": a, "reason": r, "explanation": SKIP_REASONS.get(r, r)}
+                        for a, r in self.skipped],
+            "fingerprint": self.fingerprint,
+        }
+
+
+def plan_fingerprint(alert_ids: Sequence[int], window_s: float) -> str:
+    """Identifies exactly which alerts a plan covers (and the rule that grouped them), so that
+    an import can only be confirmed for the preview that was shown."""
+    return hashlib.sha256(
+        (f"{window_s!r}|" + ",".join(str(i) for i in alert_ids)).encode()).hexdigest()
+
+
+def plan_import(alerts: Sequence[HistoricalAlert], *, window_s: float) -> ImportPlan:
+    """Group stored alerts into the incidents live processing would have made, per device, by
+    the SAME correlation rule (match_incident). Pure: nothing is read or written.
+
+    A fault that never got a recovery alert ends as MON_UNKNOWN (recovery unknown), never
+    "still down" and never "recovered". A recovery with no fault before it is skipped.
+    """
+    ordered_alerts = sorted(alerts, key=lambda a: a.id)
+    per_device: dict[str, list[DraftIncident]] = {}
+    created: list[DraftIncident] = []
+    skipped: list[tuple[int, str]] = []
+    for alert in ordered_alerts:
+        drafts = per_device.setdefault(alert.device, [])
+        is_recovery = alert.to_status == "up"
+        candidates = [d.as_candidate(i) for i, d in reversed(list(enumerate(drafts)))]
+        found = match_incident(candidates, alert.ts, is_recovery, window_s)
+        target = None if found is None else drafts[found.id]
+        if is_recovery:
+            if target is None or target.monitoring_state != MON_ACTIVE:
+                skipped.append((alert.id, SKIP_RECOVERY_WITHOUT_FAULT))
+                continue
+            target.monitoring_state, target.recovered_ts = MON_RECOVERED, alert.ts
+            target.last_alert_ts = alert.ts
+            target.events.append((alert, EV_RECOVERED))
+        elif target is None:
+            draft = DraftIncident(alert.device, alert.severity, alert.ts, alert.ts, MON_ACTIVE,
+                                  None, 0, [(alert, EV_OPENED)])
+            drafts.append(draft)
+            created.append(draft)
+        elif target.monitoring_state == MON_ACTIVE:
+            target.severity = worse(target.severity, alert.severity)
+            target.last_alert_ts = alert.ts
+            target.events.append((alert, EV_ALERT))
+        else:  # back within the correlation window of its recovery: a recurrence
+            target.monitoring_state = MON_ACTIVE
+            target.flap_count += 1
+            target.severity = worse(target.severity, alert.severity)
+            target.last_alert_ts = alert.ts
+            target.events.append((alert, EV_RECURRED))
+    for draft in created:
+        if draft.monitoring_state == MON_ACTIVE:  # the stored alerts end without a recovery
+            draft.monitoring_state, draft.recovered_ts = MON_UNKNOWN, None
+    created.sort(key=lambda d: (d.opened_ts, d.events[0][0].id))
+    return ImportPlan(
+        drafts=tuple(created), skipped=tuple(skipped), considered=len(ordered_alerts),
+        fingerprint=plan_fingerprint([a.id for a in ordered_alerts], window_s))
 
 
 # ------------------------------------------------------------------ operator input
@@ -266,14 +411,20 @@ def check_acknowledge(inc: Incident) -> None:
         raise IncidentError(IncidentError.INVALID_TRANSITION, "already acknowledged")
 
 
-def check_resolve(inc: Incident) -> None:
+def check_resolve(inc: Incident, *, confirm_unknown: bool = False) -> None:
     if inc.review_state == REV_RESOLVED:
         raise IncidentError(IncidentError.INVALID_TRANSITION, "already resolved")
-    if inc.monitoring_state != MON_RECOVERED:
+    if inc.monitoring_state == MON_ACTIVE:
         raise IncidentError(
             IncidentError.INVALID_TRANSITION,
             "monitoring still reports this fault: an incident can only be resolved after "
             "monitoring has confirmed recovery (acknowledge it meanwhile)")
+    if inc.monitoring_state == MON_UNKNOWN and not confirm_unknown:
+        raise IncidentError(
+            IncidentError.INVALID_INPUT,
+            "monitoring never recorded a recovery for this historical fault: confirm that you "
+            "understand this (confirm_unknown_recovery) and explain in the summary how you know "
+            "it ended")
 
 
 def check_reopen(inc: Incident) -> None:
@@ -458,15 +609,28 @@ def build_report(
     Nothing in `observed` is guessed, and a cause appears only if the simulator defines one.
     """
     life = lifecycle(inc)
-    first = next((e for e in events if e.source == SRC_MONITORING), None)
+    imported = inc.origin == ORIGIN_IMPORTED
+    unknown = inc.monitoring_state == MON_UNKNOWN
+    first = next((e for e in events if e.source == SRC_MONITORING and e.alert_id is not None),
+                 None)
     start_status = (first.to_status if first and first.to_status else "unhealthy").upper()
     summary = [f"{inc.device} entered a fault state (confirmed {start_status}) at "
                f"{fmt_ts(inc.opened_ts)}."]
     if inc.recovered_ts is not None and inc.monitoring_state == MON_RECOVERED:
         summary.append(f"Monitoring confirmed it had recovered at {fmt_ts(inc.recovered_ts)}, "
                        f"{fmt_duration(inc.recovered_ts - inc.opened_ts)} after detection.")
+    elif unknown:
+        summary.append("No recovery alert was recorded for this fault, so NetMonLT does not know "
+                       "whether or when it ended.")
     else:
         summary.append("Monitoring has not confirmed recovery.")
+    if imported:
+        imp = next((e for e in events if e.kind == EV_IMPORTED), None)
+        summary.append(
+            "This incident was reconstructed afterwards from the stored alert history"
+            + (f" ({fmt_ts(imp.ts)})" if imp else "")
+            + ": the alert times, severities and messages are the original ones, but it was not "
+            "open at the time and no one is recorded as having looked at it then.")
     if inc.flap_count:
         summary.append(f"The fault recurred {inc.flap_count} time(s) within the "
                        f"{fmt_duration(cfg.correlation_window_s)} correlation window, so this "
@@ -485,21 +649,28 @@ def build_report(
     actions = []
     if first is not None:
         actions.append(
-            f"Confirmed the change after {CONFIRM_CHECKS} consecutive checks agreed, raised a "
-            f"{(first.severity or 'unknown').upper()} alert ({fmt_ts(first.ts)}) and opened this "
-            "incident automatically.")
+            f"Confirmed the change after {CONFIRM_CHECKS} consecutive checks agreed and raised a "
+            f"{(first.severity or 'unknown').upper()} alert ({fmt_ts(first.ts)})"
+            + (", from which this incident was later created by a historical import."
+               if imported else " and opened this incident automatically."))
     if len(alerts) > 1:
         actions.append(f"Raised {len(alerts) - 1} further alert(s) as the status changed.")
     if inc.flap_count:
         actions.append(f"Grouped {inc.flap_count} recurrence(s) into this incident instead of "
                        "opening new ones.")
-    actions.append(f"Kept checking the device every {poll_interval_s:g} s.")
+    if not imported:  # the interval then in force is not known for imported history
+        actions.append(f"Kept checking the device every {poll_interval_s:g} s.")
     if inc.recovered_ts is not None and inc.monitoring_state == MON_RECOVERED:
         actions.append(
             f"Confirmed recovery after {CONFIRM_CHECKS} consecutive successful checks "
-            f"({fmt_ts(inc.recovered_ts)}), raised an INFO alert and marked the monitoring "
-            "condition as recovered. This does not close the incident: a person must review "
-            "and resolve it.")
+            f"({fmt_ts(inc.recovered_ts)}), raised an INFO alert and "
+            + ("recorded the monitoring condition as recovered from it."
+               if imported else "marked the monitoring condition as recovered.")
+            + " This does not close the incident: a person must review and resolve it.")
+    elif unknown:
+        actions.append("Recorded no recovery for this fault: the stored alerts end without one, "
+                       "so the recovery is unknown. NetMonLT has not assumed that it recovered "
+                       "or that it is still down.")
     actions.append(NO_REMEDIATION)
 
     recovered_now = inc.monitoring_state == MON_RECOVERED
@@ -512,6 +683,9 @@ def build_report(
                         f"{parts}.")
     elif recovered_now:
         verification = "Recovery was confirmed, but the confirming checks are no longer stored."
+    elif unknown:
+        verification = ("No recovery alert was recorded, so there is no recorded recovery to "
+                        "verify. NetMonLT does not know whether or when the fault ended.")
     else:
         verification = "Not yet recovered: there is no recovery to verify."
 
@@ -535,10 +709,12 @@ def build_report(
         "device_type": device_type,
         "severity": inc.severity,
         "simulated": inc.simulated,
+        "imported": imported,
         "data_label": ("SIMULATED monitoring data: no real device was involved" if inc.simulated
                        else "Real monitoring data"),
         "detected_at": fmt_ts(inc.opened_ts),
         "recovered_at": fmt_ts(inc.recovered_ts) if inc.monitoring_state == MON_RECOVERED else None,
+        "recovery_unknown": unknown,
         "resolved_at": fmt_ts(inc.resolved_ts) if inc.review_state == REV_RESOLVED else None,
         "lifecycle": life,
         "flapping": is_flapping(inc, cfg),
@@ -574,6 +750,8 @@ def build_report(
                 "EXAMPLE ONLY (fictional): in this simulation the condition cleared by itself "
                 "according to its script, so no repair was needed. For a real incident, record "
                 "what you actually found and did." if recovered else
+                "EXAMPLE ONLY (fictional): no recovery was recorded for this historical fault, "
+                "so state in your own words how you know it ended." if unknown else
                 "EXAMPLE ONLY (fictional): monitoring has not yet confirmed recovery, so there "
                 "is nothing to resolve."),
             "illustrative_recommendations": list(ILLUSTRATIVE_RECOMMENDATIONS),
@@ -596,6 +774,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     summary_label = ("Summary" if report["resolved_at"] or not op["resolution_summary"]
                      else "Summary (written at an earlier resolution; the incident was reopened)")
     flapping = f"yes, {report['flap_count']} recurrence(s)" if report["flapping"] else "no"
+    recovered_line = report["recovered_at"] or (
+        "unknown (no recovery alert was recorded)" if report.get("recovery_unknown")
+        else "not confirmed")
     lines = [
         f"# {report['title']}",
         "",
@@ -604,7 +785,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"- **Severity:** {report['severity']}",
         f"- **Status:** {life['label']}",
         f"- **Detected:** {report['detected_at']}",
-        f"- **Monitoring recovered:** {report['recovered_at'] or 'not confirmed'}",
+        f"- **Monitoring recovered:** {recovered_line}",
         f"- **Resolved:** {report['resolved_at'] or 'not resolved'}",
         f"- **Flapping:** {flapping}",
         "",
@@ -650,6 +831,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "",
         "## 9. Resolution",
         f"- Resolved at: {report['resolved_at'] or 'not resolved'}",
+        *(["- Monitoring status: recovery unknown. NetMonLT never recorded a recovery for this "
+           "fault; the resolution below is the operator's statement, not a monitoring "
+           "confirmation."] if report.get("recovery_unknown") else []),
         f"- {summary_label}: {_block(op['resolution_summary'], unset)}",
         "",
         "## 10. Lessons learned and preventative actions (operator-entered)",

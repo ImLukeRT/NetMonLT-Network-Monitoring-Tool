@@ -76,7 +76,8 @@ def ids(client, **params):
 def test_list_is_empty_until_something_happens(app):
     body = local_client(app).get("/api/incidents").json()
     assert body["incidents"] == [] and body["enabled"] is True and body["simulated"] is True
-    assert body["counts"] == {"active": 0, "history": 0, "awaiting_review": 0}
+    assert body["counts"] == {"active": 0, "history": 0, "awaiting_review": 0,
+                              "recovery_unknown": 0, "import_candidates": 0}
     assert (body["correlation_window_s"], body["flapping_recurrences"]) == (900.0, 2)
 
 
@@ -436,7 +437,10 @@ def test_monitoring_endpoints_are_unchanged_by_incidents(seeded):
         ("alpha", "up"), ("beta", "down"), ("alpha", "down")]
     alpha = ids(client)["alpha"]
     client.post(f"/api/incidents/{alpha}/acknowledge", json={}, headers=headers(client))
-    assert client.get("/api/alerts").json()["alerts"] == alerts  # acknowledging changes no alert
+    after = client.get("/api/alerts").json()["alerts"]
+    link = ("incident_review",)  # the only thing that may differ: the linked incident's state
+    assert [{k: v for k, v in a.items() if k not in link} for a in after] == [
+        {k: v for k, v in a.items() if k not in link} for a in alerts]  # no alert changed
 
 
 def test_the_background_task_builds_incidents_while_the_app_runs(db, devices):

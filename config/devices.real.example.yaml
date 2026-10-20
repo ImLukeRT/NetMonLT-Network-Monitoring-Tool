@@ -49,7 +49,8 @@ poll_interval_s: 10      # minimum 5 in real mode
 #                                 # joins the same incident (60 to 86400)
 #   flapping_recurrences: 2       # this many recurrences mark an incident as flapping
 #   operator_actions: false       # OFF by default in real mode (incidents are read-only). Set
-#                                 # true to let this machine acknowledge, note and resolve them.
+#                                 # true to let this machine acknowledge, note, resolve and
+#                                 # import earlier alerts as incidents.
 
 devices:
   # Your own computer over the loopback interface: always safe to try.

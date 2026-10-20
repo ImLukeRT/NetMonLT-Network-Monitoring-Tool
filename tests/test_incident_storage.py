@@ -18,6 +18,8 @@ from netmonlt.incident_engine import process_once, run_incidents_forever
 from netmonlt.storage import Database
 
 U, D, X = Status.UP, Status.DEGRADED, Status.DOWN
+ZERO_COUNTS = {"active": 0, "history": 0, "awaiting_review": 0, "recovery_unknown": 0}
+ONE_RECOVERED = {"active": 1, "history": 0, "awaiting_review": 1, "recovery_unknown": 0}
 CFG = IncidentsConfig()  # 900 s correlation window, 2 recurrences make it "flapping"
 T0 = 10_000.0
 
@@ -100,7 +102,7 @@ def test_recovery_marks_monitoring_recovered_but_never_resolves(synced):
     assert life["label"] == "Auto-recovered — awaiting review"
     assert life["awaiting_review"] and life["in_active_view"]
     assert i.acknowledged_by is None and i.resolved_by is None
-    assert synced.incident_counts() == {"active": 1, "history": 0, "awaiting_review": 1}
+    assert synced.incident_counts() == ONE_RECOVERED
 
 
 def test_the_device_recovered_alert_is_unchanged_in_the_alert_log(synced):
@@ -300,7 +302,7 @@ def test_opening_a_database_twice_is_harmless(tmp_path):
     Database(path).close()
     db = Database(path)
     try:
-        assert db.incident_counts() == {"active": 0, "history": 0, "awaiting_review": 0}
+        assert db.incident_counts() == ZERO_COUNTS
     finally:
         db.close()
 

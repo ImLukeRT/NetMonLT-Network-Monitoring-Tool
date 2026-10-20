@@ -53,8 +53,10 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   a History view. Monitoring recovery (set only by NetMonLT) and human review (set only by
   people) are tracked separately, so a device that comes back shows as "Auto-recovered —
   awaiting review", never as fixed. Flapping faults are grouped, every incident has a structured
-  write-up, and simulated incidents get a clearly labelled example write-up. Changes are accepted
-  only from the machine running NetMonLT.
+  write-up, and simulated incidents get a clearly labelled example write-up. Earlier alerts can be
+  imported as incidents (with honest "recovery unknown" for faults that never recorded a
+  recovery), and resolving an incident moves its alerts out of the default Recent alerts view
+  (Unresolved / Archived / All). Changes are accepted only from the machine running NetMonLT.
 - **Alerts without alert storms.** A device's state changes only after 3 consecutive checks
   agree. Alerts are stored in SQLite, survive restarts, and never repeat while the state is
   unchanged.
@@ -63,7 +65,7 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   server.
 - **Dashboard with no framework.** Plain HTML, JavaScript and hand-built SVG, no CDN, so it works
   offline. Shows stale data and API failures clearly.
-- **Tested.** 1386 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
+- **Tested.** 1459 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
   network and never need an SNMP device.
 
 ## Quick start (simulated demo)
@@ -248,6 +250,26 @@ alerts** and logged to the console.
   thresholds and alert pruning. The **Recent alerts** table is an event log and is never edited:
   acknowledging and closing happen on incidents (next section), which are built from these alerts.
 
+### Recent alerts views
+
+The Recent alerts table has three views, filtered in the database (so the row limit and **Show
+more** paging always count rows of the chosen view):
+
+| View | Shows |
+|---|---|
+| **Unresolved** (the dashboard's default tab) | Everything **except** alerts linked to a *resolved* incident. Alerts that belong to an open, acknowledged or reopened incident are shown, and so are alerts no incident covers (for example earlier alerts you have not imported): they stay until they are placed in an incident and it is resolved. Other alerts from the same device are never hidden. |
+| **Archived / resolved** | Exactly the alerts linked to a resolved incident. |
+| **All alerts** | The complete original alert history, always. |
+
+Resolving an incident moves its alerts from Unresolved to Archived; reopening it brings them back.
+Each alert shows which incident it belongs to (or "not in an incident"). Nothing is deleted or
+changed: alerts stay in All alerts and in the incident's report for good, and the automatic
+UP/DOWN detection and recovery alerts work exactly as before. `GET /api/alerts` takes
+`view` (`all`, `unresolved`, `archived`), `limit` and `offset`. **Without `view` the endpoint
+returns every alert, exactly as before**, so existing API consumers are unaffected; the dashboard
+asks for `view=unresolved` explicitly. With incident management disabled there is nothing to
+archive, so every alert is shown.
+
 ## Incident management
 
 Alerts say *what monitoring saw*. Incidents are a separate, lightweight workflow on top of them
@@ -260,7 +282,7 @@ cannot change a check, an alert or a device's state, and if it fails monitoring 
 
 | State | Values | Set by |
 |---|---|---|
-| **Monitoring** | `active`, `recovered` | NetMonLT only, from its own alerts |
+| **Monitoring** | `active`, `recovered`, `unknown` | NetMonLT only, from its own alerts (`unknown`: see Importing earlier alerts) |
 | **Review** | `open`, `acknowledged`, `resolved` | A person only, through the dashboard or API |
 
 Shown together as one lifecycle label:
@@ -271,12 +293,14 @@ Shown together as one lifecycle label:
 | **Acknowledged** | A person has seen it. This does not change what monitoring reports. |
 | **Auto-recovered — awaiting review** | Monitoring confirmed the device is back (3 good checks). **No person has investigated or fixed anything**; the incident stays in the Active view until someone reviews it. |
 | **Monitoring recovered — acknowledged** | Recovered, and a person has acknowledged it. |
+| **Recovery unknown — awaiting review** | An imported historical fault whose stored alerts end without a recovery alert. NetMonLT does not know whether or when it ended, and does not assume either way. |
 | **Resolved** | A person closed it with a written resolution summary. It leaves the Active view and stays in History. |
 | **Reopened** | A person reopened a resolved incident (with a reason). |
 
 A user action can never falsify telemetry: acknowledging, noting, resolving and reopening change
 only the review state. **Resolve** is refused while monitoring still reports the fault (you can
-acknowledge it meanwhile), so a live outage cannot be hidden by closing it.
+acknowledge it meanwhile), so a live outage cannot be hidden by closing it. (A historical
+*recovery unknown* incident can be resolved; see below.)
 
 ### Correlation and flapping
 
@@ -331,15 +355,62 @@ Real incidents get only the first two. Nothing is invented for them.
 *Simulated data. The first screenshot is the Active view (a flapping incident, an open warning and
 a recurrence linked to its earlier, resolved incident); the second is the top of one write-up.*
 
+### Importing earlier alerts
+
+Incident management started with your newest existing alert, so alerts raised **before** you
+upgraded appear in Recent alerts but in no incident. To investigate, document and resolve those
+earlier outages, use **Import historical alerts** in the Incidents section. It is explicit and
+opt-in: nothing is ever imported automatically, and it follows the same rules as every other
+change (local machine only; in real mode your inventory must set `incidents.operator_actions: true`).
+
+1. When earlier alerts are not in any incident, the section says how many, with **Preview import…**.
+2. The preview shows what would be created (how many incidents, how many auto-recovered, how many
+   with recovery unknown, how many flapping) and lists them. It writes nothing.
+3. **Import N incidents** creates exactly what was previewed (the confirmation carries the
+   preview's fingerprint, so a changed history is refused with "preview again").
+
+How it groups: the stored alerts are replayed per device with the **same** correlation rules as
+live processing (the same window, recurrence and flapping rules; never merged across devices or
+alert types). Original alert times, severities, transitions and messages are kept on the
+timeline; one extra event, stamped with the import time, says the incident was reconstructed
+afterwards. The incident was not open at the time and no one is recorded as having looked at it.
+
+What is honest about incomplete history:
+
+- A fault **with a recovery alert** is marked monitoring *recovered* and its review state stays
+  **open** until a person resolves it.
+- A fault **with no recovery alert** (for example the app was stopped and re-baselined silently)
+  is **Recovery unknown**: NetMonLT does not assume it is still down and does not invent a
+  recovery. It can still be resolved, but only with a written summary *and* an explicit
+  confirmation that recovery was never confirmed; the resolution is recorded as the operator's
+  statement and the monitoring record stays "recovery unknown".
+- A recovery alert with **no fault before it** is never turned into an outage. It is left
+  unchanged, recorded (with the reason) in `incident_import_skips`, and not offered again; it stays
+  visible in Recent alerts as "not in an incident".
+- Evidence is counted from the checks that are actually stored for that period. Causes, actions,
+  recovery verification and resolution text stay blank; nothing is invented, and the report omits
+  claims it cannot support (such as the polling interval at the time).
+
+Safety: the import only **adds** incidents and events. It never changes an alert, an existing
+incident, note, report or audit event, and repeating it, interrupting it or restarting the
+application cannot create duplicates (one transaction, a unique index on each alert's event, and
+only alerts no incident references are considered). It runs under the same lock as live
+processing, and an imported incident is never joined to a live one. Imported incidents get new
+incident numbers, so they are not in time order; the lists sort by activity time. Every import is
+recorded in `incident_imports` (who, when, counts). Alerts that live processing ignored because no
+incident was open (a recovery after the upgrade for a fault from before it) are paired with their
+fault by the import. Importing once, soon after upgrading, is the intended use.
+
 ### Storage, restarts and your existing data
 
-Incidents live in three new SQLite tables created automatically on start-up
-(`CREATE TABLE IF NOT EXISTS`); your existing tables and alert history are never altered or
-deleted. A cursor, committed in the same transaction as the incident changes, records how far
+Incidents live in new SQLite tables created automatically on start-up
+(`CREATE TABLE IF NOT EXISTS`, plus two `ALTER TABLE ... ADD COLUMN` with defaults (`origin`,
+`import_id`) for a database from an earlier build; every existing incident, note, report and audit
+event is kept exactly as it was, and the alert history is never altered or deleted). A cursor, committed in the same transaction as the incident changes, records how far
 through the alert log incidents have been built, so a restart carries on where it stopped and
 repeated polls never create duplicate incidents or events. **Alerts that already existed when you
-upgraded are not turned into incidents** (the cursor starts at the newest alert); they stay in
-the event log. The event trail is append-only (database triggers refuse any update or delete),
+upgraded are not turned into incidents automatically** (the cursor starts at the newest alert);
+they stay in the event log until you choose to import them (above). The event trail is append-only (database triggers refuse any update or delete),
 there is no delete endpoint, and incidents are keyed by device name, so removing a device from the
 inventory does not remove its incident records.
 
@@ -878,11 +949,13 @@ Every endpoint is read-only JSON except the incident operator actions listed las
 | `GET /api/qos?device=NAME` | Latest QoS telemetry per QoS-enabled device: `adapter`, `adapter_label`, `source_mib`, `requirements`, the poll `status` (`ok`, `pending`, `unsupported`, `timeout`, `auth_failure`, `config`, `error`), `stale`, and per element `kind` (`traffic` or `drops`), `name`, `detail`, `counter_type`, `polled_at`, packets/s, bits/s, drops/s and drop %, each `null` when it cannot be known, with a `rate_note` saying why. Raw counters are never returned. Includes `definitions` and `scope` (what QoS telemetry does and does not prove). |
 | `GET /api/qos/history?device=NAME&window_s=N&max_points=M` | Derived rates over time, one series per element, in time buckets (empty buckets omitted; a bucket with no valid rate has null rates, never zero) plus `gaps` where nothing was polled. |
 | `GET /api/interfaces?device=NAME` | Latest SNMP interface statistics per SNMP device (optionally one): SNMP `status` (`ok`, `pending`, `timeout`, `auth_failure`, `unsupported`, `error`), safe `message`, `stale`, and per interface `oper_status`, `present`, `in_bps`, `out_bps`, error and discard increases since the last poll, and a `rate_note` saying why a rate is `null`. Raw counters are never returned; `simulated` says whether the data is simulated. |
-| `GET /api/alerts?limit=N` | Newest alerts first (1 to 500, default 50) with `severity`, `from_status`, `to_status`, `message`, `age_s`. |
-| `GET /api/incidents?view=active\|history\|all&status=S&severity=V&device=D&limit=N` | Incidents built from the alerts, newest activity first. `view` defaults to `active` (not resolved); `status` is `open`, `acknowledged`, `recovered`, `reopened` or `resolved`; `severity` is `critical`, `warning` or `info`. Each has a `lifecycle` (`monitoring`, `review`, `label`, `awaiting_review`), `flapping`, times, and `simulated`; also `counts`, `can_modify` and the correlation settings. |
+| `GET /api/alerts?view=V&limit=N&offset=K` | Alerts newest first. `view` is `all` (the default when omitted: every alert, as before), `unresolved` (everything except alerts of resolved incidents; what the dashboard requests) or `archived` (alerts of resolved incidents); `limit` 1 to 500 (default 50), `offset` for paging. Each has `severity`, `from_status`, `to_status`, `message`, `age_s`, and its incident link (`incident_id`, `incident_display_id`, `incident_review`, `not_in_incident`, `skipped_reason`). Also `total` and `has_more` for the chosen view and `counts` for all three. |
+| `GET /api/incidents/import/preview` | What importing earlier alerts would create (`incidents_to_create`, `recovered`, `recovery_unknown`, `flapping_groups`, `alerts_to_skip`, the incidents, and a `fingerprint`). Reads only. |
+| `POST /api/incidents/import` | Create exactly the previewed incidents (`{"confirm": "<fingerprint>"}`). Same local-only, token and (real mode) `operator_actions` rules as other changes; 409 if the history changed since the preview. |
+| `GET /api/incidents?view=active\|history\|all&status=S&severity=V&device=D&limit=N` | Incidents built from the alerts, newest activity first. `view` defaults to `active` (not resolved); `status` is `open`, `acknowledged`, `recovered`, `unknown`, `reopened` or `resolved`; `severity` is `critical`, `warning` or `info`. Each has a `lifecycle` (`monitoring`, `review`, `label`, `awaiting_review`), `flapping`, times, and `simulated`; also `counts`, `can_modify` and the correlation settings. |
 | `GET /api/incidents/{id}` | One incident with its full `report` (observed evidence and timeline, operator fields, and for simulated incidents a labelled `simulated_example`) and the same write-up as `markdown`. |
 | `GET /api/incidents/{id}/report?format=markdown\|json` | The write-up alone, as `text/markdown` (default) or JSON. |
-| `POST /api/incidents/{id}/acknowledge`, `/notes`, `/resolve`, `/reopen`, `PUT /api/incidents/{id}/report` | Operator actions (JSON bodies; unknown fields rejected). Local machine only, with the page's token (see Incident management); 403 otherwise, 409 for a transition that is not allowed, 422 for invalid input. No endpoint deletes anything. |
+| `POST /api/incidents/{id}/acknowledge`, `/notes`, `/resolve`, `/reopen`, `PUT /api/incidents/{id}/report` | Operator actions (JSON bodies; unknown fields rejected). Local machine only, with the page's token (see Incident management); 403 otherwise, 409 for a transition that is not allowed, 422 for invalid input. No endpoint deletes anything. Resolving a historical "recovery unknown" incident needs `"confirm_unknown_recovery": true`. |
 | `GET /healthz` | `{"ok": true}` |
 
 ## Configuration reference
@@ -947,7 +1020,7 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-1386 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
+1459 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
 persistence, schema upgrade), the ICMP prober and its safety rules (with a fake command runner
 and recorded or constructed `ping` output), inventory validation, the collector's error handling,
 storage, the history and downsampling queries, the API and the CLI, and for SNMP: the counter
@@ -976,7 +1049,13 @@ no merging across devices or alert types), restart persistence without duplicate
 a database without incident tables, the append-only triggers, every valid and invalid transition,
 validation and SQL-metacharacter input, the write-protection model (remote client, missing or wrong
 token, foreign Origin or Host, non-JSON bodies, guard-before-validation), hostile notes, real versus
-simulated write-ups, and that monitoring data is untouched. None touch a network, run a real
+simulated write-ups, and that monitoring data is untouched. For the historical import: the planner
+(window boundary, flapping, missing recovery, unmatched recoveries, equivalence with live
+processing), duplicates (repeated, interrupted, restarted and concurrent with live processing),
+untouched existing incidents, notes, reports and audit events, the upgrade of an existing Stage 10
+database, the skip records, the "recovery unknown" resolve confirmation and the protection of the
+import endpoints. For the alert views: filtering, row limits, offsets and totals in SQL, resolve
+and reopen moving alerts, unmatched alerts staying visible, and no alert ever changing. None touch a network, run a real
 `ping` or need an SNMP device.
 
 **What has and hasn't been verified**
@@ -995,7 +1074,7 @@ simulated write-ups, and that monitoring data is untouched. None touch a network
 | Wi-Fi (Windows backends) | **Not run on real Windows or Wi-Fi hardware by the author.** The `netsh` parser is tested against sample output built from the documented English format. The WLAN API structure sizes and offsets are checked against values worked out from the Windows headers, not against the DLL, and the decoding against synthetic buffers. The helper-process plumbing (JSON, timeouts, killing a hung child, validation) is exercised for real on Linux, where it correctly reports "unsupported". A test also runs the helper on whatever machine runs the tests, so a Windows CI runner will call the real `wlanapi.dll` (it has no Wi-Fi adapter, so it should report no adapter or service unavailable), but that has not been run yet. |
 | Wi-Fi (simulated, dashboard) | Checked in headless Chromium: the scripted dip, warning and disconnection, and each unavailable state (Ethernet-only, unsupported OS, timeout, stale, API error) using the real API's responses. |
 | Dashboard | Checked by hand in headless Chromium (desktop, 375 and 390 px wide, dark mode). **Not tested in Firefox, Safari or Edge;** the one-second "ago" labels have Node.js tests, the rest of the JavaScript has none. |
-| Incident management | 1386 tests (Python 3.11 and 3.13; 1240 passed and 7 skipped without the SNMP extra). Checked in headless Chromium against the live simulated demo (outage, incident opened, auto-recovered, acknowledge, note, write-up, resolve, History, reopen, copy, restart persistence, a recurrence grouped after a restart) and against seeded states (flapping, filters, recurrence after closure), at desktop and 390 px width and in dark mode, plus a hostile note that executed nothing. The local-only rule was checked with a real non-loopback connection to the container's own address (read-only page, 403 on changes). **Not verified on real devices or a real outage, on Windows, or in Firefox, Safari or Edge.** |
+| Incident management | 1459 tests (Python 3.11 and 3.13; 1240 passed and 7 skipped without the SNMP extra). Checked in headless Chromium against the live simulated demo (outage, incident opened, auto-recovered, acknowledge, note, write-up, resolve, History, reopen, copy, restart persistence, a recurrence grouped after a restart) and against seeded states (flapping, filters, recurrence after closure), at desktop and 390 px width and in dark mode, plus a hostile note that executed nothing. The local-only rule was checked with a real non-loopback connection to the container's own address (read-only page, 403 on changes). The historical import and the alert views were checked in Chromium against a seeded pre-upgrade database (preview, import, a flapping group, a fault with no recovery, a stray recovery, resolving a "recovery unknown" incident, resolve and reopen moving alerts between the views, Show more, a restart, a real-mode database with the action not opted in, and a 390 px layout). **Not verified on real devices or a real outage, on Windows, or in Firefox, Safari or Edge.** |
 | PowerShell commands | Not run on Windows by the author. |
 
 ## Project layout
@@ -1067,7 +1146,9 @@ JavaScript framework or build step.
 - **Alerts:** shown and logged only; no notifications. Thresholds are fixed (3 pings, 20% loss,
   150 ms, 3 confirming checks).
 - **Incidents:** only ICMP up/down/degraded alerts create incidents (SNMP, Wi-Fi and QoS do not).
-  Alerts from before you upgraded are not turned into incidents. There are no user accounts: the
+  Alerts from before you upgraded become incidents only if you import them, and an imported
+  incident is reconstructed afterwards, so its timeline cannot show who looked at it at the time.
+  Imported incidents are not joined to live ones, even within the window. There are no user accounts: the
   "actor" is a self-declared label and anyone using the local machine's browser can act. Changes
   are local-only by design, so a remote team cannot acknowledge from their own machines. Evidence
   is counted from stored checks, so it is only as complete as those (a check that could not run is

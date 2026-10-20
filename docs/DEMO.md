@@ -146,7 +146,30 @@ starts, so don't leave it for later (if you miss it, the history is still there;
        can reach the page sees everything but gets a read-only view (no buttons, and 403 from
        the API), even if you bind to `0.0.0.0`.
 
-11. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
+11. **Importing earlier alerts and the Recent alerts views.** Incident management only follows
+    alerts raised after it was installed, so an existing database (like one from before the
+    upgrade) shows alerts that no incident covers. To try this from scratch you need such a
+    database: run the demo with the previous release, stop it, then start this release on the
+    same `data/netmonlt.db`. (The older alerts stay in **Recent alerts** as "not in an incident".)
+
+    1. In **Incidents**, the notice says "N earlier alerts are not part of any incident". Click
+       **Preview import…**. The preview says how many incidents it would create, how many are
+       auto-recovered, how many have **recovery unknown**, and how many alerts cannot be placed
+       (a recovery with no recorded fault is never turned into an outage).
+    2. Click **Import N incidents**. They appear in Active, badged *imported from alert history*,
+       with the original alert times and messages and one note stamped with the import time. The
+       alerts themselves do not change, and the notice disappears. Importing again does nothing.
+    3. Open an imported incident whose recovery was recorded: **Auto-recovered — awaiting review**.
+       Open one with **Recovery unknown**: the report says NetMonLT does not know whether or when it
+       ended. To resolve it you must tick the confirmation and write a summary; the report then
+       states that the resolution is your statement, not a monitoring confirmation.
+    4. **Recent alerts** has three views. **Unresolved** is the default; resolve an incident and
+       watch its alerts leave it and appear under **Archived / resolved**. **All alerts** always
+       shows the complete history. **Reopen** the incident and its alerts return to Unresolved.
+       Alerts that no incident covers stay in Unresolved until they are in an incident that is
+       resolved, and other alerts from the same device are never hidden.
+
+12. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
    pings only your own computer (loopback). The badge changes to **LIVE · ICMP** and the data goes
    to a separate database. Latencies are tiny (well under 1 ms) because it is local.
 
@@ -190,5 +213,11 @@ PowerShell, `rm -r data` elsewhere).
   In real mode, changes are off until your private inventory sets `incidents.operator_actions:
   true`. Known limits: no accounts, so the actor label is self-declared; only ICMP alerts create
   incidents; and the incident workflow has been tested against the simulator, not a real outage.
+- **History can be imported without rewriting it.** The import replays stored alerts through the
+  same correlation rules, only adds incidents, never touches an existing incident or alert, and
+  cannot duplicate. Where history is incomplete it says "recovery unknown" instead of guessing, and
+  it never turns a recovery with no fault into an outage.
+- **Resolved alerts are archived, not deleted.** The default alert view hides only alerts of
+  resolved incidents; the full history stays one click away and in each incident's report.
 - **Real monitoring is opt-in and bounded.** It needs a separate file, `authorized: true` per
   device and single-host targets only. There is no scanning or discovery.

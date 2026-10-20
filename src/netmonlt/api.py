@@ -67,6 +67,13 @@ class ReportBody(_Body):
 
 class ResolveBody(ReportBody):
     resolution_summary: str = Field(max_length=inc.REPORT_TEXT_FIELDS["resolution_summary"])
+    # Required (true) to resolve a historical incident whose recovery was never recorded.
+    confirm_unknown_recovery: bool = False
+
+
+class ImportBody(_Body):
+    actor: str | None = Field(None, max_length=40)
+    confirm: str = Field(pattern=r"^[0-9a-f]{64}$")  # the fingerprint the preview returned
 
 
 class ReopenBody(_Body):
@@ -194,8 +201,8 @@ def create_app(
 
     @app.exception_handler(inc.IncidentError)
     async def incident_error(_: Request, exc: inc.IncidentError):
-        status = {inc.IncidentError.NOT_FOUND: 404,
-                  inc.IncidentError.INVALID_TRANSITION: 409}.get(exc.code, 422)
+        status = {inc.IncidentError.NOT_FOUND: 404, inc.IncidentError.INVALID_TRANSITION: 409,
+                  inc.IncidentError.STALE: 409}.get(exc.code, 422)
         return JSONResponse(status_code=status, content={"detail": exc.message, "code": exc.code})
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -575,7 +582,7 @@ def create_app(
             "reopened_count": i.reopened_count, "previous_incident_id": i.previous_incident_id,
             "previous_display_id": (None if i.previous_incident_id is None
                                     else inc.display_id(i.previous_incident_id)),
-            "simulated": i.simulated, "alert_events": alerts,
+            "simulated": i.simulated, "origin": i.origin, "alert_events": alerts,
         }
 
     def incident_access(request: Request) -> dict:
@@ -604,7 +611,8 @@ def create_app(
     def list_incidents(
         request: Request,
         view: Literal["active", "history", "all"] = "active",
-        status: Literal["open", "acknowledged", "recovered", "reopened", "resolved"] | None = None,
+        status: Literal[
+            "open", "acknowledged", "recovered", "unknown", "reopened", "resolved"] | None = None,
         severity: Literal["critical", "warning", "info"] | None = None,
         device: str | None = Query(None, max_length=64),
         limit: int = Query(100, ge=1, le=500),
@@ -622,8 +630,41 @@ def create_app(
                     "incidents": []}
         rows = db.list_incidents(view=view, status=status, severity=severity, device=device,
                                  limit=limit)
-        return {**base, "counts": db.incident_counts(),
+        return {**base, "counts": {**db.incident_counts(),
+                                   "import_candidates": db.import_candidate_count()},
                 "incidents": [incident_summary(r, db.incident_alert_count(r.id)) for r in rows]}
+
+    @app.get("/api/incidents/import/preview")
+    def import_preview(request: Request):
+        """What importing the earlier alerts would create. Reads only; nothing is written. The
+        `fingerprint` identifies exactly this preview and is needed to confirm the import."""
+        if not incidents_cfg.enabled:
+            raise inc.IncidentError(inc.IncidentError.NOT_FOUND, "incident management is disabled")
+        plan = db.preview_import(incidents_cfg)
+        return {
+            "server_time": clock(), **incident_access(request), "simulated": simulated_mode,
+            "correlation_window_s": incidents_cfg.correlation_window_s, **plan.summary(),
+            "incidents": [
+                {"device": d.device, "severity": d.severity, "opened_ts": d.opened_ts,
+                 "last_alert_ts": d.last_alert_ts, "alerts": len(d.events),
+                 "recovered_ts": d.recovered_ts, "flap_count": d.flap_count,
+                 "monitoring": d.monitoring_state,
+                 "label": ("Auto-recovered — awaiting review"
+                           if d.monitoring_state == inc.MON_RECOVERED
+                           else "Recovery unknown — awaiting review")}
+                for d in plan.drafts],
+        }
+
+    @app.post("/api/incidents/import", dependencies=[Depends(require_change)])
+    def import_history(body: ImportBody):
+        """Create incidents from the earlier alerts, exactly as previewed. Only adds incidents:
+        alerts and existing incidents are never changed, and repeating it adds nothing."""
+        if not incidents_cfg.enabled:
+            raise inc.IncidentError(inc.IncidentError.NOT_FOUND, "incident management is disabled")
+        result = db.apply_import(incidents_cfg, simulated=simulated_mode, actor=body.actor,
+                                 fingerprint=body.confirm, now=clock())
+        return {**result, "counts": {**db.incident_counts(),
+                                     "import_candidates": db.import_candidate_count()}}
 
     @app.get("/api/incidents/{incident_id}")
     def incident_detail(request: Request, incident_id: int):
@@ -676,8 +717,10 @@ def create_app(
     def resolve(incident_id: int, body: ResolveBody):
         """Close an incident. Needs a written resolution summary, and only works once monitoring
         has confirmed recovery. Monitoring evidence is left exactly as it is."""
-        updates = body.model_dump(exclude_unset=True, exclude={"actor", "resolution_summary"})
-        db.resolve_incident(incident_id, body.actor, body.resolution_summary, updates, clock())
+        updates = body.model_dump(exclude_unset=True, exclude={"actor", "resolution_summary",
+                                              "confirm_unknown_recovery"})
+        db.resolve_incident(incident_id, body.actor, body.resolution_summary, updates, clock(),
+                            confirm_unknown=body.confirm_unknown_recovery)
         return changed(incident_id)
 
     @app.post("/api/incidents/{incident_id}/reopen", dependencies=[Depends(require_change)])
@@ -734,18 +777,43 @@ def create_app(
         }
 
     @app.get("/api/alerts")
-    def list_alerts(limit: int = Query(50, ge=1, le=500)):
-        """Recent state-change alerts, newest first (read-only)."""
+    def list_alerts(
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0, le=1_000_000),
+        view: Literal["all", "unresolved", "archived"] = "all",
+    ):
+        """Alerts, newest first (read-only; no alert is ever changed or deleted).
+
+        Without `view` this is what it always was: every recent alert ("all", the complete
+        original history). The dashboard asks for `view=unresolved`, which leaves out only alerts
+        linked to a RESOLVED incident (so alerts no incident covers always appear); `view=archived`
+        is exactly those linked to a resolved incident. Reopening an incident brings its alerts
+        back into "unresolved". Filtering, `limit` and `offset` are applied in SQL and `total` is
+        the size of the chosen view (`has_more` says whether more follow). With incident
+        management disabled there is nothing to archive, so every alert is shown."""
         now = clock()
+        shown = view if incidents_cfg.enabled else "all"
+        page = db.list_alerts(view=shown, limit=limit, offset=offset)
         alerts = [
             {
-                **row,
+                **{k: v for k, v in row.items()
+                   if k not in ("incident_id", "incident_review", "skipped_reason")},
                 "transition": f"{row['from_status']} -> {row['to_status']}",
                 "age_s": max(0.0, now - row["ts"]),
+                "incident_id": row["incident_id"],
+                "incident_display_id": (None if row["incident_id"] is None
+                                        else inc.display_id(row["incident_id"])),
+                "incident_review": row["incident_review"],
+                "not_in_incident": row["incident_id"] is None,
+                "skipped_reason": row["skipped_reason"],
             }
-            for row in db.recent_alerts(limit)
+            for row in page["rows"]
         ]
-        return {"server_time": now, "alerts": alerts}
+        return {
+            "server_time": now, "alerts": alerts, "view": shown, "limit": limit, "offset": offset,
+            "total": page["total"], "has_more": offset + len(alerts) < page["total"],
+            "counts": db.alert_view_counts(), "incidents_enabled": incidents_cfg.enabled,
+        }
 
     @app.get("/healthz")
     def healthz():

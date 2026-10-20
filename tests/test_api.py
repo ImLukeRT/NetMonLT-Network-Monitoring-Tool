@@ -144,7 +144,8 @@ def test_alerts_endpoint_is_empty_before_anything_happens(db, devices, inventory
     db.sync_devices(devices)
     app = create_app(inventory, db, SimulatedProber(), start_collector=False, clock=FakeClock(5.0))
     with TestClient(app) as client:
-        assert client.get("/api/alerts").json() == {"server_time": 5.0, "alerts": []}
+        body = client.get("/api/alerts").json()
+    assert (body["server_time"], body["alerts"], body["total"]) == (5.0, [], 0)
 
 
 def test_alerts_endpoint_returns_newest_first_with_all_fields(db, devices, inventory):
@@ -161,11 +162,15 @@ def test_alerts_endpoint_returns_newest_first_with_all_fields(db, devices, inven
         body = client.get("/api/alerts").json()
     assert body["server_time"] == 260.0
     first, second = body["alerts"]
-    assert first == {
+    # the original alert fields are exactly as before (the incident link fields are additions)
+    assert {k: first[k] for k in (
+        "id", "device", "ts", "severity", "from_status", "to_status", "transition", "message",
+        "age_s")} == {
         "id": 2, "device": "beta", "ts": 200.0, "severity": "info", "from_status": "down",
         "to_status": "up", "transition": "down -> up", "message": "beta went up at 200.0",
         "age_s": 60.0,
     }
+    assert first["incident_id"] is None and first["not_in_incident"] is True
     assert (second["device"], second["severity"], second["transition"]) == (
         "alpha", "critical", "up -> down"
     )

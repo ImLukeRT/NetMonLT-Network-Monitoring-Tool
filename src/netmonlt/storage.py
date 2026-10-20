@@ -139,7 +139,9 @@ CREATE TABLE IF NOT EXISTS incidents (
     simulated            INTEGER NOT NULL DEFAULT 0,
     run_started_ts       REAL,
     report               TEXT NOT NULL DEFAULT '{}',
-    evidence             TEXT NOT NULL DEFAULT '{}'
+    evidence             TEXT NOT NULL DEFAULT '{}',
+    origin               TEXT NOT NULL DEFAULT 'live',
+    import_id            INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_device ON incidents(device, opened_ts);
 CREATE INDEX IF NOT EXISTS idx_incidents_review ON incidents(review_state, last_alert_ts);
@@ -166,6 +168,31 @@ CREATE TRIGGER IF NOT EXISTS incident_events_no_delete BEFORE DELETE ON incident
 BEGIN SELECT RAISE(ABORT, 'incident events are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS incidents_no_delete BEFORE DELETE ON incidents
 BEGIN SELECT RAISE(ABORT, 'incidents are never deleted'); END;
+-- Historical import: every import is recorded, and so is every alert it chose not to place in an
+-- incident (with the reason), so such alerts are not offered as import candidates again. Both
+-- tables are append-only, like the event trail.
+CREATE TABLE IF NOT EXISTS incident_imports (
+    id                 INTEGER PRIMARY KEY,
+    ts                 REAL NOT NULL,
+    actor              TEXT NOT NULL,
+    alerts_considered  INTEGER NOT NULL,
+    incidents_created  INTEGER NOT NULL,
+    alerts_skipped     INTEGER NOT NULL,
+    fingerprint        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS incident_import_skips (
+    alert_id  INTEGER PRIMARY KEY,
+    import_id INTEGER NOT NULL REFERENCES incident_imports(id),
+    reason    TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS incident_imports_no_update BEFORE UPDATE ON incident_imports
+BEGIN SELECT RAISE(ABORT, 'import records are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS incident_imports_no_delete BEFORE DELETE ON incident_imports
+BEGIN SELECT RAISE(ABORT, 'import records are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS incident_import_skips_no_update BEFORE UPDATE ON incident_import_skips
+BEGIN SELECT RAISE(ABORT, 'import records are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS incident_import_skips_no_delete BEFORE DELETE ON incident_import_skips
+BEGIN SELECT RAISE(ABORT, 'import records are append-only'); END;
 -- How far through the alert log incidents have been built. On a database that already holds
 -- alerts it starts at the newest one: earlier alerts stay in the event log, unchanged, and are
 -- not retroactively turned into "awaiting review" incidents.
@@ -262,7 +289,8 @@ def _wifi_reading_from_row(row: sqlite3.Row) -> WifiReading:
 _INCIDENT_COLUMNS = (
     "id, device, kind, severity, opened_ts, last_alert_ts, monitoring_state, recovered_ts, "
     "flap_count, review_state, acknowledged_ts, acknowledged_by, resolved_ts, resolved_by, "
-    "reopened_count, previous_incident_id, simulated, run_started_ts, report, evidence"
+    "reopened_count, previous_incident_id, simulated, run_started_ts, report, evidence, "
+    "origin, import_id"
 )
 _EVENT_COLUMNS = (
     "id, incident_id, ts, source, kind, actor, severity, from_status, to_status, alert_id, text"
@@ -288,6 +316,7 @@ def _incident_from_row(row: sqlite3.Row) -> inc.Incident:
         reopened_count=row["reopened_count"], previous_incident_id=row["previous_incident_id"],
         simulated=bool(row["simulated"]), run_started_ts=row["run_started_ts"],
         report=_json_dict(row["report"]), evidence=_json_dict(row["evidence"]),
+        origin=row["origin"], import_id=row["import_id"],
     )
 
 
@@ -379,6 +408,18 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._upgrade_incident_columns()
+
+    def _upgrade_incident_columns(self) -> None:
+        """Add the columns a database created by an earlier Stage 10 build lacks. Adding a column
+        with a default leaves every existing row and value exactly as it was."""
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(incidents)")}
+        with self._conn:
+            if "origin" not in existing:
+                self._conn.execute(
+                    "ALTER TABLE incidents ADD COLUMN origin TEXT NOT NULL DEFAULT 'live'")
+            if "import_id" not in existing:
+                self._conn.execute("ALTER TABLE incidents ADD COLUMN import_id INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -656,8 +697,12 @@ class Database:
         unresolved, and the stored snapshot once it is resolved (so it stays as it was)."""
         if incident.review_state == inc.REV_RESOLVED and incident.evidence:
             return incident.evidence
-        end = (incident.recovered_ts if incident.monitoring_state == inc.MON_RECOVERED
-               and incident.recovered_ts is not None else now)
+        if incident.monitoring_state == inc.MON_RECOVERED and incident.recovered_ts is not None:
+            end = incident.recovered_ts
+        elif incident.monitoring_state == inc.MON_UNKNOWN:
+            end = incident.last_alert_ts  # nothing is known beyond the last recorded alert
+        else:
+            end = now
         recovered = (incident.recovered_ts if incident.monitoring_state == inc.MON_RECOVERED
                      else None)
         with self._lock:
@@ -697,6 +742,7 @@ class Database:
             "open": "review_state = 'open' AND reopened_count = 0",
             "acknowledged": "review_state = 'acknowledged'",
             "recovered": "monitoring_state = 'recovered' AND review_state != 'resolved'",
+            "unknown": "monitoring_state = 'unknown' AND review_state != 'resolved'",
             "reopened": "reopened_count > 0 AND review_state != 'resolved'",
             "resolved": "review_state = 'resolved'",
         }
@@ -720,17 +766,139 @@ class Database:
         """How many monitoring alerts (not operator actions) an incident groups."""
         with self._lock:
             return self._conn.execute(
-                "SELECT COUNT(*) FROM incident_events WHERE incident_id=? AND source=?",
-                (incident_id, inc.SRC_MONITORING),
+                "SELECT COUNT(*) FROM incident_events WHERE incident_id=? AND alert_id IS NOT NULL",
+                (incident_id,),
             ).fetchone()[0]
 
     def incident_counts(self) -> dict:
         with self._lock:
             row = self._conn.execute(
                 "SELECT SUM(review_state != 'resolved'), SUM(review_state = 'resolved'), "
-                "SUM(review_state = 'open' AND monitoring_state = 'recovered') FROM incidents"
+                "SUM(review_state = 'open' AND monitoring_state = 'recovered'), "
+                "SUM(review_state != 'resolved' AND monitoring_state = 'unknown') FROM incidents"
             ).fetchone()
-        return {"active": row[0] or 0, "history": row[1] or 0, "awaiting_review": row[2] or 0}
+        return {"active": row[0] or 0, "history": row[1] or 0, "awaiting_review": row[2] or 0,
+                "recovery_unknown": row[3] or 0}
+
+    # ---- historical import: turn stored alerts that no incident covers into incidents
+    def _import_candidates(self, cfg: IncidentsConfig) -> list[inc.HistoricalAlert]:
+        """Alerts the live engine has already passed (id <= cursor) that no incident references and
+        no earlier import skipped, oldest first (lock held by the caller)."""
+        cursor = self._conn.execute(
+            "SELECT last_alert_id FROM incident_cursor WHERE id=1").fetchone()[0]
+        rows = self._conn.execute(
+            "SELECT a.id, a.device, a.ts, a.severity, a.from_status, a.to_status, a.message "
+            "FROM alerts a WHERE a.id <= ? "
+            "AND NOT EXISTS (SELECT 1 FROM incident_events e WHERE e.alert_id = a.id) "
+            "AND NOT EXISTS (SELECT 1 FROM incident_import_skips s WHERE s.alert_id = a.id) "
+            "ORDER BY a.id", (cursor,)).fetchall()
+        return [inc.HistoricalAlert(r["id"], r["device"], r["ts"], r["severity"],
+                                    r["from_status"], r["to_status"], r["message"]) for r in rows]
+
+    def import_candidate_count(self) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT last_alert_id FROM incident_cursor WHERE id=1").fetchone()[0]
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM alerts a WHERE a.id <= ? "
+                "AND NOT EXISTS (SELECT 1 FROM incident_events e WHERE e.alert_id = a.id) "
+                "AND NOT EXISTS (SELECT 1 FROM incident_import_skips s WHERE s.alert_id = a.id)",
+                (cursor,)).fetchone()[0]
+
+    def preview_import(self, cfg: IncidentsConfig) -> inc.ImportPlan:
+        """What an import would create right now. Reads only."""
+        with self._lock:
+            alerts = self._import_candidates(cfg)
+        return inc.plan_import(alerts, window_s=cfg.correlation_window_s)
+
+    def apply_import(
+        self, cfg: IncidentsConfig, *, simulated: bool, actor, fingerprint: str, now: float,
+    ) -> dict:
+        """Create the incidents the preview described, in ONE transaction (so an interrupted
+        import leaves nothing behind) and under the same lock as live processing (so the two can
+        never interleave). Only inserts: no existing incident, event or alert is changed. The
+        alerts it cannot place are recorded, with the reason, and are not offered again."""
+        actor = inc.clean_actor(actor)
+        with self._lock, self._conn:
+            plan = inc.plan_import(self._import_candidates(cfg),
+                                   window_s=cfg.correlation_window_s)
+            if plan.fingerprint != fingerprint:
+                raise inc.IncidentError(
+                    inc.IncidentError.STALE,
+                    "the alert history changed since this preview: preview the import again")
+            if not plan.considered:
+                return {"import_id": None, "incidents_created": 0, "alerts_linked": 0,
+                        "alerts_skipped": 0}
+            import_id = self._conn.execute(
+                "INSERT INTO incident_imports(ts, actor, alerts_considered, incidents_created, "
+                "alerts_skipped, fingerprint) VALUES (?, ?, ?, ?, ?, ?)",
+                (now, actor, plan.considered, len(plan.drafts), len(plan.skipped),
+                 plan.fingerprint)).lastrowid
+            previous: dict[str, int] = {}
+            linked = 0
+            for draft in plan.drafts:
+                new_id = self._conn.execute(
+                    "INSERT INTO incidents(device, kind, severity, opened_ts, last_alert_ts, "
+                    "monitoring_state, recovered_ts, flap_count, review_state, "
+                    "previous_incident_id, simulated, run_started_ts, origin, import_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                    (draft.device, inc.KIND_ICMP, draft.severity, draft.opened_ts,
+                     draft.last_alert_ts, draft.monitoring_state, draft.recovered_ts,
+                     draft.flap_count, inc.REV_OPEN, previous.get(draft.device), int(simulated),
+                     inc.ORIGIN_IMPORTED, import_id)).lastrowid
+                previous[draft.device] = new_id
+                for alert, kind in draft.events:
+                    self._insert_incident_event(
+                        new_id, alert.ts, inc.SRC_MONITORING, kind, severity=alert.severity,
+                        from_status=alert.from_status, to_status=alert.to_status,
+                        alert_id=alert.id, text=alert.message)
+                    linked += 1
+                self._insert_incident_event(
+                    new_id, now, inc.SRC_MONITORING, inc.EV_IMPORTED, actor=actor,
+                    text=f"Created from {len(draft.events)} stored alert(s) by import "
+                         f"#{import_id}; the alerts above are the original ones.")
+                end = (draft.recovered_ts if draft.monitoring_state == inc.MON_RECOVERED
+                       else draft.last_alert_ts)
+                self._store_evidence(new_id, draft.device, draft.opened_ts, draft.recovered_ts,
+                                     end)
+            self._conn.executemany(
+                "INSERT INTO incident_import_skips(alert_id, import_id, reason) VALUES (?, ?, ?)",
+                [(alert_id, import_id, reason) for alert_id, reason in plan.skipped])
+        return {"import_id": import_id, "incidents_created": len(plan.drafts),
+                "alerts_linked": linked, "alerts_skipped": len(plan.skipped)}
+
+    # ---- the Recent alerts view: filtered by what the linked incident's review state is
+    _ARCHIVED = (
+        "EXISTS (SELECT 1 FROM incident_events e JOIN incidents i ON i.id = e.incident_id "
+        "WHERE e.alert_id = a.id AND i.review_state = 'resolved')"
+    )
+
+    def list_alerts(self, *, view: str = "unresolved", limit: int = 50, offset: int = 0) -> dict:
+        """Alerts newest first, with their incident link. `view`: "unresolved" (everything except
+        alerts linked to a RESOLVED incident: unmatched alerts always appear), "archived" (alerts
+        linked to a resolved incident) or "all". Filtering, the row limit and the offset are all
+        done here in SQL, and `total` is the size of the chosen view. Alerts are only read."""
+        where = {"unresolved": f"WHERE NOT {self._ARCHIVED}", "archived": f"WHERE {self._ARCHIVED}",
+                 "all": ""}[view]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT a.id, a.device, a.ts, a.severity, a.from_status, a.to_status, a.message, "
+                "(SELECT e.incident_id FROM incident_events e WHERE e.alert_id = a.id LIMIT 1) "
+                "AS incident_id, "
+                "(SELECT i.review_state FROM incident_events e JOIN incidents i "
+                "ON i.id = e.incident_id WHERE e.alert_id = a.id LIMIT 1) AS incident_review, "
+                "(SELECT s.reason FROM incident_import_skips s WHERE s.alert_id = a.id) "
+                f"AS skipped_reason FROM alerts a {where} "
+                "ORDER BY a.ts DESC, a.id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM alerts a {where}").fetchone()[0]
+        return {"rows": [dict(r) for r in rows], "total": total}
+
+    def alert_view_counts(self) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*), COALESCE(SUM({self._ARCHIVED}), 0) FROM alerts a").fetchone()
+        return {"all": row[0], "archived": row[1], "unresolved": row[0] - row[1]}
 
     # ---- operator actions: each validates the transition, then records it in one transaction
     def _load_for_update(self, incident_id: int) -> inc.Incident:
@@ -788,7 +956,8 @@ class Database:
             return self._load_for_update(incident_id)
 
     def resolve_incident(
-        self, incident_id: int, actor, summary, updates, now: float
+        self, incident_id: int, actor, summary, updates, now: float, *,
+        confirm_unknown: bool = False,
     ) -> inc.Incident:
         """Close an incident. Needs a written resolution summary, and monitoring must already
         have confirmed recovery. The monitoring state and evidence are left exactly as they are."""
@@ -798,7 +967,7 @@ class Database:
                                  min_len=inc.MIN_SUMMARY_LEN)
         with self._lock, self._conn:
             incident = self._load_for_update(incident_id)
-            inc.check_resolve(incident)
+            inc.check_resolve(incident, confirm_unknown=confirm_unknown)
             changes = inc.normalize_report_update(
                 {**dict(updates or {}), "resolution_summary": summary}, incident.report
             )
@@ -807,10 +976,14 @@ class Database:
                 "UPDATE incidents SET review_state=?, resolved_ts=?, resolved_by=? WHERE id=?",
                 (inc.REV_RESOLVED, now, actor, incident_id),
             )
-            self._insert_incident_event(incident_id, now, inc.SRC_OPERATOR, inc.EV_RESOLVED,
-                                        actor=actor, text=summary)
-            self._store_evidence(incident_id, incident.device, incident.opened_ts,
-                                 incident.recovered_ts, incident.recovered_ts or now)
+            unknown = incident.monitoring_state == inc.MON_UNKNOWN
+            self._insert_incident_event(
+                incident_id, now, inc.SRC_OPERATOR, inc.EV_RESOLVED, actor=actor,
+                text=summary + ("\n[Monitoring never recorded a recovery for this fault; the "
+                                "operator confirmed they understand this.]" if unknown else ""))
+            self._store_evidence(
+                incident_id, incident.device, incident.opened_ts, incident.recovered_ts,
+                incident.last_alert_ts if unknown else (incident.recovered_ts or now))
             return self._load_for_update(incident_id)
 
     def reopen_incident(self, incident_id: int, actor, reason, now: float) -> inc.Incident:
