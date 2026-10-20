@@ -36,8 +36,8 @@ def test_labels_tick_every_second_from_a_single_timer():
 
 def test_the_data_refresh_intervals_are_unchanged():
     assert [(n, int(ms)) for n, ms in intervals() if n != "tickAges"] == [
-        ("refreshChart", 5000), ("refreshQuality", 5000), ("refreshInterfaces", 5000),
-        ("refresh", 3000),
+        ("refreshChart", 5000), ("refreshQuality", 5000), ("refreshWifi", 5000),
+        ("refreshInterfaces", 5000), ("refresh", 3000),
     ]
 
 
@@ -86,6 +86,47 @@ def test_quality_is_drawn_with_text_nodes_only():
 def test_missing_quality_figures_are_shown_as_dashes_not_zero():
     assert 'v === null || v === undefined ? "–"' in PAGE
     assert "const fmtOptMs" in PAGE and "const fmtPct" in PAGE
+
+
+# ------------------------------------------------------------------ the Wi-Fi panel
+def test_the_wifi_panel_is_hidden_until_the_api_says_it_is_enabled():
+    assert 'id="w-panel" hidden' in PAGE
+    assert "if (!data.enabled) { wPanel.hidden = true; return; }" in PAGE
+    assert PAGE.index('"/api/wifi/history?window_s="') > PAGE.index("if (!data.enabled)")
+
+
+def test_the_wifi_panel_states_what_it_does_and_does_not_do():
+    text = " ".join(PAGE.split())
+    for needle in ("Wi-Fi signal (this computer)", "Local only", "never scans for nearby networks",
+                   "never records other networks' names", "never connects to anything",
+                   "never calculated from the percentage", "not measured throughput",
+                   "A dash means unavailable, not zero", "SIMULATED WI-FI DATA"):
+        assert needle in text, needle
+
+
+def test_wifi_never_derives_rssi_from_the_signal_percentage():
+    block = PAGE[PAGE.index("function renderWifi"):PAGE.index("function wSummaryText")]
+    assert "signal_pct" in block and "rssi_dbm" in block
+    # the RSSI row reads only the API's rssi_dbm; there is no arithmetic that makes dBm from %
+    assert "signal_pct / 2" not in block and "- 100" not in block and "-100" not in block
+    assert "never converts the signal quality % into dBm" in block
+
+
+def test_the_wifi_chart_never_draws_a_disconnection_as_a_zero_signal():
+    block = PAGE[PAGE.index("function drawWifiChart"):PAGE.index("async function refreshWifi")]
+    assert "p.signal_mean === null" in block  # no signal: breaks the line
+    assert '"data-kind": "notconnected"' in block and "offzone" in block
+
+
+def test_the_wifi_last_observation_label_is_a_live_one_second_label():
+    block = PAGE[PAGE.index("function renderWifi"):PAGE.index("function wSummaryText")]
+    assert 'setAge(when, cur.age_s, "seconds")' in block
+
+
+def test_the_wifi_window_buttons_do_not_drive_the_latency_chart():
+    assert 'class="wwin"' in PAGE and "data-wwindow" in PAGE
+    assert 'querySelectorAll(".windows button")' in PAGE  # the latency chart's own group
+    assert 'querySelectorAll(".wwin button")' in PAGE
 
 
 # ------------------------------------------------------------------ the arithmetic, in Node.js

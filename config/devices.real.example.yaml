@@ -23,6 +23,19 @@ poll_interval_s: 10      # minimum 5 in real mode
 #   loss_pct: {excellent: 0.5, good: 2, fair: 5}
 #   window_s: 900
 
+# Optional, OFF unless enabled: monitor THIS computer's own Wi-Fi link (Windows 11 only for now).
+# It only reads the state of the adapter that is already there: it never scans for nearby
+# networks, never collects other people's network names and never connects to anything. The
+# network name is masked by default and is never written to the log.
+# wifi:
+#   enabled: true
+#   poll_interval_s: 10       # minimum 5
+#   backend: auto             # auto (native WLAN API, then netsh), wlanapi or netsh
+#   ssid_privacy: masked      # masked (default), full or hidden
+#   low_signal_pct: 40        # warn at or below this signal quality (percent) ...
+#   warn_after_polls: 3       # ... for this many polls in a row
+#   retention_days: 7
+
 devices:
   # Your own computer over the loopback interface: always safe to try.
   - name: this-machine

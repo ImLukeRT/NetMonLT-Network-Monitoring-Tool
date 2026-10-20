@@ -16,17 +16,30 @@ from netmonlt.domain import (
     SNMP_AUTH_PROTOCOLS,
     SNMP_PRIV_PROTOCOLS,
     SNMP_SECURITY_LEVELS,
+    WIFI_BACKENDS,
+    WIFI_SSID_PRIVACY,
     Device,
     QualityConfig,
     QualityThresholds,
     SimInterface,
     SimProfile,
     SnmpConfig,
+    WifiConfig,
+    WifiSimProfile,
 )
 from netmonlt.probes.icmp import TargetError, validate_target
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # used in URLs, so keep it URL-safe
-_TOP_KEYS = {"mode", "poll_interval_s", "snmp_poll_interval_s", "quality", "devices"}
+_TOP_KEYS = {"mode", "poll_interval_s", "snmp_poll_interval_s", "quality", "wifi", "devices"}
+_WIFI_KEYS = {
+    "enabled", "poll_interval_s", "backend", "ssid_privacy", "low_signal_pct",
+    "warn_after_polls", "retention_days", "sim",
+}
+_WIFI_SIM_KEYS = {
+    "ssid", "base_signal_pct", "dip_at_s", "dip_duration_s", "dip_signal_pct",
+    "disconnect_at_s", "disconnect_duration_s",
+}
+REAL_MIN_WIFI_INTERVAL_S = 5.0
 _QUALITY_KEYS = {
     "latency_ms", "jitter_ms", "loss_pct", "window_s", "min_checks", "min_jitter_pairs",
     "max_gap_fraction",
@@ -97,6 +110,7 @@ class Inventory:
     devices: tuple[Device, ...]
     snmp_poll_interval_s: float = 30.0
     quality: QualityConfig = field(default_factory=QualityConfig)
+    wifi: WifiConfig = field(default_factory=WifiConfig)
 
     @property
     def snmp_devices(self) -> tuple[Device, ...]:
@@ -139,6 +153,7 @@ def parse_inventory(raw: Any) -> Inventory:
     )
 
     quality = _parse_quality(raw.get("quality"))
+    wifi = _parse_wifi(raw.get("wifi"), mode)
 
     raw_devices = raw.get("devices")
     if not isinstance(raw_devices, list) or not raw_devices:
@@ -158,6 +173,7 @@ def parse_inventory(raw: Any) -> Inventory:
         devices=tuple(devices),
         snmp_poll_interval_s=snmp_interval,
         quality=quality,
+        wifi=wifi,
     )
 
 
@@ -187,6 +203,81 @@ def _parse_quality(raw: Any) -> QualityConfig:
         min_checks=whole("min_checks", 2, 100_000),
         min_jitter_pairs=whole("min_jitter_pairs", 1, 100_000),
         max_gap_fraction=fraction,
+    )
+
+
+def _parse_wifi(raw: Any, mode: str) -> WifiConfig:
+    """The optional `wifi:` block. Monitoring this computer's Wi-Fi is off unless enabled."""
+    if raw is None:
+        return WifiConfig()
+    if not isinstance(raw, dict):
+        raise InventoryError("wifi must be a mapping")
+    _reject_unknown(raw, _WIFI_KEYS, "wifi")
+    defaults = WifiConfig()
+    enabled = raw.get("enabled", defaults.enabled)
+    if not isinstance(enabled, bool):
+        raise InventoryError("wifi.enabled must be true or false")
+
+    def choice(key: str, allowed: tuple[str, ...]) -> str:
+        value = raw.get(key, getattr(defaults, key))
+        if value not in allowed:
+            raise InventoryError(f"wifi.{key} must be one of {', '.join(allowed)}, not {value!r}")
+        return value
+
+    def whole(key: str, minimum: int, maximum: int) -> int:
+        value = _number(raw.get(key, getattr(defaults, key)), f"wifi.{key}", minimum, maximum)
+        if value != int(value):
+            raise InventoryError(f"wifi.{key} must be a whole number")
+        return int(value)
+
+    minimum = REAL_MIN_WIFI_INTERVAL_S if mode == "real" else 1.0
+    interval = _number(
+        raw.get("poll_interval_s", defaults.poll_interval_s), "wifi.poll_interval_s", minimum
+    )
+    return WifiConfig(
+        enabled=enabled,
+        poll_interval_s=interval,
+        backend=choice("backend", WIFI_BACKENDS),
+        ssid_privacy=choice("ssid_privacy", WIFI_SSID_PRIVACY),
+        low_signal_pct=whole("low_signal_pct", 0, 100),
+        warn_after_polls=whole("warn_after_polls", 1, 1000),
+        retention_days=whole("retention_days", 1, 90),
+        sim=_parse_wifi_sim(raw.get("sim")),
+    )
+
+
+def _parse_wifi_sim(raw: Any) -> WifiSimProfile:
+    if raw is None:
+        return WifiSimProfile()
+    if not isinstance(raw, dict):
+        raise InventoryError("wifi.sim must be a mapping")
+    _reject_unknown(raw, _WIFI_SIM_KEYS, "wifi.sim")
+    d = WifiSimProfile()
+    ssid = raw.get("ssid", d.ssid)
+    if not isinstance(ssid, str) or not 1 <= len(ssid) <= 32:
+        raise InventoryError("wifi.sim.ssid must be a text of 1 to 32 characters")
+
+    def pct(key: str, default: int) -> int:
+        value = _number(raw.get(key, default), f"wifi.sim.{key}", 1, 100)
+        if value != int(value):
+            raise InventoryError(f"wifi.sim.{key} must be a whole number")
+        return int(value)
+
+    def optional(key: str, default: float | None) -> float | None:
+        value = raw.get(key, default)
+        return None if value is None else _number(value, f"wifi.sim.{key}", 0)
+
+    def duration(key: str, default: float) -> float:
+        return _number(raw.get(key, default), f"wifi.sim.{key}", 0.1)
+
+    return WifiSimProfile(
+        ssid=ssid,
+        base_signal_pct=pct("base_signal_pct", d.base_signal_pct),
+        dip_at_s=optional("dip_at_s", d.dip_at_s),
+        dip_duration_s=duration("dip_duration_s", d.dip_duration_s),
+        dip_signal_pct=pct("dip_signal_pct", d.dip_signal_pct),
+        disconnect_at_s=optional("disconnect_at_s", d.disconnect_at_s),
+        disconnect_duration_s=duration("disconnect_duration_s", d.disconnect_duration_s),
     )
 
 

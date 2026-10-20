@@ -20,6 +20,26 @@ quality:
   min_jitter_pairs: 3      # jitter needs this many pairs of consecutive successful checks
   max_gap_fraction: 0.5    # more of the window than this unmeasured: Unknown (sparse history)
 
+# Wi-Fi signal monitoring of THIS computer's own wireless link. It is opt-in (off unless
+# `enabled: true`) and local-only: it never scans for nearby networks or joins one. In this
+# simulated demo it shows scripted, deterministic telemetry, clearly labelled as simulated;
+# in real mode it would read the real adapter (Windows only, see the README).
+wifi:
+  enabled: true
+  poll_interval_s: 5       # real mode: minimum 5
+  ssid_privacy: masked     # masked (default), full or hidden: what is stored and shown
+  low_signal_pct: 40       # warn when the signal quality is at or below this ...
+  warn_after_polls: 3      # ... for this many polls in a row
+  retention_days: 7        # older observations are deleted
+  sim:                     # simulated mode only: the scripted link (seconds after start)
+    ssid: HomeWiFi
+    base_signal_pct: 80
+    dip_at_s: 60           # the signal drops to dip_signal_pct ...
+    dip_duration_s: 40     # ... for this long (triggers the low-signal warning)
+    dip_signal_pct: 25
+    disconnect_at_s: 130   # then the link drops entirely ...
+    disconnect_duration_s: 20  # ... for this long
+
 devices:
   - name: core-router
     address: 192.0.2.1

@@ -7,12 +7,14 @@ One shared connection guarded by a lock: the collector (event loop) and the API
 import sqlite3
 import threading
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from netmonlt.alerts import Alert, AlertState
 from netmonlt.domain import CheckResult, Device, Status
 from netmonlt.ifstats import STATUS_OK, InterfaceState, SnmpStatus
 from netmonlt.quality import CheckSample
+from netmonlt.wifi import WifiReading, WifiSample
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -84,6 +86,32 @@ CREATE TABLE IF NOT EXISTS interface_state (
     rate_note          TEXT,
     PRIMARY KEY (device, if_index)
 );
+-- This computer's own Wi-Fi link (opt-in). One status row, plus one row per successful look at
+-- the adapter, kept for a bounded time. The SSID is stored as the privacy setting allows
+-- (masked by default); the access point's MAC address and the profile name are never stored.
+CREATE TABLE IF NOT EXISTS wifi_status (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    ts         REAL NOT NULL,
+    status     TEXT NOT NULL,
+    message    TEXT,
+    last_ok_ts REAL
+);
+CREATE TABLE IF NOT EXISTS wifi_observations (
+    id          INTEGER PRIMARY KEY,
+    ts          REAL NOT NULL,
+    state       TEXT NOT NULL,
+    ssid        TEXT,
+    interface   TEXT,
+    signal_pct  INTEGER,
+    rssi_dbm    INTEGER,
+    rssi_source TEXT,
+    rx_mbps     REAL,
+    tx_mbps     REAL,
+    radio_type  TEXT,
+    channel     INTEGER,
+    source      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wifi_ts ON wifi_observations(ts);
 """
 
 _STATE_COLUMNS = (
@@ -91,6 +119,31 @@ _STATE_COLUMNS = (
     "in_discards, out_discards, interval_s, in_bps, out_bps, in_errors_delta, out_errors_delta, "
     "in_discards_delta, out_discards_delta, rate_note"
 )
+
+
+@dataclass(frozen=True)
+class WifiStatus:
+    """The outcome of the latest Wi-Fi poll."""
+
+    ts: float
+    status: str
+    message: str | None
+    last_ok_ts: float | None
+
+
+_WIFI_COLUMNS = (
+    "ts, state, ssid, interface, signal_pct, rssi_dbm, rssi_source, rx_mbps, tx_mbps, "
+    "radio_type, channel, source"
+)
+
+
+def _wifi_reading_from_row(row: sqlite3.Row) -> WifiReading:
+    return WifiReading(
+        state=row["state"], ssid=row["ssid"], interface=row["interface"],
+        signal_pct=row["signal_pct"], rssi_dbm=row["rssi_dbm"], rssi_source=row["rssi_source"],
+        rx_mbps=row["rx_mbps"], tx_mbps=row["tx_mbps"], radio_type=row["radio_type"],
+        channel=row["channel"], source=row["source"],
+    )
 
 
 def _text(value: int | None) -> str | None:
@@ -292,6 +345,80 @@ class Database:
             ).fetchall()
         samples = [CheckSample(r["ts"], r["sent"], r["received"], r["rtt_avg_ms"]) for r in rows]
         return samples, first_ts, last_ts
+
+    # ---- this computer's Wi-Fi link
+    def save_wifi_observation(self, ts: float, reading: WifiReading) -> None:
+        """Store a successful look at the adapter and mark the poll as ok. The reading must
+        already have had the SSID privacy setting applied."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO wifi_observations(" + _WIFI_COLUMNS + ") "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, reading.state, reading.ssid, reading.interface, reading.signal_pct,
+                 reading.rssi_dbm, reading.rssi_source, reading.rx_mbps, reading.tx_mbps,
+                 reading.radio_type, reading.channel, reading.source),
+            )
+            self._conn.execute(
+                "INSERT INTO wifi_status(id, ts, status, message, last_ok_ts) "
+                "VALUES (1, ?, ?, NULL, ?) ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, "
+                "status=excluded.status, message=NULL, last_ok_ts=excluded.last_ok_ts",
+                (ts, "ok", ts),
+            )
+
+    def save_wifi_failure(self, ts: float, category: str, message: str) -> None:
+        """Record that a poll produced no observation. Stored history is left as it was."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO wifi_status(id, ts, status, message) VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET ts=excluded.ts, status=excluded.status, "
+                "message=excluded.message",
+                (ts, category, message),
+            )
+
+    def get_wifi_status(self) -> WifiStatus | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM wifi_status WHERE id=1").fetchone()
+        return None if row is None else WifiStatus(
+            row["ts"], row["status"], row["message"], row["last_ok_ts"]
+        )
+
+    def latest_wifi(self, limit: int = 1) -> list[tuple[WifiReading, float]]:
+        """The newest stored observations as (reading, ts), newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_WIFI_COLUMNS} FROM wifi_observations ORDER BY ts DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [(_wifi_reading_from_row(r), r["ts"]) for r in rows]
+
+    def wifi_samples(
+        self, start: float, end: float
+    ) -> tuple[list[WifiSample], float | None, float | None]:
+        """Observations in [start, end], oldest first, plus the first and last ever stored."""
+        with self._lock:
+            first, last = self._conn.execute(
+                "SELECT MIN(ts), MAX(ts) FROM wifi_observations"
+            ).fetchone()
+            rows = self._conn.execute(
+                "SELECT ts, state, signal_pct, rssi_dbm, rx_mbps, tx_mbps FROM wifi_observations "
+                "WHERE ts BETWEEN ? AND ? ORDER BY ts, id", (start, end),
+            ).fetchall()
+        samples = [WifiSample(r["ts"], r["state"], r["signal_pct"], r["rssi_dbm"], r["rx_mbps"],
+                              r["tx_mbps"]) for r in rows]
+        return samples, first, last
+
+    def prune_wifi(self, older_than: float, max_rows: int) -> int:
+        """Delete observations older than `older_than`, then the oldest beyond `max_rows`."""
+        with self._lock, self._conn:
+            deleted = self._conn.execute(
+                "DELETE FROM wifi_observations WHERE ts < ?", (older_than,)
+            ).rowcount
+            deleted += self._conn.execute(
+                "DELETE FROM wifi_observations WHERE id <= "
+                "(SELECT id FROM wifi_observations ORDER BY id DESC LIMIT 1 OFFSET ?)",
+                (max_rows,),
+            ).rowcount
+        return deleted
 
     # ---- SNMP interface statistics
     def get_snmp_status(self, device: str) -> SnmpStatus | None:

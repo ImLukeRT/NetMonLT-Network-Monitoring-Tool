@@ -122,6 +122,22 @@
           z-index:2; }
   .sw-ref { height:0 !important; border-top:2px dashed var(--muted); vertical-align:3px !important; }
   .sw-noloss { background:var(--f-up); }
+  #w-panel[hidden] { display:none; }
+  #w-note { font-size:13px; padding:6px 10px; border-radius:6px; margin:0 0 8px;
+            background:var(--down-bg); color:var(--down); }
+  #w-note:empty { display:none; }
+  #w-warning { margin:0; border-radius:0; }
+  #w-card th, #w-card td { padding-left:10px; padding-right:10px; }
+  #w-card td.prov { white-space:normal; color:var(--muted); font-size:13px; }
+  #w-card td.na { cursor:help; }
+  .wwin { display:inline-flex; gap:4px; }
+  .wwin button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+                 border:1px solid var(--line); border-radius:6px; padding:3px 8px; cursor:pointer; }
+  .wwin button[aria-pressed="true"] { background:var(--fg); color:var(--bg); border-color:var(--fg); }
+  #w-chart-card { margin-top:12px; }
+  .qchart .wband { fill:var(--accent); opacity:.16; }
+  .qchart .offzone { fill:var(--f-down); opacity:.22; }
+  .sw-off { background:var(--f-down); opacity:.5; }
   #if-panel[hidden] { display:none; }
   .if-head { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:center; margin:28px 0 8px; }
   .if-head h2 { margin:0; }
@@ -229,6 +245,53 @@
         <span><i class="sw-noloss"></i>Measured, no loss</span>
         <span><i class="sw-ref"></i>Your Excellent / Good / Fair limits</span>
         <span><i class="sw-gap"></i>No data: not measured</span>
+      </div>
+    </div>
+  </section>
+  <section id="w-panel" hidden>
+    <div class="if-head">
+      <h2>Wi-Fi signal (this computer)</h2>
+      <span id="w-badge" class="banner"></span>
+    </div>
+    <div id="w-note" role="status"></div>
+    <div class="wrap" id="w-card">
+      <div class="note" id="w-warning" role="status" hidden></div>
+      <table>
+        <thead><tr><th>Measurement</th><th>Value</th><th>Source</th></tr></thead>
+        <tbody id="w-rows"></tbody>
+      </table>
+      <div class="q-caption">
+        Local only: this reads the Wi-Fi adapter of the computer running NetMonLT. It never scans
+        for nearby networks, never records other networks' names and never connects to anything.
+        Signal quality is the percentage Windows reports (a vendor-defined figure, not dBm). RSSI
+        in dBm is shown only when the operating system itself reports one, and is never calculated
+        from the percentage. Link rates are the negotiated rates, not measured throughput. A dash
+        means unavailable, not zero.
+      </div>
+    </div>
+    <div class="wrap chart-card" id="w-chart-card">
+      <div class="chart-controls">
+        <div class="wwin" role="group" aria-label="Wi-Fi history window">
+          <button type="button" data-wwindow="900" aria-pressed="true">15 min</button>
+          <button type="button" data-wwindow="3600" aria-pressed="false">1 h</button>
+          <button type="button" data-wwindow="21600" aria-pressed="false">6 h</button>
+          <button type="button" data-wwindow="86400" aria-pressed="false">24 h</button>
+          <button type="button" data-wwindow="604800" aria-pressed="false">7 d</button>
+        </div>
+      </div>
+      <div class="q-chart-title">Signal quality over time</div>
+      <div class="qbox" id="w-chart-box">
+        <svg class="qchart" id="w-chart" role="img" aria-label="Wi-Fi signal quality over time"></svg>
+        <div class="qmsg" id="w-chart-msg">Loading…</div>
+        <div class="qtip" id="w-chart-tip" hidden></div>
+      </div>
+      <div id="w-summary" class="chart-summary-line"></div>
+      <div class="legend" aria-hidden="true">
+        <span><i class="sw-line"></i>Signal quality (mean)</span>
+        <span><i class="sw-band"></i>Min to max</span>
+        <span><i class="sw-off"></i>Not connected (observed)</span>
+        <span><i class="sw-ref"></i>Your low-signal limit</span>
+        <span><i class="sw-gap"></i>No data: not observed</span>
       </div>
     </div>
   </section>
@@ -939,6 +1002,239 @@ window.addEventListener("resize", () => {
   requestAnimationFrame(() => { qResizeQueued = false; if (qDetail) drawQuality(qDetail); });
 });
 setInterval(refreshQuality, 5000);
+
+// ---- Wi-Fi signal of this computer (opt-in; the panel stays hidden unless it is enabled) ----------
+// Each figure is reported by the OS, simulated, or null (unavailable, shown as a dash). RSSI in
+// dBm appears only if the OS reported it; it is never calculated from the signal percentage.
+const wPanel = document.getElementById("w-panel");
+const wRows = document.getElementById("w-rows");
+const wNote = document.getElementById("w-note");
+const wWarning = document.getElementById("w-warning");
+const wCard = document.getElementById("w-card");
+const wChartCard = document.getElementById("w-chart-card");
+const wBadge = document.getElementById("w-badge");
+const wSummary = document.getElementById("w-summary");
+let wWindow = 900, wDetail = null, wLoaded = false, wReq = 0;
+const W_STATE_CLASS = {connected: "up", disconnected: "down", connecting: "degraded",
+                       disconnecting: "degraded", not_ready: "degraded", unknown: "unknown"};
+const W_STATE_TEXT = {connected: "connected", disconnected: "disconnected", connecting: "connecting",
+                      disconnecting: "disconnecting", not_ready: "radio off or not ready", unknown: "unknown"};
+
+function wProvenance(data, tag) {
+  if (tag === "simulated") return "simulated";
+  if (tag === "reported") return "reported by " + data.source_label;
+  return "not available";
+}
+
+function wRow(label, value, data, tag, hint, provenance) {
+  const tr = document.createElement("tr");
+  const v = cell(value, "num" + (tag === "unavailable" ? " na" : ""));
+  if (tag === "unavailable" && hint) v.title = hint;
+  tr.append(cell(label), v, cell(provenance || wProvenance(data, tag), "prov"));
+  return tr;
+}
+
+function renderWifi(data) {
+  wPanel.hidden = false;
+  wBadge.textContent = data.simulated ? "SIMULATED WI-FI DATA" : "LOCAL · " + data.source_label;
+  wBadge.className = "banner" + (data.simulated ? "" : " live");
+  const st = data.status, cur = data.current;
+  const failed = st.status !== "ok" && st.status !== "pending";
+  wNote.textContent = failed ? "Wi-Fi unavailable: " + st.message + " (" + st.status.replace("_", " ") + ")"
+    : st.status === "pending" ? "Waiting for the first reading…" : "";
+  wRows.replaceChildren();
+  wCard.classList.toggle("offline", (failed || st.stale) && !!cur);
+  const w = data.warning;
+  wWarning.hidden = !w.low_signal;
+  if (w.low_signal) {
+    wWarning.textContent = "Low signal: quality has been at or below " + w.threshold_pct + "% for " +
+      w.consecutive_low + " readings in a row (since " + new Date(w.since * 1000).toLocaleTimeString() + ").";
+  }
+  if (!cur) return;
+  const f = cur.fields;
+  const state = document.createElement("tr");
+  const badgeCell = document.createElement("td");
+  const badge = document.createElement("span");
+  badge.className = "badge " + (W_STATE_CLASS[cur.state] || "unknown");
+  badge.textContent = W_STATE_TEXT[cur.state] || cur.state;
+  badgeCell.appendChild(badge);
+  const stateSource = cell(data.simulated ? "simulated" : "reported by " + data.source_label, "prov");
+  state.append(cell("Connection"), badgeCell, stateSource);
+  const rate = (cur.rx_mbps === null && cur.tx_mbps === null) ? "–"
+    : (cur.rx_mbps === null ? "–" : cur.rx_mbps + " Mbps") + " in / " + (cur.tx_mbps === null ? "–" : cur.tx_mbps + " Mbps") + " out";
+  const rateTag = (cur.rx_mbps === null && cur.tx_mbps === null) ? "unavailable" : f.rx_mbps !== "unavailable" ? f.rx_mbps : f.tx_mbps;
+  const notConn = cur.state === "connected" ? "" : "Not connected, so there is no link to measure. ";
+  const rssi = cur.rssi_dbm === null ? "–" : cur.rssi_dbm + " dBm";
+  const radio = [cur.radio_type, cur.channel === null ? null : "channel " + cur.channel].filter((x) => x !== null && x !== undefined).join(", ") || "–";
+  const sig = cur.signal_pct === null ? "–" : cur.signal_pct + " %";
+  wRows.append(
+    state,
+    wRow("Network (SSID, " + data.ssid_privacy + ")", cur.ssid === null ? "–" : cur.ssid, data, f.ssid,
+         notConn + (data.ssid_privacy === "hidden" ? "The network name is hidden by configuration" : "Not reported")),
+    wRow("Adapter", cur.interface === null ? "–" : cur.interface, data, f.interface, "Not reported"),
+    wRow("Signal quality", sig, data, f.signal_pct, notConn + "Not reported"),
+    wRow("RSSI", rssi, data,
+         cur.rssi_dbm === null ? "unavailable" : f.rssi_dbm,
+         notConn + "Not reported by this source. NetMonLT never converts the signal quality % into dBm.",
+         cur.rssi_dbm !== null && cur.rssi_source && !data.simulated ? "reported by " + cur.rssi_source : undefined),
+    wRow("Link rate (receive / transmit)", rate, data, rateTag, notConn + "Not reported"),
+    wRow("Radio type and channel", radio, data, f.radio_type !== "unavailable" ? f.radio_type : f.channel, notConn + "Not reported"),
+  );
+  const when = cell("", "num");
+  setAge(when, cur.age_s, "seconds");
+  const last = document.createElement("tr");
+  last.append(cell("Last observation"), when, cell(st.status === "ok" ? "" : "latest poll failed: " + st.status.replace("_", " "), "prov"));
+  wRows.appendChild(last);
+}
+
+function wSummaryText(d) {
+  const parts = ["Last " + windowLabel(d.window_s), d.observations + (d.observations === 1 ? " observation" : " observations") +
+                 ", each bar or point covers " + fmtDuration(d.bucket_s)];
+  if (d.gaps.length) parts.push(d.gaps.length + (d.gaps.length === 1 ? " gap" : " gaps") + " with no observations");
+  return parts.join(" · ");
+}
+
+function drawWifiChart(d) {
+  const svg = document.getElementById("w-chart"), box = document.getElementById("w-chart-box");
+  const msg = document.getElementById("w-chart-msg"), tip = document.getElementById("w-chart-tip");
+  const show = (text) => { svg.replaceChildren(); svg.style.display = "none"; tip.hidden = true; msg.textContent = text; msg.hidden = false; };
+  if (d.first_ts === null || d.points.length === 0) {
+    return show(d.first_ts === null ? "No observations yet." : "No observations in the last " + windowLabel(d.window_s) + ".");
+  }
+  msg.hidden = true;
+  svg.style.display = "block";
+  svg.replaceChildren();
+  const W = Math.max(320, box.clientWidth), H = 190;
+  const m = {l: 50, r: 14, t: 10, b: 28};
+  const pw = W - m.l - m.r, ph = H - m.t - m.b, bottom = m.t + ph;
+  const x0 = Math.min(Math.max(d.start, d.first_ts), d.end - 30), x1 = d.end, span = x1 - x0;
+  const xs = (t) => m.l + Math.min(1, Math.max(0, (t - x0) / span)) * pw;
+  const ys = (v) => bottom - (v / 100) * ph;   // signal quality is always 0 to 100
+  svg.setAttribute("width", W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.setAttribute("aria-label", "Wi-Fi signal quality. " + wSummaryText(d));
+  const defs = svgEl("defs", {}, svg);
+  const hatch = svgEl("pattern", {id: "w-hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}, defs);
+  svgEl("line", {x1: 0, y1: 0, x2: 0, y2: 6, class: "hatch-line"}, hatch);
+  for (const v of [0, 25, 50, 75, 100]) {
+    svgEl("line", {x1: m.l, x2: m.l + pw, y1: ys(v), y2: ys(v), class: "grid"}, svg);
+    svgEl("text", {x: m.l - 6, y: ys(v) + 4, "text-anchor": "end"}, svg).textContent = v + " %";
+  }
+  for (const g of d.gaps) {
+    const a = xs(Math.max(g.start, x0)), b = xs(Math.min(g.end, x1));
+    if (b - a >= 0.5) svgEl("rect", {x: a, y: m.t, width: b - a, height: ph, fill: "url(#w-hatch)", class: "gapzone", "data-kind": "gap"}, svg);
+  }
+  // Observed but not connected: a red zone (never drawn as a 0 % signal).
+  for (const p of d.points) {
+    if (p.not_connected === 0) continue;
+    const a = xs(p.start), b = xs(p.end);
+    svgEl("rect", {x: a, y: m.t, width: Math.max(2, b - a), height: ph, class: "offzone", "data-kind": "notconnected",
+                   opacity: p.connected === 0 ? 1 : 0.5}, svg);
+  }
+  const limitY = ys(d.low_signal_pct);
+  svgEl("line", {x1: m.l, x2: m.l + pw, y1: limitY, y2: limitY, class: "ref", "data-kind": "limit"}, svg);
+  svgEl("text", {x: m.l + pw - 2, y: limitY - 3, "text-anchor": "end"}, svg).textContent = "Low-signal limit " + d.low_signal_pct + " %";
+
+  const centre = (p) => (p.start + p.end) / 2;
+  const hasGapBetween = (a, b) => d.gaps.some((g) => g.start < centre(b) && g.end > centre(a));
+  const runs = [];
+  let cur = [], prev = null;
+  for (const p of d.points) {
+    if (p.signal_mean === null || (prev && (Math.abs(p.start - prev.end) > 0.5 || hasGapBetween(prev, p)))) {
+      if (cur.length) runs.push(cur);
+      cur = [];
+    }
+    if (p.signal_mean !== null) cur.push(p);
+    prev = p.signal_mean === null ? null : p;
+  }
+  if (cur.length) runs.push(cur);
+  const dots = d.points.length <= 80;
+  for (const r of runs) {
+    if (r.length > 1) {
+      const top = r.map((p) => xs(centre(p)) + "," + ys(p.signal_max));
+      const low = r.slice().reverse().map((p) => xs(centre(p)) + "," + ys(p.signal_min));
+      svgEl("polygon", {points: top.concat(low).join(" "), class: "wband", "data-kind": "band"}, svg);
+      svgEl("polyline", {points: r.map((p) => xs(centre(p)) + "," + ys(p.signal_mean)).join(" "), class: "line", "data-kind": "line"}, svg);
+    }
+    if (dots || r.length === 1) {
+      for (const p of r) svgEl("circle", {cx: xs(centre(p)), cy: ys(p.signal_mean), r: 3, class: "dot", "data-kind": "point", "data-value": p.signal_mean}, svg);
+    }
+  }
+  const ticks = Math.max(1, Math.min(4, Math.floor(pw / 110)));
+  for (let i = 0; i <= ticks; i++) {
+    const t = x0 + (span * i) / ticks;
+    svgEl("text", {x: xs(t), y: bottom + 18, "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle", "data-kind": "tick"}, svg).textContent = fmtTick(t, span);
+  }
+  const cross = svgEl("line", {y1: m.t, y2: bottom, class: "cross", visibility: "hidden"}, svg);
+  const overlay = svgEl("rect", {x: m.l, y: m.t, width: pw, height: ph, fill: "transparent"}, svg);
+  overlay.addEventListener("pointermove", (ev) => {
+    const px = ev.clientX - svg.getBoundingClientRect().left;
+    const t = x0 + ((px - m.l) / pw) * span;
+    const p = d.points.find((q) => t >= q.start && t < q.end);
+    const gap = d.gaps.find((g) => t >= g.start && t <= g.end);
+    let lines = null, at = px;
+    if (p) {
+      lines = [new Date(p.start * 1000).toLocaleTimeString() + " to " + new Date(p.end * 1000).toLocaleTimeString(),
+               p.signal_mean === null ? "Signal: none (not connected)"
+                 : "Signal quality: " + p.signal_mean + " % (min " + p.signal_min + ", max " + p.signal_max + ")"];
+      if (p.rssi_mean !== null) lines.push("RSSI: " + p.rssi_mean + " dBm (as reported)");
+      if (p.rx_mean !== null) lines.push("Link rate: " + p.rx_mean + " / " + p.tx_mean + " Mbps");
+      lines.push(p.connected + " connected, " + p.not_connected + " not connected of " + p.observations);
+      at = xs(centre(p));
+    } else if (gap) {
+      lines = ["No observations", fmtDuration(gap.end - gap.start) + " not observed", "(not the same as disconnected)"];
+    }
+    if (!lines) { tip.hidden = true; cross.setAttribute("visibility", "hidden"); return; }
+    tip.textContent = lines.join("\n");
+    tip.hidden = false;
+    tip.style.left = Math.max(0, Math.min(at + 12, box.clientWidth - tip.offsetWidth)) + "px";
+    cross.setAttribute("x1", at);
+    cross.setAttribute("x2", at);
+    cross.setAttribute("visibility", "visible");
+  });
+  overlay.addEventListener("pointerleave", () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+}
+
+async function refreshWifi() {
+  const req = ++wReq;   // a response for an earlier window must not overwrite this one
+  try {
+    const data = await getJson("/api/wifi");
+    if (req !== wReq) return;
+    if (!data.enabled) { wPanel.hidden = true; return; }
+    const history = await getJson("/api/wifi/history?window_s=" + wWindow);
+    if (req !== wReq) return;
+    renderWifi(data);
+    wDetail = history;
+    drawWifiChart(history);
+    wSummary.textContent = wSummaryText(history);
+    wLoaded = true;
+    wNote.className = "";
+    wChartCard.classList.remove("offline");
+  } catch (err) {
+    if (req !== wReq) return;
+    if (wLoaded) {
+      wNote.textContent = "Could not load Wi-Fi data (" + err.message + "). Showing the last data received, which is out of date.";
+      wCard.classList.add("offline");
+      wChartCard.classList.add("offline");
+    }
+  }
+}
+for (const button of document.querySelectorAll(".wwin button")) {
+  button.addEventListener("click", () => {
+    wWindow = Number(button.dataset.wwindow);
+    for (const other of document.querySelectorAll(".wwin button")) other.setAttribute("aria-pressed", String(other === button));
+    refreshWifi();
+  });
+}
+let wResizeQueued = false;
+window.addEventListener("resize", () => {
+  if (wResizeQueued || !wDetail) return;
+  wResizeQueued = true;
+  requestAnimationFrame(() => { wResizeQueued = false; if (wDetail) drawWifiChart(wDetail); });
+});
+refreshWifi();
+setInterval(refreshWifi, 5000);
 
 // ---- interface statistics (SNMP) ----------------------------------------------------------
 // Values the server doesn't know are null and shown as a dash with the reason, never as 0.

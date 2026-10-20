@@ -5,7 +5,8 @@
 **A lightweight network monitoring platform in Python.** NetMonLT polls devices for
 reachability and latency, reads interface traffic and error counters over SNMP, stores the
 history in SQLite, grades network quality (latency, jitter and packet loss), raises alerts when
-a device changes state, and serves a live web dashboard with historical charts. It runs fully offline with simulated devices, and can optionally
+a device changes state, optionally watches this computer's own Wi-Fi signal, and serves a live web
+dashboard with historical charts. It runs fully offline with simulated devices, and can optionally
 monitor real devices over ICMP and SNMPv3, restricted to targets you list explicitly and are
 authorised to monitor.
 
@@ -35,6 +36,12 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   Fair / Poor / Unknown grade from thresholds you can configure, and historical jitter and loss
   charts. All calculated from the ICMP checks already in SQLite, with the formulas stated and
   missing data never counted as zero. It measures performance; it does not verify or enforce QoS.
+- **Wi-Fi signal of this computer (opt-in, Windows).** Connection state, signal quality %, link
+  rates, radio type, channel and, only when the OS reports one, RSSI in dBm, with history and a
+  configurable low-signal warning. Local-only: it never scans for networks, never records other
+  people's SSIDs and masks yours by default. Every figure is labelled reported, simulated or
+  unavailable; nothing is estimated. Simulated by default so it works on Linux CI and on PCs with
+  no Wi-Fi adapter.
 - **Alerts without alert storms.** A device's state changes only after 3 consecutive checks
   agree. Alerts are stored in SQLite, survive restarts, and never repeat while the state is
   unchanged.
@@ -43,7 +50,7 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   server.
 - **Dashboard with no framework.** Plain HTML, JavaScript and hand-built SVG, no CDN, so it works
   offline. Shows stale data and API failures clearly.
-- **Tested.** 645 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
+- **Tested.** 896 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
   network and never need an SNMP device.
 
 ## Quick start (simulated demo)
@@ -105,6 +112,13 @@ flowchart LR
     col -->|"each check"| alert["Alert state machine<br/>3 consecutive checks"]
     alert -->|"alerts, state"| db
     snmp -->|"rates, SNMP status"| db
+    wifi["Wi-Fi poller<br/>own loop, this computer only"] -->|"read()"| wsrc
+    subgraph wsrc["Wi-Fi sources (same interface)"]
+        wsim["SimulatedWifiSource<br/>default, offline"]
+        wwin["WindowsWifiSource<br/>opt-in: WLAN API helper or netsh"]
+    end
+    wsrc -->|"WifiReading"| wifi
+    wifi -->|"observations, status"| db
     db -->|"stored checks"| qual["Quality figures<br/>latency, jitter, loss, grade"]
     qual --> api
     db --> api["FastAPI<br/>read-only JSON API"]
@@ -119,6 +133,7 @@ flowchart LR
 | Alerts | `alerts.py` | Pure state machine: confirms state changes, raises alerts, handles restarts and gaps. |
 | Interface maths | `ifstats.py` | Pure functions: IF-MIB table parsing and counter-to-rate maths (first sample, rollover, reset, gap, absent interfaces). |
 | Network quality | `quality.py` | Pure functions over stored checks: mean latency, jitter, packet loss, grading and the bucketed series for the charts. Reads existing rows; stores nothing. |
+| Wi-Fi | `wifi.py`, `wifi_windows.py`, `wifi_wlanapi.py`, `wifi_poller.py` | Data model and validation, SSID privacy, `netsh` parsing, the simulated source, low-signal warning and history maths; the Windows source, which runs the WLAN API helper or `netsh` as a separate, time-limited process; the native `ctypes` helper itself; and a polling loop that is separate from the ICMP collector. |
 | SNMP | `snmp.py`, `snmp_pysnmp.py`, `snmp_poller.py` | `SnmpClient` interface, the deterministic simulated client, the real SNMPv3 client (optional dependency) and a polling loop that is separate from the ICMP collector. |
 | Storage | `storage.py` | SQLite with plain SQL: one shared connection, a lock, WAL mode. Windowed and downsampled history queries. |
 | API and dashboard | `api.py`, `templates/dashboard.html` | Read-only JSON endpoints and a single-page dashboard that polls them. |
@@ -320,6 +335,104 @@ kind of grade, deterministically (the simulation is seeded):
 | `wifi-ap` | Poor | 40% simulated packet loss |
 | `branch-vpn` | Poor | 170 ms latency |
 
+## Wi-Fi signal monitoring (opt-in, local only, Windows first)
+
+This watches the Wi-Fi link of **the computer running NetMonLT**, which is useful for explaining
+"the network felt slow" (a weak signal, a roam, a drop) next to the ICMP and SNMP data. It is a
+home or lab feature, not a wireless survey tool, and it needs no enterprise equipment.
+
+**What it will never do:** scan for nearby networks, record anyone else's SSID, connect to or
+leave a network, or collect the access point's MAC address (BSSID), the saved profile name or any
+key. The dashboard panel and the config say so, and the tests check it. It is **off unless the
+inventory says `wifi: {enabled: true}`.**
+
+### What is real, estimated, unavailable or simulated
+
+Every figure in the panel and API is exactly one of: **reported** (read from the operating
+system), **simulated** (from the built-in simulator, shown with a SIMULATED badge) or
+**unavailable** (shown as a dash, never as zero). **Nothing is estimated.**
+
+| Figure | From the Windows WLAN API (preferred) | From `netsh wlan` (fallback) | Simulated |
+|---|---|---|---|
+| Connection state | Reported: the adapter's state | Reported (English labels only) | Simulated |
+| SSID | Reported, then masked or hidden per `ssid_privacy` before it is stored | Same | Simulated name |
+| Signal quality % | Reported: Windows' 0 to 100 "signal quality" | Reported | Simulated |
+| **RSSI (dBm)** | Reported **only if the driver answers the RSSI query**; otherwise unavailable | Reported only if the output has an `Rssi` line; otherwise unavailable | Simulated, labelled as such |
+| Link rates | Reported: negotiated receive and transmit rate (not throughput) | Reported | Simulated |
+| Radio type | Reported: the PHY type, shown as 802.11n, ac, ax and so on | Reported | Simulated |
+| Channel | Reported if the adapter provides it, else unavailable | Reported | Simulated |
+| Anything while not connected | Unavailable (there is no link to measure) | Unavailable | Unavailable |
+| Ethernet-only PC, no adapter, stopped service, other OS | No reading: the panel says why (`no_adapter`, `unavailable`, `unsupported_os`) | Same | Not applicable |
+
+**Signal quality is not dBm.** Windows reports a 0 to 100 "signal quality" whose scale is
+vendor-defined. Microsoft documents an approximate relationship to RSSI, but it varies between
+drivers, so **NetMonLT never converts the percentage into dBm**. If a real RSSI is available it is
+shown in its own row with its source (for example "Windows WLAN API (driver-reported)"); if not,
+the row shows a dash and says it is not available.
+
+### Why the native API, and what `netsh` is for
+
+`netsh wlan show interfaces` prints text whose labels are translated into the Windows display
+language, so it can only be parsed reliably on English Windows; on another language it reports
+`parse_error` rather than guess. The WLAN API (`wlanapi.dll`, read through `ctypes`) returns
+structured values with no dependence on the language, so it is the default. `backend: auto` uses
+the native API and falls back to `netsh` only if the native helper itself fails. `wlanapi` or
+`netsh` can be forced.
+
+### How it stays safe
+
+- **Separate processes.** Each query runs as a short-lived child process with a hard timeout
+  (`python -m netmonlt.wifi_wlanapi`, or `netsh wlan show interfaces`): no shell, no console
+  window, output size capped, JSON validated. A hang or crash in native Windows code can only
+  end that child.
+- **Separate task.** A Wi-Fi poller has its own loop, timeout and error handling, like the SNMP
+  poller. A slow, hung or missing adapter cannot delay ICMP checks, SNMP polling, alerts or the
+  latency charts (the tests run an app with a hung Wi-Fi source to prove it).
+- **Only read-only queries** on interfaces that already exist: no scanning functions are called.
+- **Privacy.** `ssid_privacy: masked` (default) keeps the first character and hides the rest
+  (`H*******`), `full` shows it, `hidden` removes it. The reduction happens **before** the value
+  reaches the database, and the API applies the current setting again. The SSID is never written
+  to the log.
+- **Bounded storage.** One status row and one row per successful look, deleted after
+  `retention_days` (default 7) with a hard cap of 200,000 rows. New tables are created only if
+  missing, so existing databases upgrade in place.
+
+### Turning it on
+
+Simulated demo: already on in `config/devices.sim.yaml`. It shows a steady link, a dip to a weak
+signal (the low-signal warning appears after 3 readings), a short disconnection, and a recovery.
+
+Real Windows machine: copy `config/devices.real.example.yaml`, set `mode: real` as usual and add
+the commented `wifi:` block from the file:
+
+```yaml
+wifi:
+  enabled: true
+  poll_interval_s: 10      # minimum 5
+  backend: auto            # auto, wlanapi or netsh
+  ssid_privacy: masked     # masked, full or hidden
+  low_signal_pct: 40       # warn at or below this signal quality ...
+  warn_after_polls: 3      # ... for this many readings in a row
+  retention_days: 7
+```
+
+On an Ethernet-only PC, or anything that is not Windows, the panel appears and says exactly why
+there is no data; nothing else is affected. With several adapters, a connected one is reported
+(otherwise the first).
+
+### The low-signal warning
+
+A banner appears when the signal quality has been at or below `low_signal_pct` for
+`warn_after_polls` consecutive readings. A disconnection, a gap in the data or stale data ends it:
+it speaks only about a link that is connected and being observed. It is a dashboard warning, not
+an alert in the alert log (alerts are for devices), and it is not sent anywhere.
+
+### History chart
+
+Signal quality over time with the minimum to maximum band, your low-signal limit as a dashed
+line, a red zone where the adapter was observed but **not connected** (never drawn as 0 %), and a
+hatched zone where nothing was observed. Windows from 15 minutes to 7 days, with its own buttons.
+
 ## SNMP interface monitoring
 
 For devices that have interfaces (routers, switches, firewalls), NetMonLT reads the standard
@@ -470,6 +583,8 @@ All endpoints are read-only JSON; interactive documentation is at `/docs`.
 | `GET /api/devices/{name}/latency?window_s=N&max_points=M` | Chart data: points (latency is `null` for a down check), `gaps`, first/last check, `stale`. `window_s` 60 to 604800 (default 900), `max_points` 10 to 1000 (default 300). |
 | `GET /api/quality?window_s=N` | Network-quality summary for every device over the last `window_s` seconds (60 to 604800, default `quality.window_s`): `level` (`excellent`, `good`, `fair`, `poor` or `unknown`), `reason`, per-figure `grades`, `limiting`, `latency_ms`, `jitter_ms`, `loss_pct` (each `null` when it cannot be calculated), check and probe counts, `jitter_pairs`, `gap_fraction`, `stale`, plus the thresholds, the definitions and a scope statement. |
 | `GET /api/devices/{name}/quality?window_s=N&max_points=M` | One device's summary plus `points` (time buckets with `loss_pct`, `jitter_ms`, probe counts; empty buckets are omitted) and `gaps`. |
+| `GET /api/wifi` | This computer's Wi-Fi link: `{"enabled": false}` unless switched on; otherwise the latest observation (`state`, `ssid` as the privacy setting allows, `interface`, `signal_pct`, `rssi_dbm` and `rssi_source`, link rates, `radio_type`, `channel`, `age_s`, and `fields` saying for each whether it is `reported`, `simulated` or `unavailable`), the latest poll's `status` (`ok`, `pending`, `no_adapter`, `unsupported_os`, `unavailable`, `timeout`, `parse_error`, `error`), `stale`, and the low-signal `warning`. |
+| `GET /api/wifi/history?window_s=N&max_points=M` | Signal history in time buckets (mean, min and max signal quality of the connected observations, counts of connected and not-connected observations; empty buckets omitted) and `gaps`. 404 unless Wi-Fi monitoring is enabled. |
 | `GET /api/interfaces?device=NAME` | Latest SNMP interface statistics per SNMP device (optionally one): SNMP `status` (`ok`, `pending`, `timeout`, `auth_failure`, `unsupported`, `error`), safe `message`, `stale`, and per interface `oper_status`, `present`, `in_bps`, `out_bps`, error and discard increases since the last poll, and a `rate_note` saying why a rate is `null`. Raw counters are never returned; `simulated` says whether the data is simulated. |
 | `GET /api/alerts?limit=N` | Newest alerts first (1 to 500, default 50) with `severity`, `from_status`, `to_status`, `message`, `age_s`. |
 | `GET /healthz` | `{"ok": true}` |
@@ -483,6 +598,9 @@ snmp_poll_interval_s: 30   # interface polling; default 30; minimum 1 simulated,
 quality:                   # optional; grading thresholds and minimum data (see Network quality)
   jitter_ms: {excellent: 5, good: 15, fair: 30}   # also latency_ms and loss_pct
   min_checks: 10           # also window_s, min_jitter_pairs, max_gap_fraction
+wifi:                      # optional; OFF unless enabled (see Wi-Fi signal monitoring)
+  enabled: false           # also poll_interval_s, backend, ssid_privacy, low_signal_pct,
+                           # warn_after_polls, retention_days and (simulated) sim: {...}
 devices:
   - name: access-switch    # 1-64 chars: letters, digits . _ -
     address: 192.0.2.10    # simulated: any label without spaces; real: one IPv4 address or hostname
@@ -517,7 +635,7 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-645 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
+896 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
 persistence, schema upgrade), the ICMP prober and its safety rules (with a fake command runner
 and recorded or constructed `ping` output), inventory validation, the collector's error handling,
 storage, the history and downsampling queries, the API and the CLI, and for SNMP: the counter
@@ -528,7 +646,13 @@ SNMP client's logic with its pysnmp calls replaced by fakes. For network quality
 latency and loss maths (consecutive pairs, down checks, gaps, weighting, a reference
 implementation on random data), grading and thresholds, the Unknown cases, the series buckets,
 the `quality:` configuration rules, the storage query and both endpoints, and the simulated
-demo's deterministic grades. None touch a network, run a real
+demo's deterministic grades. For Wi-Fi: the reading validation (out-of-range values become unavailable, signal is
+never turned into dBm), SSID privacy, the `netsh` parser (connected, disconnected, several
+adapters, no adapter, stopped service, another language), the native API structure layouts and
+decoding with synthetic buffers, the helper process and its timeout, the backends and fallback
+rules, the simulated script, storage and retention, the poller's failure handling, isolation from
+ICMP and SNMP with a hung source, the warning rules, the `wifi:` configuration, both endpoints
+and the dashboard panel's rules. None touch a network, run a real
 `ping` or need an SNMP device.
 
 **What has and hasn't been verified**
@@ -542,6 +666,8 @@ demo's deterministic grades. None touch a network, run a real
 | Real SNMPv3 | Run end to end (authPriv, SHA-256 and AES-128) against a **net-snmp agent on loopback on Linux**, including wrong key, wrong user and wrong privacy key, and a search of the log, API and database for the passphrases. **Not tested against real network hardware, other SNMP agents, other protocol combinations, or on Windows or macOS.** |
 | Windows and macOS `ping` parsing | Tested only against sample output built from each tool's documented format; **not run on real Windows or macOS.** |
 | Network quality | Grades observed on real runs of the simulated demo (see the table above) and on real ICMP against loopback on Linux (sub-millisecond latency, 0 loss). The Unknown, stale, sparse-history, no-reply, no-jitter-pairs and API-error displays were checked in Chromium by serving the real API's responses for each scenario to the page. **Not measured on real WAN or wireless links, and the grading thresholds are untuned heuristics.** |
+| Wi-Fi (Windows backends) | **Not run on real Windows or Wi-Fi hardware by the author.** The `netsh` parser is tested against sample output built from the documented English format. The WLAN API structure sizes and offsets are checked against values worked out from the Windows headers, not against the DLL, and the decoding against synthetic buffers. The helper-process plumbing (JSON, timeouts, killing a hung child, validation) is exercised for real on Linux, where it correctly reports "unsupported". A test also runs the helper on whatever machine runs the tests, so a Windows CI runner will call the real `wlanapi.dll` (it has no Wi-Fi adapter, so it should report no adapter or service unavailable), but that has not been run yet. |
+| Wi-Fi (simulated, dashboard) | Checked in headless Chromium: the scripted dip, warning and disconnection, and each unavailable state (Ethernet-only, unsupported OS, timeout, stale, API error) using the real API's responses. |
 | Dashboard | Checked by hand in headless Chromium (desktop, 375 and 390 px wide, dark mode). **Not tested in Firefox, Safari or Edge;** the one-second "ago" labels have Node.js tests, the rest of the JavaScript has none. |
 | PowerShell commands | Not run on Windows by the author. |
 
@@ -556,6 +682,10 @@ src/netmonlt/
   collector.py     polling loop
   alerts.py        alert state machine
   quality.py       latency, jitter, packet-loss maths and grading (pure functions)
+  wifi.py          Wi-Fi data model, SSID privacy, netsh parsing, simulated source, warnings
+  wifi_windows.py  Windows source: runs the helper or netsh as a time-limited process
+  wifi_wlanapi.py  native WLAN API helper (ctypes), run as a child process
+  wifi_poller.py   Wi-Fi polling loop, separate from the ICMP collector
   ifstats.py       interface counter maths and IF-MIB table parsing
   snmp.py          SNMP client interface, credentials, simulated client
   snmp_pysnmp.py   real SNMPv3 client (optional dependency)
@@ -574,6 +704,12 @@ JavaScript framework or build step.
 
 ## Limitations
 
+- **Wi-Fi:** Windows only for now (Linux and macOS report "unsupported"), and only this
+  computer's own adapter: one adapter is reported (a connected one if there is one). RSSI depends
+  on the driver; many will not report it. `netsh` needs English Windows. Signal quality is a
+  vendor-defined percentage, so values are not comparable between adapters, and link rate is
+  negotiated, not throughput. No roaming, access-point or band analysis, no rate history chart,
+  and the low-signal warning is not an alert. Observations are kept for 7 days by default.
 - **Network quality:** jitter is calculated from each check's average of 3 pings (stored data
   only), so it is smoother than per-packet jitter and is neither RFC 3550 jitter nor one-way
   delay. Loss resolution depends on the probes in the window (3 per check). ICMP can be

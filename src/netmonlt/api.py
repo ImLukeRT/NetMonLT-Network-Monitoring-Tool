@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from netmonlt import __version__, quality
+from netmonlt import __version__, quality, wifi
 from netmonlt.collector import run_forever
 from netmonlt.collector import stale_after_s as compute_stale_after_s
 from netmonlt.inventory import Inventory
@@ -19,6 +19,7 @@ from netmonlt.probes.base import Prober
 from netmonlt.snmp import SnmpClient
 from netmonlt.snmp_poller import run_snmp_forever, snmp_stale_after_s
 from netmonlt.storage import Database
+from netmonlt.wifi_poller import WifiSource, run_wifi_forever, wifi_stale_after_s
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -31,14 +32,19 @@ def create_app(
     start_collector: bool = True,
     clock: Callable[[], float] = time.time,
     snmp_client: SnmpClient | None = None,
+    wifi_source: WifiSource | None = None,
 ) -> FastAPI:
     """Build the app. Tests pass start_collector=False to control polling themselves.
 
     `snmp_client` (optional) polls interface statistics for `inventory.snmp_devices` in a
     separate task, so SNMP problems can't affect the ICMP collector or anything it feeds.
+    `wifi_source` (optional, used only if `inventory.wifi.enabled`) does the same for this
+    computer's own Wi-Fi link.
     """
     stale_after_s = compute_stale_after_s(inventory.poll_interval_s)
     snmp_stale_s = snmp_stale_after_s(inventory.snmp_poll_interval_s)
+    wifi_cfg = inventory.wifi
+    wifi_stale_s = wifi_stale_after_s(wifi_cfg.poll_interval_s)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -51,6 +57,8 @@ def create_app(
                 tasks.append(asyncio.create_task(run_snmp_forever(
                     inventory.snmp_devices, snmp_client, db, inventory.snmp_poll_interval_s
                 )))
+            if wifi_source is not None and wifi_cfg.enabled:
+                tasks.append(asyncio.create_task(run_wifi_forever(wifi_source, db, wifi_cfg)))
         try:
             yield
         finally:
@@ -207,6 +215,97 @@ def create_app(
             "first_check_ts": first,
             "last_check_ts": last,
             "summary": summary,
+            "bucket_s": bucket_s,
+            "points": points,
+            "gaps": [{"start": a, "end": b} for a, b in gaps],
+        }
+
+    @app.get("/api/wifi")
+    def wifi_state():
+        """This computer's Wi-Fi link: the latest observation, the outcome of the latest poll and
+        the low-signal warning. `{"enabled": false}` unless wireless monitoring is switched on.
+
+        Every figure is reported by the OS, simulated, or null (unavailable): `fields` says which.
+        `rssi_dbm` is only ever a value the OS reported (see `rssi_source`), never derived from
+        `signal_pct`. Read-only.
+        """
+        if not wifi_cfg.enabled:
+            return {"enabled": False}
+        now = clock()
+        status = db.get_wifi_status()
+        recent = db.latest_wifi(100)
+        samples = [
+            wifi.WifiSample(ts, r.state, r.signal_pct, r.rssi_dbm, r.rx_mbps, r.tx_mbps)
+            for r, ts in recent
+        ]
+        current = None
+        source = "simulated" if inventory.mode == "simulated" else wifi_cfg.backend
+        if recent:
+            reading, ts = recent[0]
+            reading = wifi.apply_ssid_privacy(reading, wifi_cfg.ssid_privacy)  # honour changes
+            source = reading.source
+            current = {
+                "state": reading.state, "ssid": reading.ssid, "interface": reading.interface,
+                "signal_pct": reading.signal_pct, "rssi_dbm": reading.rssi_dbm,
+                "rssi_source": reading.rssi_source, "rx_mbps": reading.rx_mbps,
+                "tx_mbps": reading.tx_mbps, "radio_type": reading.radio_type,
+                "channel": reading.channel, "age_s": max(0.0, now - ts),
+                "fields": wifi.field_provenance(reading),
+            }
+        last_ok = None if status is None else status.last_ok_ts
+        return {
+            "enabled": True,
+            "mode": inventory.mode,
+            "simulated": inventory.mode == "simulated",
+            "source": source,
+            "source_label": wifi.SOURCE_LABELS.get(source, source),
+            "server_time": now,
+            "poll_interval_s": wifi_cfg.poll_interval_s,
+            "stale_after_s": wifi_stale_s,
+            "ssid_privacy": wifi_cfg.ssid_privacy,
+            "status": {
+                "status": "pending" if status is None else status.status,
+                "message": None if status is None else status.message,
+                "last_poll_age_s": None if status is None else max(0.0, now - status.ts),
+                "last_ok_age_s": None if last_ok is None else max(0.0, now - last_ok),
+                "stale": last_ok is not None and now - last_ok > wifi_stale_s,
+            },
+            "current": current,
+            "warning": wifi.low_signal_warning(
+                samples, wifi_cfg, now=now, stale_after_s=wifi_stale_s
+            ),
+        }
+
+    @app.get("/api/wifi/history")
+    def wifi_history(
+        window_s: int = Query(900, ge=60, le=7 * 86400),
+        max_points: int = Query(60, ge=10, le=500),
+    ):
+        """Signal-quality history in time buckets (never zero-filled: empty buckets are omitted
+        and a disconnected observation is counted, not averaged in as 0 %), plus `gaps`."""
+        if not wifi_cfg.enabled:
+            raise HTTPException(status_code=404, detail="Wi-Fi monitoring is not enabled")
+        now = clock()
+        samples, first, last = db.wifi_samples(now - window_s, now)
+        points, bucket_s = wifi.series(
+            samples, start=now - window_s, end=now, first_ts=first,
+            poll_interval_s=wifi_cfg.poll_interval_s, max_points=max_points,
+        )
+        gaps = quality.find_gaps(samples, now - window_s, now, wifi_stale_s, first)
+        return {
+            "enabled": True,
+            "simulated": inventory.mode == "simulated",
+            "server_time": now,
+            "window_s": window_s,
+            "start": now - window_s,
+            "end": now,
+            "poll_interval_s": wifi_cfg.poll_interval_s,
+            "gap_threshold_s": wifi_stale_s,
+            "low_signal_pct": wifi_cfg.low_signal_pct,
+            "first_ts": first,
+            "last_ts": last,
+            "last_age_s": None if last is None else max(0.0, now - last),
+            "observations": len(samples),
             "bucket_s": bucket_s,
             "points": points,
             "gaps": [{"start": a, "end": b} for a, b in gaps],

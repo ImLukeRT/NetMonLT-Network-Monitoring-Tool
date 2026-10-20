@@ -93,6 +93,41 @@ class QualityConfig:
     max_gap_fraction: float = 0.5  # more of the window than this unmeasured: Unknown
 
 
+WIFI_BACKENDS = ("auto", "wlanapi", "netsh")
+WIFI_SSID_PRIVACY = ("masked", "full", "hidden")
+
+
+@dataclass(frozen=True)
+class WifiSimProfile:
+    """The scripted behaviour of the simulated Wi-Fi link (times are seconds after start)."""
+
+    ssid: str = "HomeWiFi"
+    base_signal_pct: int = 80
+    dip_at_s: float | None = 60.0  # the signal drops to dip_signal_pct ...
+    dip_duration_s: float = 40.0  # ... for this long
+    dip_signal_pct: int = 25
+    disconnect_at_s: float | None = 130.0  # the link drops entirely ...
+    disconnect_duration_s: float = 20.0  # ... for this long
+
+
+@dataclass(frozen=True)
+class WifiConfig:
+    """Opt-in monitoring of this computer's own Wi-Fi link. Off unless `enabled` is true.
+
+    Never scans for other networks and never joins one: it only reads the state of the adapter
+    that is already there.
+    """
+
+    enabled: bool = False
+    poll_interval_s: float = 10.0
+    backend: str = "auto"  # real mode only: auto (native API, then netsh), wlanapi or netsh
+    ssid_privacy: str = "masked"  # what is stored and shown: masked, full or hidden
+    low_signal_pct: int = 40  # a low-signal warning at or below this signal quality
+    warn_after_polls: int = 3  # consecutive low readings needed before warning
+    retention_days: int = 7  # observations older than this are deleted
+    sim: WifiSimProfile = WifiSimProfile()
+
+
 @dataclass(frozen=True)
 class Device:
     name: str

@@ -233,3 +233,75 @@ def test_real_mode_without_snmp_enabled_never_loads_the_snmp_library(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setitem(sys.modules, "netmonlt.snmp_pysnmp", None)  # would fail if it were imported
     assert main(["--inventory", REAL_EXAMPLE]) == 0
+
+
+# ------------------------------------------------------------------ Wi-Fi wiring
+SIM_WIFI = """\
+mode: simulated
+wifi: {enabled: true, poll_interval_s: 5}
+devices:
+  - name: plain
+    address: 192.0.2.2
+"""
+REAL_WIFI = """\
+mode: real
+poll_interval_s: 10
+wifi: {enabled: true, backend: wlanapi}
+devices:
+  - name: lo
+    address: 127.0.0.1
+    authorized: true
+"""
+
+
+@pytest.fixture
+def captured_app(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "netmonlt.__main__.create_app",
+        lambda inv, db, prober, **kw: captured.update(kw) or object(),
+    )
+    return captured
+
+
+def test_enabled_wifi_in_simulated_mode_uses_the_simulated_source(
+    tmp_path, served, captured_app, capsys
+):
+    rc = main(["--inventory", write_inventory(tmp_path, SIM_WIFI), "--db", str(tmp_path / "x.db")])
+    assert rc == 0
+    assert type(captured_app["wifi_source"]).__name__ == "SimulatedWifiSource"
+    assert "Simulated Wi-Fi telemetry is ON" in capsys.readouterr().out
+
+
+def test_wifi_is_off_unless_the_inventory_enables_it(tmp_path, served, captured_app):
+    plain = "devices:\n  - {name: a, address: 192.0.2.1}\n"
+    assert main(["--inventory", write_inventory(tmp_path, plain),
+                 "--db", str(tmp_path / "x.db")]) == 0
+    assert "wifi_source" not in captured_app
+
+
+def test_the_shipped_demo_inventory_starts_simulated_wifi(tmp_path, served, captured_app):
+    assert main(["--inventory", SHIPPED_INVENTORY, "--db", str(tmp_path / "x.db")]) == 0
+    assert type(captured_app["wifi_source"]).__name__ == "SimulatedWifiSource"
+
+
+def test_real_mode_wifi_uses_the_windows_source_and_says_it_is_local_only(
+    tmp_path, served, app_capture, capsys, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    assert main(["--inventory", write_inventory(tmp_path, REAL_WIFI)]) == 0
+    out = capsys.readouterr().out
+    assert "REAL Wi-Fi monitoring is ON for this computer's own adapter only" in out
+    assert "No scanning, no other networks" in out and "SSID masked" in out
+    if sys.platform != "win32":
+        assert "only implemented for Windows" in out
+
+
+def test_simulated_mode_never_creates_the_windows_source(tmp_path, served, captured_app,
+                                                         monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the Windows source must not be created in simulated mode")
+
+    monkeypatch.setattr("netmonlt.wifi_windows.WindowsWifiSource", forbidden)
+    assert main(["--inventory", write_inventory(tmp_path, SIM_WIFI),
+                 "--db", str(tmp_path / "x.db")]) == 0

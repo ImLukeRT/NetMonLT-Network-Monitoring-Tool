@@ -13,6 +13,8 @@ from netmonlt.inventory import InventoryError, load_inventory
 from netmonlt.probes import IcmpProber, ProbeError, SimulatedProber
 from netmonlt.snmp import SimulatedSnmpClient, SnmpClient, SnmpConfigError
 from netmonlt.storage import Database
+from netmonlt.wifi import SimulatedWifiSource
+from netmonlt.wifi_poller import WifiSource
 
 DEFAULT_INVENTORY = Path("config") / "devices.sim.yaml"
 DEFAULT_DB = Path("data") / "netmonlt.db"
@@ -83,6 +85,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             snmp_client = SimulatedSnmpClient()
 
+    wifi_source: WifiSource | None = None
+    if inventory.wifi.enabled:
+        if inventory.mode == "real":
+            from netmonlt.wifi_windows import WindowsWifiSource
+
+            wifi_source = WindowsWifiSource(inventory.wifi)
+        else:
+            wifi_source = SimulatedWifiSource(inventory.wifi.sim)
+
     try:
         db = Database(db_path)
         db.sync_devices(inventory.devices)
@@ -90,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot open database {db_path}: {exc}", file=sys.stderr)
         return 2
     kwargs = {} if snmp_client is None else {"snmp_client": snmp_client}
+    if wifi_source is not None:
+        kwargs["wifi_source"] = wifi_source
     app = create_app(inventory, db, prober, **kwargs)
     if inventory.mode == "real":
         print("REAL ICMP monitoring is ON. Probing only these configured targets:")
@@ -105,6 +118,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             names = ", ".join(d.name for d in inventory.snmp_devices)
             print(f"Simulated SNMP interface statistics for: {names}")
+    if wifi_source is not None:
+        if inventory.mode == "real":
+            print(f"REAL Wi-Fi monitoring is ON for this computer's own adapter only "
+                  f"(backend {inventory.wifi.backend}, SSID {inventory.wifi.ssid_privacy}). "
+                  "No scanning, no other networks.")
+            if sys.platform != "win32":
+                print("note: Wi-Fi monitoring is only implemented for Windows; the dashboard "
+                      "will report it as unsupported on this operating system.")
+        else:
+            print("Simulated Wi-Fi telemetry is ON (no adapter is read).")
     print(f"NetMonLT ({inventory.mode} mode, {len(inventory.devices)} devices): "
           f"http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
