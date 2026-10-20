@@ -1055,7 +1055,12 @@ processing), duplicates (repeated, interrupted, restarted and concurrent with li
 untouched existing incidents, notes, reports and audit events, the upgrade of an existing Stage 10
 database, the skip records, the "recovery unknown" resolve confirmation and the protection of the
 import endpoints. For the alert views: filtering, row limits, offsets and totals in SQL, resolve
-and reopen moving alerts, unmatched alerts staying visible, and no alert ever changing. None touch a network, run a real
+and reopen moving alerts, unmatched alerts staying visible, and no alert ever changing. For the dashboard's view tabs (a regression test for
+`/api/incidents?view=undefined`): static checks that each tab group's script only binds to its own
+buttons and that incident requests can never carry an undefined view, plus a Chromium test that
+clicks every tab, switches Active and History, waits for the periodic refreshes and asserts that no
+request fails (skipped automatically where Node.js, playwright or a Chromium build is not
+installed, such as CI). None touch a network, run a real
 `ping` or need an SNMP device.
 
 **What has and hasn't been verified**

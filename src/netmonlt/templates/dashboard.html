@@ -171,11 +171,11 @@
   .inc-controls { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; padding:10px 14px;
                   border-bottom:1px solid var(--line); }
   .inc-controls label { color:var(--muted); font-size:13px; }
-  .inc-tabs { display:inline-flex; gap:4px; }
-  .inc-tabs button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+  .view-tabs { display:inline-flex; gap:4px; }
+  .view-tabs button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
                      border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
-  .inc-tabs button[aria-selected="true"] { background:var(--fg); color:var(--bg); border-color:var(--fg); }
-  .inc-tabs .count { margin-left:6px; opacity:.75; }
+  .view-tabs button[aria-selected="true"] { background:var(--fg); color:var(--bg); border-color:var(--fg); }
+  .view-tabs .count { margin-left:6px; opacity:.75; }
   #inc-wrap th, #inc-wrap td { padding-left:10px; padding-right:10px; }
   #inc-wrap td.inc-cell { white-space:normal; }
   #inc-wrap td small { display:block; color:var(--muted); font-size:12px; }
@@ -293,7 +293,7 @@
     <div id="inc-note" role="status"></div>
     <div class="wrap" id="inc-wrap">
       <div class="inc-controls">
-        <div class="inc-tabs" role="tablist" aria-label="Incident view">
+        <div class="view-tabs" id="inc-tabs" role="tablist" aria-label="Incident view">
           <button type="button" role="tab" data-incview="active" aria-selected="true">Active <span class="count" id="inc-count-active"></span></button>
           <button type="button" role="tab" data-incview="history" aria-selected="false">History <span class="count" id="inc-count-history"></span></button>
         </div>
@@ -613,7 +613,7 @@
     of the default view; nothing is ever deleted.</p>
   <div class="wrap" id="alerts-wrap">
     <div class="inc-controls">
-      <div class="inc-tabs" role="tablist" aria-label="Alert view" id="alert-tabs">
+      <div class="view-tabs" role="tablist" aria-label="Alert view" id="alert-tabs">
         <button type="button" role="tab" data-alertview="unresolved" aria-selected="true">Unresolved <span class="count" id="alert-count-unresolved"></span></button>
         <button type="button" role="tab" data-alertview="archived" aria-selected="false">Archived / resolved <span class="count" id="alert-count-archived"></span></button>
         <button type="button" role="tab" data-alertview="all" aria-selected="false">All alerts <span class="count" id="alert-count-all"></span></button>
@@ -722,6 +722,7 @@ const ALERT_EMPTY_TEXT = {
   archived: "No archived alerts yet. When you resolve an incident, its alerts appear here.",
   all: "No alerts yet. An alert is raised when a device's state changes and stays changed for 3 consecutive checks.",
 };
+const ALERT_VIEWS = ["unresolved", "archived", "all"];
 const ALERT_COLUMNS = ["Time", "Severity", "Device", "Change", "Message"];
 let alertView = "unresolved", alertLimit = 20, alertReq = 0;
 
@@ -772,7 +773,10 @@ function renderAlerts(data) {
 
 document.getElementById("alert-more").addEventListener("click", () => { alertLimit = Math.min(500, alertLimit + 20); refresh(); });
 for (const tab of document.querySelectorAll("#alert-tabs button")) {
-  tab.addEventListener("click", () => { alertView = tab.dataset.alertview; alertLimit = 20; refresh(); });
+  tab.addEventListener("click", () => {
+    if (!ALERT_VIEWS.includes(tab.dataset.alertview)) return;
+    alertView = tab.dataset.alertview; alertLimit = 20; refresh();
+  });
 }
 
 function ago(seconds) {
@@ -791,7 +795,7 @@ async function refresh() {
   try {
     const req = ++alertReq, view = alertView;
     const [devices, alerts] = await Promise.all([
-      getJson("/api/devices"), getJson("/api/alerts?limit=" + alertLimit + "&view=" + view),
+      getJson("/api/devices"), getJson("/api/alerts?limit=" + alertLimit + "&view=" + (ALERT_VIEWS.includes(view) ? view : "unresolved")),
     ]);
     render(devices);
     if (req === alertReq && view === alertView) renderAlerts(alerts);
@@ -1136,6 +1140,7 @@ const INC_STATUS_CLASS = {
   unknown_awaiting_review: "unknown", unknown_acknowledged: "unknown", reopened_unknown: "degraded",
 };
 const INC_REPORT_FIELDS = ["root_cause", "actions_taken", "impact_assessment", "recovery_verification", "lessons_learned"];
+const INC_VIEWS = ["active", "history"];
 let incView = "active", incStatus = "", incSeverity = "", incSelected = null, incFilled = null;
 let incCan = false, incLoaded = false, incReq = 0, incDetailReq = 0, incCurrent = null;
 
@@ -1298,7 +1303,7 @@ function renderIncidentList(data) {
 
 async function refreshIncidents() {
   const req = ++incReq;
-  const q = new URLSearchParams({view: incView, limit: "100"});
+  const q = new URLSearchParams({view: INC_VIEWS.includes(incView) ? incView : "active", limit: "100"});
   if (incStatus) q.set("status", incStatus);
   if (incSeverity) q.set("severity", incSeverity);
   try {
@@ -1515,10 +1520,12 @@ document.getElementById("inc-b-copy").addEventListener("click", async () => {
     incShow("Could not use the clipboard here: the report text is selected below, press Ctrl+C.", "bad");
   }
 });
-for (const tab of document.querySelectorAll(".inc-tabs button")) {
+// Only the incident tabs (#inc-tabs): the alert tabs have their own handler and their own state.
+for (const tab of document.querySelectorAll("#inc-tabs button")) {
   tab.addEventListener("click", () => {
+    if (!INC_VIEWS.includes(tab.dataset.incview)) return;  // never let a bad value reach the API
     incView = tab.dataset.incview;
-    for (const other of document.querySelectorAll(".inc-tabs button")) other.setAttribute("aria-selected", String(other === tab));
+    for (const other of document.querySelectorAll("#inc-tabs button")) other.setAttribute("aria-selected", String(other === tab));
     const statusSelect = document.getElementById("inc-status");
     statusSelect.disabled = incView === "history";
     if (incView === "history") { statusSelect.value = ""; incStatus = ""; }

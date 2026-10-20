@@ -192,7 +192,8 @@ def test_the_unresolved_and_archived_views_are_opt_in_and_report_counts_and_pagi
 
 def test_the_dashboard_explicitly_asks_for_the_unresolved_view(db, devices):
     page = local_client(make_app(db, devices)).get("/").text
-    assert '"&view=" + view' in page and 'let alertView = "unresolved"' in page
+    assert '"&view=" + (ALERT_VIEWS.includes(view) ? view : "unresolved")' in page
+    assert 'let alertView = "unresolved"' in page
     assert 'data-alertview="unresolved" aria-selected="true"' in page  # the default tab
     assert "filter=" not in page.split("/api/alerts")[1][:80]
 

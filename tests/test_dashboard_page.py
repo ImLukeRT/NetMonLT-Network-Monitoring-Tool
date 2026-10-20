@@ -269,3 +269,94 @@ def test_a_program_far_longer_than_a_windows_command_line_still_runs():
     # Regression test: the program travels on stdin, so its length is not limited like argv is.
     padding = "/* " + "x" * 300_000 + " */"
     assert run_js(padding + 'console.log(JSON.stringify(["ok"]));') == ["ok"]
+
+
+# ------------------------------------------------------------------ view tabs (Stage 10.1 fix)
+# Regression: the Recent alerts tabs reused the incident tabs' CSS class, and the incident tab
+# handler (`.inc-tabs button`) also bound to them. Clicking an alert tab then set the incident view
+# to `undefined`, so every incident refresh requested /api/incidents?view=undefined (HTTP 422).
+from html.parser import HTMLParser  # noqa: E402
+
+
+class _Buttons(HTMLParser):
+    """Every <button> with the ids and classes of the elements it sits inside."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack, self.buttons, self._in_script = [], [], False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "script":
+            self._in_script = True
+        if tag in ("br", "input", "meta", "link", "img", "hr", "col"):
+            return
+        self.stack.append((tag, a.get("id"), (a.get("class") or "").split()))
+        if tag == "button":
+            self.buttons.append((a, [f for f in self.stack[:-1]]))
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._in_script = False
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                del self.stack[i:]
+                break
+
+
+def _buttons():
+    parser = _Buttons()
+    parser.feed(PAGE[:PAGE.index("<script>")])
+    return parser.buttons
+
+
+def _matched_by(selector):
+    """The buttons a `<ancestor> button` selector would match (an #id or .class ancestor)."""
+    anc = selector.removesuffix(" button")
+    kind, name = anc[0], anc[1:]
+    assert kind in "#.", selector
+    return [a for a, ancestors in _buttons()
+            if any((f[1] == name) if kind == "#" else (name in f[2]) for f in ancestors)]
+
+
+def _tab_selectors():
+    return re.findall(r'querySelectorAll\("([#.][\w-]+ button)"\)', PAGE)
+
+
+def test_incident_tab_buttons_only_carry_valid_incident_views():
+    inc_tabs = _matched_by("#inc-tabs button")
+    assert [b["data-incview"] for b in inc_tabs] == ["active", "history"]
+    assert inc_tabs[0]["aria-selected"] == "true"  # the initial view is Active
+    assert re.search(r'let incView = "active"', PAGE)
+
+
+def test_alert_tab_buttons_only_carry_valid_alert_views():
+    alert_tabs = _matched_by("#alert-tabs button")
+    assert [b["data-alertview"] for b in alert_tabs] == ["unresolved", "archived", "all"]
+    assert alert_tabs[0]["aria-selected"] == "true"
+    assert 'let alertView = "unresolved"' in PAGE
+
+
+def test_no_tab_handler_can_bind_to_the_other_tab_group():
+    selectors = _tab_selectors()
+    assert "#inc-tabs button" in selectors and "#alert-tabs button" in selectors
+    for selector in selectors:
+        matched = _matched_by(selector)
+        groups = {"incident" if "data-incview" in b else "alert" for b in matched
+                  if "data-incview" in b or "data-alertview" in b}
+        assert len(groups) <= 1, f"{selector} matches buttons from both tab groups"
+        if groups:  # a tab handler must match tab buttons only, never other buttons
+            assert all("data-incview" in b or "data-alertview" in b for b in matched), selector
+    # the shared look is a neutral class that no script selects on
+    assert ".inc-tabs" not in PAGE and 'class="view-tabs"' in PAGE
+
+
+def test_incident_requests_can_never_carry_an_undefined_view():
+    body = function_body("refreshIncidents")
+    assert 'view: INC_VIEWS.includes(incView) ? incView : "active"' in body
+    assert 'const INC_VIEWS = ["active", "history"];' in PAGE
+    handler = PAGE[PAGE.index('for (const tab of document.querySelectorAll("#inc-tabs button"))'):]
+    assert "if (!INC_VIEWS.includes(tab.dataset.incview)) return;" in handler[:400]
+    refresh_body = function_body("refresh")
+    assert 'ALERT_VIEWS.includes(view) ? view : "unresolved"' in refresh_body
+    assert '"&view=" + (ALERT_VIEWS' in refresh_body
