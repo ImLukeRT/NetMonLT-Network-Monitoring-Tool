@@ -11,6 +11,8 @@ import uvicorn
 from netmonlt.api import create_app
 from netmonlt.inventory import InventoryError, load_inventory
 from netmonlt.probes import IcmpProber, ProbeError, SimulatedProber
+from netmonlt.qos import QosClient
+from netmonlt.qos_sim import SimulatedQosClient
 from netmonlt.snmp import SimulatedSnmpClient, SnmpClient, SnmpConfigError
 from netmonlt.storage import Database
 from netmonlt.wifi import SimulatedWifiSource
@@ -33,6 +35,19 @@ def _real_snmp_client(devices):
             "'uv sync --extra snmp' or \"pip install 'netmonlt[snmp]'\""
         ) from None
     return PySnmpClient.from_devices(devices)
+
+
+def _real_qos_client(devices):
+    """Build the real SNMPv3 QoS client, or explain what is missing (same optional dependencies
+    and the same credentials as interface polling)."""
+    try:
+        from netmonlt.snmp_pysnmp import PySnmpQosClient
+    except ImportError:
+        raise ImportError(
+            "QoS polling needs the optional SNMP dependencies: install them with "
+            "'uv sync --extra snmp' or \"pip install 'netmonlt[snmp]'\""
+        ) from None
+    return PySnmpQosClient.from_devices(devices)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,6 +100,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             snmp_client = SimulatedSnmpClient()
 
+    qos_client: QosClient | None = None
+    if inventory.qos_devices:
+        if inventory.mode == "real":
+            try:
+                qos_client = _real_qos_client(inventory.qos_devices)
+            except (ImportError, SnmpConfigError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+        else:
+            qos_client = SimulatedQosClient()
+
     wifi_source: WifiSource | None = None
     if inventory.wifi.enabled:
         if inventory.mode == "real":
@@ -103,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
     kwargs = {} if snmp_client is None else {"snmp_client": snmp_client}
     if wifi_source is not None:
         kwargs["wifi_source"] = wifi_source
+    if qos_client is not None:
+        kwargs["qos_client"] = qos_client
     app = create_app(inventory, db, prober, **kwargs)
     if inventory.mode == "real":
         print("REAL ICMP monitoring is ON. Probing only these configured targets:")
@@ -118,6 +146,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             names = ", ".join(d.name for d in inventory.snmp_devices)
             print(f"Simulated SNMP interface statistics for: {names}")
+    if qos_client is not None:
+        if inventory.mode == "real":
+            print("REAL read-only QoS telemetry (SNMPv3) is ON for these configured devices only:")
+            for device in inventory.qos_devices:
+                print(f"  - {device.name} ({device.address}, adapter {device.qos.adapter})")
+        else:
+            names = ", ".join(d.name for d in inventory.qos_devices)
+            print(f"Simulated QoS telemetry for: {names}")
     if wifi_source is not None:
         if inventory.mode == "real":
             print(f"REAL Wi-Fi monitoring is ON for this computer's own adapter only "

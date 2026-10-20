@@ -29,6 +29,11 @@ starts, so don't leave it for later (if you miss it, the history is still there;
 | about 75 s | A **Low signal** banner appears (3 consecutive readings at or below 40%), and the chart line crosses the dashed limit. | Wi-Fi signal panel |
 | 100 s | The simulated signal recovers and the banner clears. | Wi-Fi signal panel |
 | 130 to 150 s | The simulated link **disconnects**: a red "not connected" zone, no signal figure (never 0%), then it reconnects. | Wi-Fi signal panel |
+| 60 s | **QoS (simulated):** congestion starts on `edge-firewall`'s wan0 egress policy. Best effort and Business surge; Voice, Video and Scavenger are unaffected. | QoS telemetry panel |
+| 60 to 115 s | **Queue-specific drops:** Best effort drops about half its traffic, Business a little, while the priority Voice class stays at 0%. | QoS panel, Drops/s and Drop % charts |
+| about 75 s | Best effort's 32-bit counters **roll over**: its rate carries on with no false reset. | QoS panel |
+| 115 s | Congestion ends and the drops stop. | QoS panel |
+| about 130 s | `edge-firewall` "restarts": QoS counters reset, one sample has no rate (a grey marker on the chart), then rates resume. | QoS panel |
 | 30 to 60 s | SNMP to `access-switch` times out too (labelled as such); its interface rows dim and the last good values are kept, not zeroed. ICMP and the charts are unaffected. | Interfaces (SNMP) panel |
 | about 75 s | `core-router` Gi0/1 crosses the 64-bit counter limit. The rate carries on unbroken instead of spiking or going negative. | Interfaces panel |
 | about 100 s | `edge-firewall` vpn0 stops being reported and is shown as **absent**, with no rate. | Interfaces panel |
@@ -86,7 +91,18 @@ starts, so don't leave it for later (if you miss it, the history is still there;
    red zone, not a zero. This panel is local-only: it never scans for networks. On an
    Ethernet-only PC in real mode it would instead explain that there is no wireless adapter.
 
-9. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
+9. **QoS telemetry (simulated).** Scroll to **QoS telemetry (SNMP)**, badged **SIMULATED QoS
+   DATA**. For each device it shows the adapter (here "simulated"), the source, the counter
+   width and when each row was polled. Watch the Best effort row: during congestion (about 60
+   to 115 s) its Drops/s and **Drop %** rise while Voice stays at 0%, and the **Throughput**
+   chart shows the surge. Use the metric buttons for Throughput, Drops/s and Drop %, and the
+   window buttons for the period. A dash means a rate could not be calculated and hovering says
+   why (for example the sample straight after the restart). The panel's caption explains that
+   this is different from the Network quality grades (ICMP), from interface discards, and from
+   DSCP markings observed in traffic (which NetMonLT never inspects); counters existing does not
+   prove QoS is enforced.
+
+10. **Optional: the real mode, safely.** `uv run netmonlt --inventory config/devices.real.example.yaml`
    pings only your own computer (loopback). The badge changes to **LIVE · ICMP** and the data goes
    to a separate database. Latencies are tiny (well under 1 ms) because it is local.
 
@@ -105,6 +121,10 @@ PowerShell, `rm -r data` elsewhere).
   ICMP or alerts. Rates come from counter differences over elapsed time, handling rollover,
   resets and missing interfaces. The real SNMPv3 client reads credentials from environment
   variables only; it was tested against a software agent on loopback, not network hardware.
+- **QoS telemetry is device-reported and explicit.** It reads only counters from a documented
+  adapter you name (today the standard DIFFSERV-MIB), never guesses OIDs, and shows "no QoS
+  telemetry" for devices that do not expose it. It does not prove QoS works, and it is not DSCP
+  observed in traffic. The simulation is labelled as scripted, not real equipment.
 - **Wi-Fi telemetry is honest about its sources.** Each figure is reported, simulated or
   unavailable. Nothing is estimated, RSSI is never derived from a percentage, and the SSID is
   masked before it is stored. It is opt-in and reads only this computer's own adapter.

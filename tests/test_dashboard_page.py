@@ -37,7 +37,7 @@ def test_labels_tick_every_second_from_a_single_timer():
 def test_the_data_refresh_intervals_are_unchanged():
     assert [(n, int(ms)) for n, ms in intervals() if n != "tickAges"] == [
         ("refreshChart", 5000), ("refreshQuality", 5000), ("refreshWifi", 5000),
-        ("refreshInterfaces", 5000), ("refresh", 3000),
+        ("refreshQos", 5000), ("refreshInterfaces", 5000), ("refresh", 3000),
     ]
 
 
@@ -127,6 +127,57 @@ def test_the_wifi_window_buttons_do_not_drive_the_latency_chart():
     assert 'class="wwin"' in PAGE and "data-wwindow" in PAGE
     assert 'querySelectorAll(".windows button")' in PAGE  # the latency chart's own group
     assert 'querySelectorAll(".wwin button")' in PAGE
+
+
+# ------------------------------------------------------------------ the QoS section
+def test_the_qos_section_is_hidden_until_the_api_says_it_is_enabled():
+    assert 'id="qos-panel" hidden' in PAGE
+    assert "qosPanel.hidden = !data.enabled" in PAGE
+    start = PAGE.index("async function refreshQos")
+    block = PAGE[start:PAGE.index("qosDeviceSelect.addEventListener")]
+    assert block.index("if (!data.enabled || !qosDevice) return;") < block.index("/api/qos/history")
+
+
+def test_the_qos_section_explains_what_qos_telemetry_is_and_is_not():
+    text = " ".join(PAGE.split())
+    for needle in ("QoS telemetry (SNMP)", "what a <b>device itself counts</b>",
+                   "documented adapter", "<b>not</b> the Network quality grades",
+                   "<b>not</b> the interface discards",
+                   "<b>not</b> DSCP markings observed in traffic",
+                   "never inspects packets", "does not prove that QoS is enforced or effective",
+                   "SIMULATED QoS DATA"):
+        assert needle in text, needle
+
+
+def test_the_qos_panel_shows_source_adapter_counter_type_and_polling_time():
+    block = PAGE[PAGE.index("function renderQos"):PAGE.index("function qosAxisLabel")]
+    for needle in ("entry.adapter_label", "entry.source_mib", "r.counter_type",
+                   'setAge(updated, r.age_s, "seconds"', "Requires: "):
+        assert needle in block, needle
+
+
+def test_unknown_qos_values_are_dashes_with_a_reason_never_zero():
+    assert 'value === null || value === undefined ? "–"' in PAGE
+    assert "QOS_NOTES[row.rate_note]" in PAGE
+    for note in ("first_sample", "counter_reset", "discontinuity", "gap", "no_counters", "absent"):
+        assert f"  {note}:" in PAGE[PAGE.index("const QOS_NOTES"):PAGE.index("const QOS_METRICS")]
+
+
+def test_the_qos_chart_keeps_missing_data_honest():
+    block = PAGE[PAGE.index("function drawQosChart"):PAGE.index("function qosSummaryText")]
+    assert "p[qosMetric] === null" in block  # a null rate breaks the line, it is not drawn as 0
+    assert 'class: "norate"' in block and 'class: "gapzone"' in block
+    assert "not the same as zero traffic or zero drops" in block
+
+
+def test_the_qos_controls_do_not_drive_the_latency_chart():
+    assert 'class="qwin"' in PAGE and "data-qwindow" in PAGE and "data-qmetric" in PAGE
+    assert 'querySelectorAll(".windows button")' in PAGE  # the latency chart's own group
+    assert 'querySelectorAll(".qwin button")' in PAGE
+
+
+def test_qos_values_from_the_api_are_never_parsed_as_markup():
+    assert "innerHTML" not in PAGE
 
 
 # ------------------------------------------------------------------ the arithmetic, in Node.js

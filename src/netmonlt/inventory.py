@@ -19,18 +19,25 @@ from netmonlt.domain import (
     WIFI_BACKENDS,
     WIFI_SSID_PRIVACY,
     Device,
+    QosConfig,
     QualityConfig,
     QualityThresholds,
     SimInterface,
     SimProfile,
+    SimQosClass,
+    SimQosProfile,
     SnmpConfig,
     WifiConfig,
     WifiSimProfile,
 )
 from netmonlt.probes.icmp import TargetError, validate_target
+from netmonlt.qos_adapters import ADAPTERS
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # used in URLs, so keep it URL-safe
-_TOP_KEYS = {"mode", "poll_interval_s", "snmp_poll_interval_s", "quality", "wifi", "devices"}
+_TOP_KEYS = {
+    "mode", "poll_interval_s", "snmp_poll_interval_s", "qos_poll_interval_s",
+    "qos_retention_hours", "quality", "wifi", "devices",
+}
 _WIFI_KEYS = {
     "enabled", "poll_interval_s", "backend", "ssid_privacy", "low_signal_pct",
     "warn_after_polls", "retention_days", "sim",
@@ -46,13 +53,23 @@ _QUALITY_KEYS = {
 }
 _THRESHOLD_KEYS = ("excellent", "good", "fair")
 MAX_QUALITY_WINDOW_S = 7 * 86400  # the longest history window the API serves
-_DEVICE_KEYS = {"name", "address", "type", "sim", "authorized", "snmp"}
+_DEVICE_KEYS = {"name", "address", "type", "sim", "authorized", "snmp", "qos"}
+_QOS_KEYS = {"enabled", "adapter"}
+_SIM_QOS_KEYS = {"interface", "capacity_mbps", "congestion", "classes"}
+_SIM_QOS_CONGESTION_KEYS = {"start_s", "duration_s", "surge_factor"}
+_SIM_QOS_CLASS_KEYS = {
+    "name", "offered_mbps", "priority", "weight", "surges", "avg_packet_bytes",
+    "counter_bits", "wrap_at_s",
+}
+MAX_SIM_QOS_CLASSES = 16
+# QoS polling reads several tables per device, so real polling is kept gentle.
+REAL_MIN_QOS_INTERVAL_S = 10.0
 _MODES = ("simulated", "real")
 # Real probing sends traffic to someone's equipment, so don't allow hammering it.
 REAL_MIN_INTERVAL_S = 5.0
 _SIM_KEYS = {
     "rtt_ms", "jitter_ms", "loss", "outage_start_s", "outage_duration_s", "interfaces",
-    "reboot_at_s",
+    "reboot_at_s", "qos",
 }
 _SIM_IF_KEYS = {
     "name", "in_mbps", "out_mbps", "status", "in_errors_per_min", "out_errors_per_min",
@@ -111,6 +128,16 @@ class Inventory:
     snmp_poll_interval_s: float = 30.0
     quality: QualityConfig = field(default_factory=QualityConfig)
     wifi: WifiConfig = field(default_factory=WifiConfig)
+    qos_poll_interval_s: float = 30.0
+    qos_retention_hours: float = 24.0
+
+    @property
+    def qos_devices(self) -> tuple[Device, ...]:
+        """Devices whose QoS telemetry is read: simulated ones with a sim.qos policy in simulated
+        mode, and only devices that explicitly enable `qos` (with SNMPv3) in real mode."""
+        if self.mode == "real":
+            return tuple(d for d in self.devices if d.qos is not None and d.snmp is not None)
+        return tuple(d for d in self.devices if d.sim.qos is not None)
 
     @property
     def snmp_devices(self) -> tuple[Device, ...]:
@@ -155,6 +182,14 @@ def parse_inventory(raw: Any) -> Inventory:
     quality = _parse_quality(raw.get("quality"))
     wifi = _parse_wifi(raw.get("wifi"), mode)
 
+    qos_minimum = REAL_MIN_QOS_INTERVAL_S if mode == "real" else 1.0
+    qos_interval = _number(
+        raw.get("qos_poll_interval_s", 30), "qos_poll_interval_s", minimum=qos_minimum
+    )
+    qos_retention = _number(
+        raw.get("qos_retention_hours", 24), "qos_retention_hours", minimum=1, maximum=168
+    )
+
     raw_devices = raw.get("devices")
     if not isinstance(raw_devices, list) or not raw_devices:
         raise InventoryError("'devices' must be a non-empty list")
@@ -174,6 +209,8 @@ def parse_inventory(raw: Any) -> Inventory:
         snmp_poll_interval_s=snmp_interval,
         quality=quality,
         wifi=wifi,
+        qos_poll_interval_s=qos_interval,
+        qos_retention_hours=qos_retention,
     )
 
 
@@ -338,9 +375,47 @@ def _parse_device(entry: Any, index: int, mode: str) -> Device:
     sim = _parse_sim(entry.get("sim"), where)  # validated in both modes, used only when simulated
     # Validated in both modes, but only ever used to poll a real device in real mode.
     snmp = _parse_snmp(entry.get("snmp"), where)
+    qos = _parse_qos(entry.get("qos"), where, mode, snmp)
     return Device(
-        name=name, address=address, type=dev_type, sim=sim, authorized=authorized, snmp=snmp
+        name=name, address=address, type=dev_type, sim=sim, authorized=authorized, snmp=snmp,
+        qos=qos,
     )
+
+
+def _parse_qos(raw: Any, where: str, mode: str, snmp: SnmpConfig | None) -> QosConfig | None:
+    """A device's `qos` block. Returns None unless QoS telemetry is explicitly enabled.
+
+    Only adapters that NetMonLT supports are accepted, and in real mode the device must also
+    have SNMPv3 enabled: QoS polling reuses its credentials and security settings.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise InventoryError(f"{where}: 'qos' must be a mapping")
+    _reject_unknown(raw, _QOS_KEYS, f"{where}.qos")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise InventoryError(f"{where}.qos.enabled must be true or false")
+    adapter = raw.get("adapter")
+    if adapter is not None and not (isinstance(adapter, str) and adapter in ADAPTERS):
+        raise InventoryError(
+            f"{where}.qos.adapter {adapter!r} is not supported. Supported adapters: "
+            f"{', '.join(sorted(ADAPTERS))}. NetMonLT never guesses OIDs: a device's QoS MIB "
+            "needs an explicit, verified adapter"
+        )
+    if not enabled:
+        return None  # a `qos` block alone never turns polling on
+    if adapter is None:
+        raise InventoryError(
+            f"{where}.qos.adapter is required when QoS is enabled "
+            f"(one of: {', '.join(sorted(ADAPTERS))})"
+        )
+    if mode == "real" and snmp is None:
+        raise InventoryError(
+            f"{where}.qos: QoS telemetry reuses the device's SNMPv3 credentials, so the device "
+            "needs an enabled 'snmp' block too"
+        )
+    return QosConfig(adapter=adapter)
 
 
 def _parse_sim(raw: Any, where: str) -> SimProfile:
@@ -370,6 +445,83 @@ def _parse_sim(raw: Any, where: str) -> SimProfile:
         outage_duration_s=float(duration or 0),
         interfaces=_parse_sim_interfaces(raw.get("interfaces"), where),
         reboot_at_s=reboot,
+        qos=_parse_sim_qos(raw.get("qos"), where),
+    )
+
+
+def _parse_sim_qos(raw: Any, where: str) -> SimQosProfile | None:
+    """The simulated QoS policy of a device (a scripted demo; ignored in real mode)."""
+    if raw is None:
+        return None
+    here = f"{where}.sim.qos"
+    if not isinstance(raw, dict):
+        raise InventoryError(f"{where}: 'sim.qos' must be a mapping")
+    _reject_unknown(raw, _SIM_QOS_KEYS, here)
+    interface = raw.get("interface", "wan0")
+    if not isinstance(interface, str) or not _IF_NAME_RE.fullmatch(interface):
+        raise InventoryError(f"{here}.interface must be 1-64 chars: letters, digits, / . _ : -")
+    capacity = _number(raw.get("capacity_mbps", 100), f"{here}.capacity_mbps", minimum=0.1)
+
+    start = duration = None
+    factor = 1.0
+    congestion = raw.get("congestion")
+    if congestion is not None:
+        if not isinstance(congestion, dict):
+            raise InventoryError(f"{here}.congestion must be a mapping")
+        _reject_unknown(congestion, _SIM_QOS_CONGESTION_KEYS, f"{here}.congestion")
+        if "start_s" not in congestion or "duration_s" not in congestion:
+            raise InventoryError(f"{here}.congestion needs start_s and duration_s")
+        start = _number(congestion["start_s"], f"{here}.congestion.start_s", minimum=0)
+        duration = _number(congestion["duration_s"], f"{here}.congestion.duration_s", minimum=0.1)
+        factor = _number(congestion.get("surge_factor", 2), f"{here}.congestion.surge_factor",
+                         minimum=1, maximum=20)
+
+    classes_raw = raw.get("classes")
+    if not isinstance(classes_raw, list) or not classes_raw:
+        raise InventoryError(f"{here}.classes must be a non-empty list")
+    if len(classes_raw) > MAX_SIM_QOS_CLASSES:
+        raise InventoryError(f"{here}.classes has more than {MAX_SIM_QOS_CLASSES} entries")
+    classes, seen = [], set()
+    for i, entry in enumerate(classes_raw):
+        classes.append(_parse_sim_qos_class(entry, f"{here}.classes[{i}]", seen))
+    return SimQosProfile(
+        interface=interface, capacity_mbps=capacity, congestion_start_s=start,
+        congestion_duration_s=0.0 if duration is None else duration, surge_factor=factor,
+        classes=tuple(classes),
+    )
+
+
+def _parse_sim_qos_class(entry: Any, label: str, seen: set[str]) -> SimQosClass:
+    if not isinstance(entry, dict):
+        raise InventoryError(f"{label} must be a mapping")
+    _reject_unknown(entry, _SIM_QOS_CLASS_KEYS, label)
+    name = entry.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name) > 40 or not name.isprintable():
+        raise InventoryError(f"{label}.name must be 1-40 printable characters")
+    if name in seen:
+        raise InventoryError(f"{label}: duplicate class name {name!r}")
+    seen.add(name)
+    for key in ("priority", "surges"):
+        if not isinstance(entry.get(key, False), bool):
+            raise InventoryError(f"{label}.{key} must be true or false")
+    bits = entry.get("counter_bits", 64)
+    if isinstance(bits, bool) or bits not in (32, 64):
+        raise InventoryError(f"{label}.counter_bits must be 32 or 64")
+    packet = _number(entry.get("avg_packet_bytes", 800), f"{label}.avg_packet_bytes", 40, 9000)
+    if packet != int(packet):
+        raise InventoryError(f"{label}.avg_packet_bytes must be a whole number")
+    wrap = entry.get("wrap_at_s")
+    if wrap is not None:
+        wrap = _number(wrap, f"{label}.wrap_at_s", minimum=1, maximum=86400)
+    return SimQosClass(
+        name=name,
+        offered_mbps=_number(entry.get("offered_mbps"), f"{label}.offered_mbps", minimum=0),
+        priority=entry.get("priority", False),
+        weight=_number(entry.get("weight", 1), f"{label}.weight", minimum=0.01, maximum=1000),
+        surges=entry.get("surges", False),
+        avg_packet_bytes=int(packet),
+        counter_bits=bits,
+        wrap_at_s=wrap,
     )
 
 

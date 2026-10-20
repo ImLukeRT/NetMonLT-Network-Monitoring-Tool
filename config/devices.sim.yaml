@@ -5,6 +5,10 @@ mode: simulated
 poll_interval_s: 5
 # How often the simulated SNMP interface counters are read (real devices: minimum 10).
 snmp_poll_interval_s: 10
+# How often the simulated QoS telemetry is read, and how long its history is kept (real devices:
+# minimum 10 seconds; 1 to 168 hours).
+qos_poll_interval_s: 5
+qos_retention_hours: 24
 
 # How the Network quality section grades each device. These are this application's own
 # heuristics, not an industry QoS standard: tune them for the link you monitor. Each figure is
@@ -65,6 +69,22 @@ devices:
       # The firewall "restarts" 130s after start: its counters and uptime reset, so no rate is
       # shown for one poll instead of a made-up (negative) one. vpn0 vanishes at 100s.
       reboot_at_s: 130
+      # Simulated QoS telemetry for the wan0 egress policy (a scripted, deterministic demo: it
+      # is NOT read from any device). Five classes share a 100 Mbit/s link. The priority class
+      # is served first; the others share the rest by weight. From 60 s to 115 s the Business
+      # and Best-effort classes surge and the link is congested, so their queues drop packets.
+      # Best effort uses 32-bit counters that roll over at 75 s; the 130 s restart resets all.
+      qos:
+        interface: wan0
+        capacity_mbps: 100
+        congestion: {start_s: 60, duration_s: 55, surge_factor: 2.0}
+        classes:
+          - {name: Voice (EF), offered_mbps: 6, priority: true, avg_packet_bytes: 200}
+          - {name: Video (AF41), offered_mbps: 18, weight: 3, avg_packet_bytes: 1100}
+          - {name: Business (AF21), offered_mbps: 22, weight: 2, surges: true, avg_packet_bytes: 700}
+          - {name: Best effort, offered_mbps: 24, weight: 1, surges: true, avg_packet_bytes: 900,
+             counter_bits: 32, wrap_at_s: 75}
+          - {name: Scavenger (CS1), offered_mbps: 6, weight: 0.5, avg_packet_bytes: 1200}
       interfaces:
         - {name: wan0, in_mbps: 50, out_mbps: 12}
         - {name: lan0, in_mbps: 30, out_mbps: 40}

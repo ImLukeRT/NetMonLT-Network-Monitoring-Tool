@@ -42,6 +42,12 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   people's SSIDs and masks yours by default. Every figure is labelled reported, simulated or
   unavailable; nothing is estimated. Simulated by default so it works on Linux CI and on PCs with
   no Wi-Fi adapter.
+- **QoS telemetry (opt-in, read-only).** The queue, traffic-class and drop counters a device itself
+  reports for its own QoS policy, through an explicit, documented adapter (today: the standard
+  DIFFSERV-MIB), with correct rollover, reset and discontinuity handling, history and per-device
+  availability. A deterministic, clearly labelled simulation shows congestion with
+  queue-specific drops. It is not the ICMP quality grade, not interface discards and not
+  observed DSCP, and counters existing does not prove QoS works.
 - **Alerts without alert storms.** A device's state changes only after 3 consecutive checks
   agree. Alerts are stored in SQLite, survive restarts, and never repeat while the state is
   unchanged.
@@ -50,7 +56,7 @@ monitoring mistakes: false alarms from noisy checks, and mistaking "no data" for
   server.
 - **Dashboard with no framework.** Plain HTML, JavaScript and hand-built SVG, no CDN, so it works
   offline. Shows stale data and API failures clearly.
-- **Tested.** 896 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
+- **Tested.** 1185 automated tests, run with lint on Ubuntu and Windows in CI. Tests never touch a
   network and never need an SNMP device.
 
 ## Quick start (simulated demo)
@@ -112,6 +118,14 @@ flowchart LR
     col -->|"each check"| alert["Alert state machine<br/>3 consecutive checks"]
     alert -->|"alerts, state"| db
     snmp -->|"rates, SNMP status"| db
+    inv --> qosp
+    qosp["QoS poller<br/>own loop and timeouts"] -->|"poll(device)"| qosc
+    subgraph qosc["QoS clients (same interface)"]
+        qsim["SimulatedQosClient<br/>default, offline"]
+        qpy["PySnmpQosClient<br/>opt-in, SNMPv3, explicit adapter"]
+    end
+    qosc -->|"QosSnapshot"| qosp
+    qosp -->|"rates, QoS status"| db
     wifi["Wi-Fi poller<br/>own loop, this computer only"] -->|"read()"| wsrc
     subgraph wsrc["Wi-Fi sources (same interface)"]
         wsim["SimulatedWifiSource<br/>default, offline"]
@@ -134,6 +148,7 @@ flowchart LR
 | Interface maths | `ifstats.py` | Pure functions: IF-MIB table parsing and counter-to-rate maths (first sample, rollover, reset, gap, absent interfaces). |
 | Network quality | `quality.py` | Pure functions over stored checks: mean latency, jitter, packet loss, grading and the bucketed series for the charts. Reads existing rows; stores nothing. |
 | Wi-Fi | `wifi.py`, `wifi_windows.py`, `wifi_wlanapi.py`, `wifi_poller.py` | Data model and validation, SSID privacy, `netsh` parsing, the simulated source, low-signal warning and history maths; the Windows source, which runs the WLAN API helper or `netsh` as a separate, time-limited process; the native `ctypes` helper itself; and a polling loop that is separate from the ICMP collector. |
+| QoS | `qos.py`, `qos_adapters.py`, `qos_sim.py`, `qos_poller.py` | Pure rate maths for device-reported QoS counters (rollover, reset, restart, discontinuity, gaps); the explicit adapter registry with the DIFFSERV-MIB adapter; the deterministic simulated client; and a polling loop that is separate from every other collector. The real SNMPv3 client lives in `snmp_pysnmp.py`. |
 | SNMP | `snmp.py`, `snmp_pysnmp.py`, `snmp_poller.py` | `SnmpClient` interface, the deterministic simulated client, the real SNMPv3 client (optional dependency) and a polling loop that is separate from the ICMP collector. |
 | Storage | `storage.py` | SQLite with plain SQL: one shared connection, a lock, WAL mode. Windowed and downsampled history queries. |
 | API and dashboard | `api.py`, `templates/dashboard.html` | Read-only JSON endpoints and a single-page dashboard that polls them. |
@@ -572,6 +587,152 @@ are ignored and counted). The nine columns are read one after another, so a poll
 requests. Rates use wall-clock time between polls, not the device's clock. IPv4 targets only, as
 with ICMP.
 
+## QoS telemetry (opt-in, read-only SNMP)
+
+This shows what a **device itself counts** for its own QoS policy: packets, bytes and drops per
+traffic class, count action or queue dropper. It is opt-in per device, read-only, reuses the
+SNMPv3 settings that interface polling already uses, and only ever reads counters from a
+**documented adapter** you name. A device that does not expose such counters is shown as "no QoS
+telemetry", never with made-up numbers.
+
+### Four different things (and which one this is)
+
+| What | Where it comes from | What it can tell you | In NetMonLT |
+|---|---|---|---|
+| **QoS queue / class / drop counters** | The device, through a QoS MIB | How much traffic a class or queue handled, and what a queue dropped | **This section** (needs device support) |
+| **Generic interface discards and errors** | IF-MIB, every SNMP device | Something was dropped on a port, but not which class or queue | Interface panel (SNMP) |
+| **DSCP markings observed in traffic** | Packet capture or flow export (NetFlow/IPFIX) | Which DSCP values are actually on the wire | **Not available.** NetMonLT never captures or inspects packets and never infers DSCP from anything |
+| **ICMP latency, jitter, loss** | NetMonLT's own pings | How ping behaved end to end | Network quality grades |
+
+### What QoS telemetry proves, and what it does not
+
+Counters show what **one device counted** for one policy element. They do **not** prove that QoS
+is enforced, correctly configured or effective, that traffic is marked or treated as intended
+elsewhere on the path, or that an application's experience improved. A class with traffic and no
+drops does not mean a policy is working; a class with drops does not mean it is misconfigured.
+Nothing here is shown as "verified QoS".
+
+### Feasibility: which MIBs can expose real QoS counters
+
+| Source | Kind | What it can expose | NetMonLT |
+|---|---|---|---|
+| **DIFFSERV-MIB** (RFC 3289, IETF standards track) | Standard | Count-action packet/octet counters and algorithmic-dropper drop counters (all Counter64) | **Supported** (`diffserv-mib`). Rarely implemented, so many devices will not offer it. **Not verified on any real device.** |
+| **IF-MIB** | Standard | Interface errors and discards only | Used by the interface panel, not QoS |
+| Vendor MIBs, for example Cisco's CISCO-CLASS-BASED-QOS-MIB, Juniper's COS MIB and MikroTik's queue tables | Vendor-specific | Per-class and per-queue counters, usually the practical source on real equipment | **Not supported yet.** Their OIDs could not be verified from a trustworthy copy of each MIB here, and NetMonLT does not guess OIDs. Adding one means adding one adapter (below) |
+| Consumer routers (typical ISP or home models) | n/a | Most expose no QoS counters over SNMP, and many have no SNMP at all | **Do not assume yours does.** Check with the read-only command below first |
+
+The DIFFSERV-MIB OIDs used were read from the compiled MIB module, not typed from memory, and a
+test pins them. The vendor names above are from general knowledge and are listed only to explain
+what is deferred.
+
+### Supported adapters
+
+| Adapter | Source | Reads (all read-only) | Needs |
+|---|---|---|---|
+| `diffserv-mib` | DIFFSERV-MIB, RFC 3289 | `diffServCountActTable` (octets, packets), `diffServAlgDropTable` (deterministic and random drop octets/packets, type, monitored queue), `diffServActionTable` (interface of a count action), IF-MIB `ifName` and `ifCounterDiscontinuityTime` | A device that implements DIFFSERV-MIB (1.3.6.1.2.1.97) with count actions or droppers configured, and lets your SNMPv3 user read it |
+
+An adapter is a small, explicit description in `qos_adapters.py`: which columns to read (with
+their OIDs) and a pure function that turns them into rows. There is no discovery and no
+guessing; a device uses an adapter only if the inventory names it, and an unsupported adapter
+name is rejected when the inventory loads.
+
+The MIB gives elements no names, so rows are labelled by index: **Count action 3** (with its
+interface when exactly one action points at it) and **Dropper 2** (with its type and the queue
+it monitors). Count actions count traffic; droppers count only drops, so **drop % is not shown
+for them** (it appears only where one element counts both its traffic and its drops, as in the
+simulation).
+
+### Rates, rollover and discontinuities
+
+A rate needs two consecutive valid samples. The shown figures are packets/s, throughput
+(bits/s, from octets) and drops/s over the interval between two polls. The rules, all unit-tested:
+
+- the **first sample** has no rate;
+- a counter that goes down is a **rollover** if it was near the top of its width (32 or 64 bit,
+  per row) and the rate is calculated across the wrap, otherwise a **reset**: no rate;
+- if `sysUpTime` goes backwards the **device restarted**: no rate for any element;
+- if the device reports a counter **discontinuity** (`ifCounterDiscontinuityTime` of a count
+  action's interface changed) the sample has no rate;
+- a long gap or a clock step gives no rate; an element that stops being reported is marked absent;
+- one bad counter voids that whole sample for that element. A missing value is a dash with the
+  reason on hover, **never zero**.
+
+### Simulated demo (deterministic, labelled SIMULATED)
+
+`config/devices.sim.yaml` gives `edge-firewall` a simulated QoS policy: five classes share a
+100 Mbit/s link, Voice has strict priority, and the rest share what is left by weight. It is
+scripted, not read from any device, and everything is labelled simulated.
+
+| Time | What happens |
+|---|---|
+| 0 to 60 s | Normal: every class is carried, no drops |
+| 60 to 115 s | **Congestion.** Business and Best effort surge. Voice, Video and Scavenger stay clean; Best effort drops about half its traffic and Business a little: **queue-specific drops** |
+| 75 s | Best effort's 32-bit counters **roll over**; its rate stays continuous |
+| 115 s | Congestion ends, drops stop |
+| 130 s | The device "restarts": every counter and the uptime reset, one sample has no rate, then rates resume |
+
+### Real devices: set up in your private inventory
+
+Your private inventory (for example `config/devices.real.yaml`, which is git-ignored) is
+separate from the tracked example. To add QoS to a device that **already** has SNMPv3 working,
+add a `qos` block under it. Nothing else changes, and no new credentials are needed:
+
+```yaml
+  - name: edge-router
+    address: 192.168.1.1
+    type: router
+    authorized: true
+    snmp:                      # your existing SNMPv3 settings stay exactly as they are
+      enabled: true
+      credentials_env: NETMONLT_SNMP_EDGE_ROUTER
+    qos:                       # NEW, optional, off unless enabled
+      enabled: true
+      adapter: diffserv-mib
+```
+
+and optionally, at the top level of the file:
+
+```yaml
+qos_poll_interval_s: 30        # minimum 10 in real mode
+qos_retention_hours: 24        # history kept, 1 to 168
+```
+
+Then `uv sync --extra snmp` if you have not already, set the same environment variables as for
+SNMP, and run as usual. **Check support first, read-only, before enabling:**
+
+```
+snmpwalk -v3 -u USER -l authPriv -a SHA-256 -A "..." -x AES -X "..." DEVICE 1.3.6.1.2.1.97
+```
+
+If that returns nothing ("No Such Object"), the device does not implement DIFFSERV-MIB and
+NetMonLT will report "no QoS telemetry". The tracked `config/devices.real.example.yaml` shows the
+same settings as comments, disabled by default.
+
+### Security and privacy
+
+- **Read-only:** only GET and GETBULK walks of the adapter's own columns; the code has no SNMP
+  write, no packet capture, no traffic injection, no scanning or discovery.
+- **Credentials** are the existing SNMPv3 environment variables: never in YAML, the API, the
+  log or the database (tests search for them). Errors show a fixed category, never library text.
+- **Opt-in per device**, only for `authorized: true` single-host targets, and only an adapter that
+  NetMonLT supports. The API never returns raw counters, addresses or credentials.
+- **Isolation:** QoS polling is its own task with its own 30 s timeout, so a slow or failing
+  device cannot delay ICMP, interface polling, Wi-Fi monitoring or alerts (tested with a hung
+  client). History is bounded: derived rates only, `qos_retention_hours` (default 24) and a hard
+  cap of 500,000 rows; raw counters are kept only for the latest poll of each element.
+
+### Troubleshooting
+
+| You see | Meaning and what to try |
+|---|---|
+| **no QoS telemetry** (`unsupported`) | The device answered but returned no DIFFSERV-MIB counters: it does not implement the MIB, or no policy with counters exists. Check with the `snmpwalk` above. This is normal for most home routers |
+| **auth failure** | Wrong user, authentication key or protocol. Compare with the interface panel: if that works, QoS does too |
+| **timeout** | Unreachable, a firewall blocks SNMP, or a wrong **privacy** key (devices answer a bad privacy key with silence) |
+| **config** | The optional SNMP dependencies are missing, or settings are unusable |
+| **stale** | No successful poll for 3 intervals plus 30 s; the last good values are dimmed, not zeroed |
+| A dash with a tooltip | No valid rate yet: first poll, reset, restart or gap. It resolves on the next two good polls |
+| Rows missing | An element that stops being reported is greyed as "last seen"; at most 64 elements per device are shown |
+
 ## API
 
 All endpoints are read-only JSON; interactive documentation is at `/docs`.
@@ -585,6 +746,8 @@ All endpoints are read-only JSON; interactive documentation is at `/docs`.
 | `GET /api/devices/{name}/quality?window_s=N&max_points=M` | One device's summary plus `points` (time buckets with `loss_pct`, `jitter_ms`, probe counts; empty buckets are omitted) and `gaps`. |
 | `GET /api/wifi` | This computer's Wi-Fi link: `{"enabled": false}` unless switched on; otherwise the latest observation (`state`, `ssid` as the privacy setting allows, `interface`, `signal_pct`, `rssi_dbm` and `rssi_source`, link rates, `radio_type`, `channel`, `age_s`, and `fields` saying for each whether it is `reported`, `simulated` or `unavailable`), the latest poll's `status` (`ok`, `pending`, `no_adapter`, `unsupported_os`, `unavailable`, `timeout`, `parse_error`, `error`), `stale`, and the low-signal `warning`. |
 | `GET /api/wifi/history?window_s=N&max_points=M` | Signal history in time buckets (mean, min and max signal quality of the connected observations, counts of connected and not-connected observations; empty buckets omitted) and `gaps`. 404 unless Wi-Fi monitoring is enabled. |
+| `GET /api/qos?device=NAME` | Latest QoS telemetry per QoS-enabled device: `adapter`, `adapter_label`, `source_mib`, `requirements`, the poll `status` (`ok`, `pending`, `unsupported`, `timeout`, `auth_failure`, `config`, `error`), `stale`, and per element `kind` (`traffic` or `drops`), `name`, `detail`, `counter_type`, `polled_at`, packets/s, bits/s, drops/s and drop %, each `null` when it cannot be known, with a `rate_note` saying why. Raw counters are never returned. Includes `definitions` and `scope` (what QoS telemetry does and does not prove). |
+| `GET /api/qos/history?device=NAME&window_s=N&max_points=M` | Derived rates over time, one series per element, in time buckets (empty buckets omitted; a bucket with no valid rate has null rates, never zero) plus `gaps` where nothing was polled. |
 | `GET /api/interfaces?device=NAME` | Latest SNMP interface statistics per SNMP device (optionally one): SNMP `status` (`ok`, `pending`, `timeout`, `auth_failure`, `unsupported`, `error`), safe `message`, `stale`, and per interface `oper_status`, `present`, `in_bps`, `out_bps`, error and discard increases since the last poll, and a `rate_note` saying why a rate is `null`. Raw counters are never returned; `simulated` says whether the data is simulated. |
 | `GET /api/alerts?limit=N` | Newest alerts first (1 to 500, default 50) with `severity`, `from_status`, `to_status`, `message`, `age_s`. |
 | `GET /healthz` | `{"ok": true}` |
@@ -601,6 +764,8 @@ quality:                   # optional; grading thresholds and minimum data (see 
 wifi:                      # optional; OFF unless enabled (see Wi-Fi signal monitoring)
   enabled: false           # also poll_interval_s, backend, ssid_privacy, low_signal_pct,
                            # warn_after_polls, retention_days and (simulated) sim: {...}
+qos_poll_interval_s: 30    # QoS telemetry polling; default 30; minimum 1 simulated, 10 real
+qos_retention_hours: 24    # QoS history kept; 1 to 168
 devices:
   - name: access-switch    # 1-64 chars: letters, digits . _ -
     address: 192.0.2.10    # simulated: any label without spaces; real: one IPv4 address or hostname
@@ -617,6 +782,15 @@ devices:
         - {name: Gi0/1, in_mbps: 180, out_mbps: 60, status: up,
            in_errors_per_min: 0, out_errors_per_min: 0, in_discards_per_min: 0,
            out_discards_per_min: 0, wrap_at_s: 75, disappears_at_s: 100}
+      qos:                 # simulated QoS policy: up to 16 classes sharing one link
+        interface: wan0
+        capacity_mbps: 100
+        congestion: {start_s: 60, duration_s: 55, surge_factor: 2.0}
+        classes:           # name, offered_mbps, priority, weight, surges, avg_packet_bytes,
+          - {name: Voice, offered_mbps: 6, priority: true}   # counter_bits (32 or 64), wrap_at_s
+    qos:                   # real mode only (off unless enabled); reuses this device's snmp block
+      enabled: false
+      adapter: diffserv-mib   # the only supported adapter; anything else is rejected
     snmp:                  # real mode only (off unless enabled); SNMPv3, see the SNMP section
       enabled: false
       credentials_env: NETMONLT_SNMP_ACCESS_SWITCH   # prefix of <PREFIX>_USER / _AUTH_KEY / _PRIV_KEY
@@ -635,7 +809,7 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-896 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
+1185 tests cover the alert state machine (transitions, repeated polling, recovery, restarts,
 persistence, schema upgrade), the ICMP prober and its safety rules (with a fake command runner
 and recorded or constructed `ping` output), inventory validation, the collector's error handling,
 storage, the history and downsampling queries, the API and the CLI, and for SNMP: the counter
@@ -652,7 +826,13 @@ adapters, no adapter, stopped service, another language), the native API structu
 decoding with synthetic buffers, the helper process and its timeout, the backends and fallback
 rules, the simulated script, storage and retention, the poller's failure handling, isolation from
 ICMP and SNMP with a hung source, the warning rules, the `wifi:` configuration, both endpoints
-and the dashboard panel's rules. None touch a network, run a real
+and the dashboard panel's rules. For QoS: the counter maths (first sample, 32 and 64-bit
+rollover, reset, restart, discontinuity, gaps, missing values, drop %), the adapter registry with
+every OID pinned to the verified MIB, the DIFFSERV-MIB parsing (pointers, ambiguity, invalid
+values, nothing fabricated for unsupported devices), the simulated policy (allocation, congestion,
+rollover, restart, determinism), the `qos` configuration rules, storage and retention, the poller
+(failures, unsupported, hung client, isolation from ICMP, SNMP and Wi-Fi), the real client with its
+pysnmp calls faked, both endpoints and the dashboard section's rules. None touch a network, run a real
 `ping` or need an SNMP device.
 
 **What has and hasn't been verified**
@@ -666,6 +846,8 @@ and the dashboard panel's rules. None touch a network, run a real
 | Real SNMPv3 | Run end to end (authPriv, SHA-256 and AES-128) against a **net-snmp agent on loopback on Linux**, including wrong key, wrong user and wrong privacy key, and a search of the log, API and database for the passphrases. **Not tested against real network hardware, other SNMP agents, other protocol combinations, or on Windows or macOS.** |
 | Windows and macOS `ping` parsing | Tested only against sample output built from each tool's documented format; **not run on real Windows or macOS.** |
 | Network quality | Grades observed on real runs of the simulated demo (see the table above) and on real ICMP against loopback on Linux (sub-millisecond latency, 0 loss). The Unknown, stale, sparse-history, no-reply, no-jitter-pairs and API-error displays were checked in Chromium by serving the real API's responses for each scenario to the page. **Not measured on real WAN or wireless links, and the grading thresholds are untuned heuristics.** |
+| QoS telemetry (real client) | **No real QoS-capable device was available.** The real client was run end to end over genuine SNMPv3 (authPriv, SHA-256 and AES-128) against a **net-snmp agent on loopback on Linux that serves synthetic DIFFSERV-MIB data from a script I wrote**: this verified the walks, Counter64 and OID values, `ifName` and `ifCounterDiscontinuityTime` lookups, rates from two real polls, `unsupported` for an agent without the MIB, wrong keys giving `auth_failure` or `timeout`, and no passphrase in the output or database. It does **not** show that any real device implements DIFFSERV-MIB or reports meaningful values. |
+| QoS telemetry (simulated, dashboard) | Checked in headless Chromium: the live scripted timeline (congestion, rollover, restart), and the unsupported, stale, timeout, auth-failure, error, pending, absent-element, gap, API-error and mobile states using the real API's responses. |
 | Wi-Fi (Windows backends) | **Not run on real Windows or Wi-Fi hardware by the author.** The `netsh` parser is tested against sample output built from the documented English format. The WLAN API structure sizes and offsets are checked against values worked out from the Windows headers, not against the DLL, and the decoding against synthetic buffers. The helper-process plumbing (JSON, timeouts, killing a hung child, validation) is exercised for real on Linux, where it correctly reports "unsupported". A test also runs the helper on whatever machine runs the tests, so a Windows CI runner will call the real `wlanapi.dll` (it has no Wi-Fi adapter, so it should report no adapter or service unavailable), but that has not been run yet. |
 | Wi-Fi (simulated, dashboard) | Checked in headless Chromium: the scripted dip, warning and disconnection, and each unavailable state (Ethernet-only, unsupported OS, timeout, stale, API error) using the real API's responses. |
 | Dashboard | Checked by hand in headless Chromium (desktop, 375 and 390 px wide, dark mode). **Not tested in Firefox, Safari or Edge;** the one-second "ago" labels have Node.js tests, the rest of the JavaScript has none. |
@@ -682,6 +864,10 @@ src/netmonlt/
   collector.py     polling loop
   alerts.py        alert state machine
   quality.py       latency, jitter, packet-loss maths and grading (pure functions)
+  qos.py           QoS counter maths: rates, rollover, reset, discontinuity (pure functions)
+  qos_adapters.py  the explicit QoS adapter registry and the DIFFSERV-MIB adapter
+  qos_sim.py       deterministic simulated QoS telemetry
+  qos_poller.py    QoS polling loop, separate from every other collector
   wifi.py          Wi-Fi data model, SSID privacy, netsh parsing, simulated source, warnings
   wifi_windows.py  Windows source: runs the helper or netsh as a time-limited process
   wifi_wlanapi.py  native WLAN API helper (ctypes), run as a child process
@@ -710,6 +896,13 @@ JavaScript framework or build step.
   vendor-defined percentage, so values are not comparable between adapters, and link rate is
   negotiated, not throughput. No roaming, access-point or band analysis, no rate history chart,
   and the low-signal warning is not an alert. Observations are kept for 7 days by default.
+- **QoS telemetry:** only the standard DIFFSERV-MIB adapter exists, and **it has not been
+  verified on any real device** (few devices implement it). Vendor MIBs such as Cisco's
+  CBQoS are the usual real-world source but are deliberately not supported until their OIDs can
+  be verified. Elements are labelled by index, not by class name, and traffic and drops are
+  separate rows, so there is no drop % for DIFFSERV-MIB. It shows what one device counted, not
+  that QoS is enforced or effective, and it cannot show DSCP markings. At most 64 elements per
+  device; polling at least every 10 s in real mode.
 - **Network quality:** jitter is calculated from each check's average of 3 pings (stored data
   only), so it is smoother than per-packet jitter and is neither RFC 3550 jitter nor one-way
   delay. Loss resolution depends on the probes in the window (3 per check). ICMP can be

@@ -38,6 +38,32 @@ class SimInterface:
 
 
 @dataclass(frozen=True)
+class SimQosClass:
+    """One simulated traffic class on a simulated QoS policy."""
+
+    name: str
+    offered_mbps: float  # average traffic offered to the class
+    priority: bool = False  # served first, ahead of the other classes
+    weight: float = 1.0  # share of what is left when the link is congested
+    surges: bool = False  # offered traffic rises during the congestion period
+    avg_packet_bytes: int = 800
+    counter_bits: int = 64  # 32 or 64: the width of this class's counters
+    wrap_at_s: float | None = None  # the counters roll over this long after start
+
+
+@dataclass(frozen=True)
+class SimQosProfile:
+    """A simulated egress policy: classes sharing a link, with a scripted congestion period."""
+
+    interface: str = "wan0"
+    capacity_mbps: float = 100.0
+    congestion_start_s: float | None = None
+    congestion_duration_s: float = 0.0
+    surge_factor: float = 1.0
+    classes: tuple[SimQosClass, ...] = ()
+
+
+@dataclass(frozen=True)
 class SimProfile:
     """How a simulated device behaves. Ignored by real probers."""
 
@@ -48,6 +74,7 @@ class SimProfile:
     outage_duration_s: float = 0.0
     interfaces: tuple[SimInterface, ...] = ()  # simulated SNMP interfaces; none = no SNMP
     reboot_at_s: float | None = None  # all counters and the uptime restart at this time
+    qos: SimQosProfile | None = None  # simulated QoS policy; none = no QoS telemetry
 
 
 @dataclass(frozen=True)
@@ -129,6 +156,17 @@ class WifiConfig:
 
 
 @dataclass(frozen=True)
+class QosConfig:
+    """Opt-in, read-only QoS telemetry for one real device: which documented adapter to use.
+
+    The device's existing SNMPv3 settings (SnmpConfig) supply the credentials, so this holds
+    nothing secret and needs no new keys or variables.
+    """
+
+    adapter: str
+
+
+@dataclass(frozen=True)
 class Device:
     name: str
     address: str
@@ -138,6 +176,8 @@ class Device:
     authorized: bool = False
     # Real SNMP polling; None unless the device explicitly enables it (never the default).
     snmp: SnmpConfig | None = None
+    # Real QoS telemetry; None unless the device explicitly enables it (never the default).
+    qos: QosConfig | None = None
 
 
 @dataclass(frozen=True)

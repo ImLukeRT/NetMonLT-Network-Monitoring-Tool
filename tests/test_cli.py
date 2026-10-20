@@ -305,3 +305,133 @@ def test_simulated_mode_never_creates_the_windows_source(tmp_path, served, captu
     monkeypatch.setattr("netmonlt.wifi_windows.WindowsWifiSource", forbidden)
     assert main(["--inventory", write_inventory(tmp_path, SIM_WIFI),
                  "--db", str(tmp_path / "x.db")]) == 0
+
+
+# ------------------------------------------------------------------ QoS wiring
+SIM_QOS = """\
+mode: simulated
+qos_poll_interval_s: 5
+devices:
+  - name: fw
+    address: 192.0.2.1
+    sim:
+      qos:
+        classes: [{name: Voice, offered_mbps: 5, priority: true}]
+  - name: plain
+    address: 192.0.2.2
+"""
+REAL_QOS = """\
+mode: real
+poll_interval_s: 10
+devices:
+  - name: r1
+    address: 127.0.0.1
+    authorized: true
+    snmp: {enabled: true, credentials_env: NETMONLT_SNMP_R1, port: 1161}
+    qos: {enabled: true, adapter: diffserv-mib}
+"""
+
+
+def test_simulated_qos_policies_start_a_simulated_qos_client(
+    tmp_path, served, captured_app, capsys
+):
+    rc = main(["--inventory", write_inventory(tmp_path, SIM_QOS), "--db", str(tmp_path / "x.db")])
+    assert rc == 0
+    assert type(captured_app["qos_client"]).__name__ == "SimulatedQosClient"
+    assert "Simulated QoS telemetry for: fw" in capsys.readouterr().out
+
+
+def test_no_qos_client_is_created_when_no_device_has_qos(tmp_path, served, captured_app):
+    plain = "devices:\n  - {name: a, address: 192.0.2.1}\n"
+    assert main(["--inventory", write_inventory(tmp_path, plain),
+                 "--db", str(tmp_path / "x.db")]) == 0
+    assert "qos_client" not in captured_app
+
+
+def test_the_shipped_demo_inventory_starts_simulated_qos(tmp_path, served, captured_app):
+    assert main(["--inventory", SHIPPED_INVENTORY, "--db", str(tmp_path / "x.db")]) == 0
+    assert type(captured_app["qos_client"]).__name__ == "SimulatedQosClient"
+
+
+def test_real_qos_with_missing_credentials_stops_and_names_only_the_variables(
+    tmp_path, served, app_capture, monkeypatch, capsys
+):
+    pytest.importorskip("pysnmp")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETMONLT_SNMP_R1_USER", "monitor")
+    monkeypatch.delenv("NETMONLT_SNMP_R1_AUTH_KEY", raising=False)
+    monkeypatch.delenv("NETMONLT_SNMP_R1_PRIV_KEY", raising=False)
+    rc = main(["--inventory", write_inventory(tmp_path, REAL_QOS)])
+    err = capsys.readouterr().err
+    assert rc == 2 and not served and not app_capture
+    assert "NETMONLT_SNMP_R1_AUTH_KEY" in err and "monitor" not in err
+    assert not (tmp_path / "data").exists()  # nothing was created
+
+
+def test_real_qos_without_the_optional_dependencies_explains_how_to_install_them(
+    tmp_path, served, app_capture, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(sys.modules, "netmonlt.snmp_pysnmp", None)  # makes the import fail
+    rc = main(["--inventory", write_inventory(tmp_path, REAL_QOS)])
+    err = capsys.readouterr().err
+    # QoS needs SNMP on the same device, so the shared dependency check reports it first
+    assert rc == 2 and not served and "uv sync --extra snmp" in err
+
+
+def test_the_qos_client_builder_names_the_missing_dependency_itself(monkeypatch):
+    from netmonlt.__main__ import _real_qos_client
+
+    monkeypatch.setitem(sys.modules, "netmonlt.snmp_pysnmp", None)
+    with pytest.raises(ImportError, match="QoS polling needs the optional SNMP dependencies"):
+        _real_qos_client([])
+
+
+def test_real_qos_starts_with_credentials_and_never_prints_them(
+    tmp_path, served, monkeypatch, capsys
+):
+    pytest.importorskip("pysnmp")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NETMONLT_SNMP_R1_USER", SECRET + "-user")
+    monkeypatch.setenv("NETMONLT_SNMP_R1_AUTH_KEY", SECRET + "-auth")
+    monkeypatch.setenv("NETMONLT_SNMP_R1_PRIV_KEY", SECRET + "-priv")
+    captured = {}
+    monkeypatch.setattr(
+        "netmonlt.__main__.create_app",
+        lambda inv, db, prober, **kw: captured.update(kw) or object(),
+    )
+    monkeypatch.setattr("netmonlt.__main__.IcmpProber", FakePinger)
+    FakePinger.instances, FakePinger.fail_with = [], None
+    assert main(["--inventory", write_inventory(tmp_path, REAL_QOS)]) == 0
+    out = capsys.readouterr()
+    assert "REAL read-only QoS telemetry (SNMPv3) is ON" in out.out
+    assert "for these configured devices only" in out.out
+    assert "r1 (127.0.0.1, adapter diffserv-mib)" in out.out
+    assert SECRET not in out.out and SECRET not in out.err
+    assert type(captured["qos_client"]).__name__ == "PySnmpQosClient"
+    assert SECRET not in repr(captured["qos_client"])
+
+
+def test_real_mode_with_snmp_but_without_qos_never_creates_a_qos_client(
+    tmp_path, served, monkeypatch
+):
+    pytest.importorskip("pysnmp")
+    monkeypatch.chdir(tmp_path)
+    for suffix in ("USER", "AUTH_KEY", "PRIV_KEY"):
+        monkeypatch.setenv(f"NETMONLT_SNMP_R1_{suffix}", SECRET + suffix)
+    captured = {}
+    monkeypatch.setattr(
+        "netmonlt.__main__.create_app",
+        lambda inv, db, prober, **kw: captured.update(kw) or object(),
+    )
+    monkeypatch.setattr("netmonlt.__main__.IcmpProber", FakePinger)
+    FakePinger.instances, FakePinger.fail_with = [], None
+    assert main(["--inventory", write_inventory(tmp_path, REAL_SNMP)]) == 0
+    assert "snmp_client" in captured and "qos_client" not in captured
+
+
+def test_simulated_mode_never_creates_the_real_qos_client(tmp_path, served, captured_app,
+                                                          monkeypatch):
+    monkeypatch.setitem(sys.modules, "netmonlt.snmp_pysnmp", None)  # would fail if imported
+    assert main(["--inventory", write_inventory(tmp_path, SIM_QOS),
+                 "--db", str(tmp_path / "x.db")]) == 0

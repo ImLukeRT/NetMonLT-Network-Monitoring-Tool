@@ -10,13 +10,15 @@
           --up:#067647; --up-bg:#d1fadf; --deg:#93370d; --deg-bg:#fef0c7;
           --down:#b42318; --down-bg:#fee4e2; --none:#475467; --none-bg:#eaecf0; --accent:#2563eb;
           --f-up:#12b76a; --f-deg:#f79009; --f-down:#d92d20;
-          --good:#175cd3; --good-bg:#d1e0ff; }
+          --good:#175cd3; --good-bg:#d1e0ff;
+          --s1:#2563eb; --s2:#12b76a; --s3:#f79009; --s4:#7a5af8; --s5:#0e9384; --s6:#667085; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#0f1318; --card:#171c23; --fg:#e6e9ee; --muted:#98a2b3; --line:#2a313b;
             --up:#6ce9a6; --up-bg:#0b3a24; --deg:#fec84b; --deg-bg:#4a2f06;
             --down:#fda29b; --down-bg:#55160f; --none:#cbd5e1; --none-bg:#2a313b; --accent:#7cacf8;
             --f-up:#32d583; --f-deg:#fdb022; --f-down:#f97066;
-            --good:#84adff; --good-bg:#102a56; }
+            --good:#84adff; --good-bg:#102a56;
+            --s1:#7cacf8; --s2:#32d583; --s3:#fdb022; --s4:#a48afb; --s5:#2ed3b7; --s6:#98a2b3; }
   }
   body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg);
          font:15px/1.5 system-ui, sans-serif; }
@@ -138,6 +140,29 @@
   .qchart .wband { fill:var(--accent); opacity:.16; }
   .qchart .offzone { fill:var(--f-down); opacity:.22; }
   .sw-off { background:var(--f-down); opacity:.5; }
+  #qos-panel[hidden] { display:none; }
+  #qos-note { font-size:13px; padding:6px 10px; border-radius:6px; margin:0 0 8px;
+              background:var(--down-bg); color:var(--down); }
+  #qos-note:empty { display:none; }
+  #qos-wrap th, #qos-wrap td { padding-left:10px; padding-right:10px; }
+  #qos-wrap th { white-space:normal; }
+  td.qname { white-space:normal; overflow-wrap:anywhere; max-width:260px; }
+  td.qname small { display:block; color:var(--muted); font-size:12px; }
+  tr.qos-device td { background:var(--bg); font-weight:600; padding:8px 14px; white-space:normal; }
+  tr.qos-device .badge { display:inline-block; margin:2px 0 2px 8px; font-weight:600; white-space:normal; }
+  tr.qos-device .src { display:block; font-weight:400; color:var(--muted); font-size:12px; margin-top:2px; }
+  tr.qos-absent td { color:var(--muted); font-style:italic; }
+  .qwin, .qmetric { display:inline-flex; gap:4px; }
+  .qwin button, .qmetric button { font:inherit; font-size:13px; color:var(--fg); background:var(--bg);
+                 border:1px solid var(--line); border-radius:6px; padding:3px 8px; cursor:pointer; }
+  .qwin button[aria-pressed="true"], .qmetric button[aria-pressed="true"] {
+    background:var(--fg); color:var(--bg); border-color:var(--fg); }
+  #qos-chart-card { margin-top:12px; }
+  .qchart .norate { fill:var(--muted); opacity:.28; }
+  .qchart .sline { fill:none; stroke-width:1.75; stroke-linejoin:round; }
+  .qchart .sdot { stroke-width:1.75; fill:var(--card); }
+  #qos-legend { display:flex; flex-wrap:wrap; gap:4px 14px; color:var(--muted); font-size:12px; margin-top:6px; }
+  #qos-legend i { display:inline-block; width:14px; height:3px; margin-right:5px; vertical-align:3px; border-radius:2px; }
   #if-panel[hidden] { display:none; }
   .if-head { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:center; margin:28px 0 8px; }
   .if-head h2 { margin:0; }
@@ -312,6 +337,61 @@
       <div class="if-caption">
         Rates are averages over the last poll interval. Errors and discards are the increase since
         the previous poll. A dash means the value is not known, and hovering it says why.
+      </div>
+    </div>
+  </section>
+  <section id="qos-panel" hidden>
+    <div class="if-head">
+      <h2>QoS telemetry (SNMP)</h2>
+      <span id="qos-badge" class="banner"></span>
+    </div>
+    <div id="qos-note" role="status"></div>
+    <div class="wrap" id="qos-wrap">
+      <table>
+        <thead><tr>
+          <th>Class / element</th><th>Packets/s</th><th>Throughput</th><th>Drops/s</th>
+          <th>Drop %</th><th>Counters</th><th>Updated</th>
+        </tr></thead>
+        <tbody id="qos-rows"></tbody>
+      </table>
+      <div class="q-caption">
+        QoS telemetry is what a <b>device itself counts</b> for a QoS policy element (a traffic
+        class, a count action or a queue's dropper), read read-only over SNMPv3 through a
+        documented adapter; the source MIB, adapter and counter width are shown for each device.
+        It is <b>not</b> the Network quality grades above (those describe how ping behaved end to
+        end), <b>not</b> the interface discards in the table below (those count everything
+        dropped on a port, not one class or queue), and <b>not</b> DSCP markings observed in
+        traffic (NetMonLT never inspects packets). Counters existing does not prove that QoS is
+        enforced or effective. A dash means unknown, and hovering it says why: a rate needs two
+        valid polls, so the first poll, a counter reset or a device restart has none. Drop % is
+        shown only where one element counts both its traffic and its drops.
+      </div>
+    </div>
+    <div class="wrap chart-card" id="qos-chart-card">
+      <div class="chart-controls">
+        <label>Device <select id="qos-device"></select></label>
+        <div class="qmetric" role="group" aria-label="QoS metric">
+          <button type="button" data-qmetric="bps" aria-pressed="true">Throughput</button>
+          <button type="button" data-qmetric="drop_pps" aria-pressed="false">Drops/s</button>
+          <button type="button" data-qmetric="drop_pct" aria-pressed="false">Drop %</button>
+        </div>
+        <div class="qwin" role="group" aria-label="QoS history window">
+          <button type="button" data-qwindow="900" aria-pressed="true">15 min</button>
+          <button type="button" data-qwindow="3600" aria-pressed="false">1 h</button>
+          <button type="button" data-qwindow="21600" aria-pressed="false">6 h</button>
+          <button type="button" data-qwindow="86400" aria-pressed="false">24 h</button>
+        </div>
+      </div>
+      <div class="qbox" id="qos-chart-box">
+        <svg class="qchart" id="qos-chart" role="img" aria-label="QoS history chart"></svg>
+        <div class="qmsg" id="qos-chart-msg">Loading…</div>
+        <div class="qtip" id="qos-chart-tip" hidden></div>
+      </div>
+      <div id="qos-legend"></div>
+      <div id="qos-summary" class="chart-summary-line"></div>
+      <div class="legend" aria-hidden="true">
+        <span><i class="sw-gap"></i>No data: not polled</span>
+        <span><i class="sw-off" style="background:var(--muted);opacity:.3"></i>Polled, but no valid rate (first poll, reset, restart)</span>
       </div>
     </div>
   </section>
@@ -1235,6 +1315,312 @@ window.addEventListener("resize", () => {
 });
 refreshWifi();
 setInterval(refreshWifi, 5000);
+
+// ---- QoS telemetry (SNMP): what a device counts for its own QoS policy elements ------------------
+// Every rate is derived by the server from two valid consecutive polls; null means unknown and is
+// shown as a dash, never as zero. Nothing here proves QoS is enforced or effective.
+const qosPanel = document.getElementById("qos-panel");
+const qosRows = document.getElementById("qos-rows");
+const qosNote = document.getElementById("qos-note");
+const qosWrap = document.getElementById("qos-wrap");
+const qosBadge = document.getElementById("qos-badge");
+const qosDeviceSelect = document.getElementById("qos-device");
+const qosChartCard = document.getElementById("qos-chart-card");
+const qosLegend = document.getElementById("qos-legend");
+const qosSummary = document.getElementById("qos-summary");
+let qosDevice = null, qosWindow = 900, qosMetric = "bps", qosDetail = null, qosLoaded = false, qosReq = 0;
+const QOS_NOTES = {
+  first_sample: "A rate needs two polls; this is the first for this element",
+  counter_reset: "The counters went down or the device restarted; rates resume at the next poll",
+  discontinuity: "The device reported a counter discontinuity (for example its interface counters were reset); rates resume at the next poll",
+  gap: "Too long since the previous poll to calculate a rate",
+  clock_step: "The clock did not move forward between polls, so no rate was calculated",
+  no_counters: "The device reported this element without any usable counter",
+  absent: "The device no longer reports this element",
+};
+const QOS_METRICS = {
+  bps: {label: "Throughput", axis: "bps"},
+  drop_pps: {label: "Drops per second", axis: "pps"},
+  drop_pct: {label: "Drop %", axis: "pct"},
+};
+
+function fmtPps(v) {
+  if (v === null || v === undefined) return "–";
+  if (v < 1000) return (v < 10 ? v.toFixed(1) : Math.round(v)) + " pps";
+  return (v / 1000).toFixed(1) + " kpps";
+}
+
+function qosCell(value, text, row, notCounted) {
+  const td = cell(value === null || value === undefined ? "–" : text, "num" + (value === null || value === undefined ? " na" : ""));
+  if (value === null || value === undefined) {
+    td.title = row.rate_note ? (QOS_NOTES[row.rate_note] || "Not known") : notCounted;
+  }
+  return td;
+}
+
+function renderQos(data) {
+  qosPanel.hidden = !data.enabled;
+  if (!data.enabled) return;
+  qosBadge.textContent = data.simulated ? "SIMULATED QoS DATA" : "SNMPv3 · read-only";
+  qosBadge.className = "banner" + (data.simulated ? "" : " live");
+  qosRows.replaceChildren();
+  for (const entry of data.devices) {
+    const st = entry.status;
+    const failed = st.status !== "ok" && st.status !== "pending";
+    const head = document.createElement("tr");
+    head.className = "qos-device";
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    td.append(entry.device);
+    const adapter = document.createElement("span");
+    adapter.className = "badge " + (data.simulated ? "degraded" : "unknown");
+    adapter.textContent = data.simulated ? "simulated" : "adapter: " + entry.adapter_label;
+    td.appendChild(adapter);
+    const state = document.createElement("span");
+    state.className = "badge " + (st.status === "pending" ? "unknown" : failed ? "down" : st.stale ? "stale" : "up");
+    state.textContent = st.status === "pending" ? "waiting for first poll"
+      : st.status === "unsupported" ? "no QoS telemetry" : failed ? "QoS " + st.status.replace("_", " ") : st.stale ? "stale" : "QoS ok";
+    td.appendChild(state);
+    const source = document.createElement("span");
+    source.className = "src";
+    source.textContent = (st.last_ok_age_s === null ? "Configured to read: " : "Source: ") + (entry.source_mib || "unknown")
+      + (entry.truncated > 0 ? " · " + entry.truncated + " more elements not shown" : "");
+    td.appendChild(source);
+    if (failed || st.stale) {
+      const why = document.createElement("span");
+      why.className = "src";
+      const lastGood = st.last_ok_age_s === null ? "no successful poll yet" : "last good data ";
+      why.textContent = (st.message ? st.message + "; " : "") + (st.last_ok_age_s === null ? lastGood : "");
+      if (st.last_ok_age_s !== null) setAge(why, st.last_ok_age_s, "seconds", (st.message ? st.message + "; " : "") + lastGood);
+      td.appendChild(why);
+      if (st.status === "unsupported" && entry.requirements) {
+        const need = document.createElement("span");
+        need.className = "src";
+        need.textContent = "Requires: " + entry.requirements;
+        td.appendChild(need);
+      }
+    }
+    head.appendChild(td);
+    qosRows.appendChild(head);
+
+    const dim = failed || st.stale;
+    for (const r of entry.rows) {
+      const tr = document.createElement("tr");
+      tr.className = (dim ? "dim " : "") + (r.present ? "" : "qos-absent");
+      const name = cell("", "qname");
+      name.append(r.name);
+      if (r.detail) {
+        const small = document.createElement("small");
+        small.textContent = r.detail + (r.kind === "drops" ? " · counts drops only" : "");
+        name.appendChild(small);
+      }
+      const dropsOnly = "This element counts only drops, not traffic";
+      const noDrops = "This element does not count drops";
+      const updated = cell("", "num");
+      setAge(updated, r.age_s, "seconds", r.present ? "" : "last seen ");
+      tr.append(
+        name,
+        qosCell(r.pps, fmtPps(r.pps), r, r.kind === "drops" ? dropsOnly : "Not counted"),
+        qosCell(r.bps, fmtBps(r.bps), r, r.kind === "drops" ? dropsOnly : "Not counted"),
+        qosCell(r.drop_pps, fmtPps(r.drop_pps), r, noDrops),
+        qosCell(r.drop_pct, r.drop_pct === null ? "" : r.drop_pct.toFixed(1) + " %", r,
+                "Shown only where one element counts both its traffic and its drops"),
+        cell(r.counter_type + " · " + (data.simulated ? "simulated" : r.kind), "num"),
+        updated,
+      );
+      qosRows.appendChild(tr);
+    }
+    if (entry.rows.length === 0 && st.status !== "pending") {
+      const tr = document.createElement("tr");
+      tr.appendChild(cell("No QoS elements to show: nothing is invented."));
+      tr.firstChild.colSpan = 7;
+      tr.firstChild.className = "na";
+      qosRows.appendChild(tr);
+    }
+  }
+  const names = data.devices.map((d) => d.device);
+  if (names.join("\n") !== Array.from(qosDeviceSelect.options, (o) => o.value).join("\n")) {
+    qosDeviceSelect.replaceChildren(...names.map((n) => { const o = document.createElement("option"); o.value = o.textContent = n; return o; }));
+  }
+  if (!names.includes(qosDevice)) qosDevice = names[0] || null;
+  qosDeviceSelect.value = qosDevice || "";
+}
+
+function qosAxisLabel(axis, v) {
+  if (axis === "bps") return v === 0 ? "0" : fmtBps(v).replace(/ (bps|kbps|Mbps|Gbps)$/, " $1");
+  if (axis === "pps") return v === 0 ? "0" : fmtPps(v);
+  return Number(v.toFixed(1)) + " %";
+}
+
+function drawQosChart(d) {
+  const svg = document.getElementById("qos-chart"), box = document.getElementById("qos-chart-box");
+  const msg = document.getElementById("qos-chart-msg"), tip = document.getElementById("qos-chart-tip");
+  const show = (text) => { svg.replaceChildren(); svg.style.display = "none"; tip.hidden = true; qosLegend.replaceChildren(); msg.textContent = text; msg.hidden = false; };
+  const metric = QOS_METRICS[qosMetric];
+  if (d.first_ts === null) return show("No observations yet for this device.");
+  const series = d.series.filter((s) => s.points.some((p) => p[qosMetric] !== null));
+  if (series.length === 0) {
+    return show(d.series.length === 0 ? "No observations in the last " + windowLabel(d.window_s) + "."
+      : qosMetric === "drop_pct" ? "No drop % to show: it needs one element that counts both its traffic and its drops, and none of this device's elements does (or no rate could be derived yet)."
+      : "No valid " + metric.label.toLowerCase() + " in this window: no element reports it, or no rate could be derived yet.");
+  }
+  msg.hidden = true;
+  svg.style.display = "block";
+  svg.replaceChildren();
+  const W = Math.max(320, box.clientWidth), H = 220;
+  const m = {l: 66, r: 14, t: 10, b: 28};
+  const pw = W - m.l - m.r, ph = H - m.t - m.b, bottom = m.t + ph;
+  const x0 = Math.min(Math.max(d.start, d.first_ts), d.end - 30), x1 = d.end, span = x1 - x0;
+  const xs = (t) => m.l + Math.min(1, Math.max(0, (t - x0) / span)) * pw;
+  let maxV = 0;
+  for (const s of series) for (const p of s.points) if (p[qosMetric] !== null) maxV = Math.max(maxV, p[qosMetric]);
+  const scale = niceScale(metric.axis === "pct" ? Math.max(maxV, 1) : maxV);
+  if (metric.axis === "pct" && scale.max > 100) { scale.max = 100; scale.step = 25; }
+  const ys = (v) => bottom - (v / scale.max) * ph;
+  svg.setAttribute("width", W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.setAttribute("aria-label", metric.label + " per QoS element for " + d.device + ". " + series.map((s) => s.name).join(", "));
+  const defs = svgEl("defs", {}, svg);
+  const hatch = svgEl("pattern", {id: "qos-hatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)"}, defs);
+  svgEl("line", {x1: 0, y1: 0, x2: 0, y2: 6, class: "hatch-line"}, hatch);
+  for (let v = 0; v <= scale.max + scale.step / 1000; v += scale.step) {
+    svgEl("line", {x1: m.l, x2: m.l + pw, y1: ys(v), y2: ys(v), class: "grid"}, svg);
+    svgEl("text", {x: m.l - 6, y: ys(v) + 4, "text-anchor": "end"}, svg).textContent = qosAxisLabel(metric.axis, v);
+  }
+  for (const g of d.gaps) {
+    const a = xs(Math.max(g.start, x0)), b = xs(Math.min(g.end, x1));
+    if (b - a >= 0.5) svgEl("rect", {x: a, y: m.t, width: b - a, height: ph, fill: "url(#qos-hatch)", class: "gapzone", "data-kind": "gap"}, svg);
+  }
+  // Polled, but no valid rate (first poll, counter reset, device restart): a pale band when the
+  // whole bucket had none, or a thin marker when only some samples in it had none.
+  const marks = new Map();
+  for (const s of d.series) for (const p of s.points) {
+    if (p.no_rate === 0) continue;
+    const e = marks.get(p.start) || {all: 0, some: 0, end: p.end};
+    e.some += 1;
+    if (p.no_rate === p.samples) e.all += 1;
+    marks.set(p.start, e);
+  }
+  const half = Math.max(1, Math.ceil(d.series.length / 2));
+  for (const [start, e] of marks) {
+    const a = xs(start), b = xs(e.end);
+    if (e.all >= half) svgEl("rect", {x: a, y: m.t, width: Math.max(2, b - a), height: ph, class: "norate", "data-kind": "norate"}, svg);
+    else if (e.some >= half) svgEl("rect", {x: a, y: m.t, width: 2, height: ph, class: "norate", "data-kind": "norate-mark"}, svg);
+  }
+  const centre = (p) => (p.start + p.end) / 2;
+  const hasGapBetween = (a, b) => d.gaps.some((g) => g.start < centre(b) && g.end > centre(a));
+  const colorOf = (i) => "var(--s" + ((i % 6) + 1) + ")";
+  qosLegend.replaceChildren();
+  series.forEach((s, i) => {
+    const color = colorOf(i);
+    let run = [], prev = null;
+    const flush = () => {
+      if (run.length > 1) svgEl("polyline", {points: run.map((p) => xs(centre(p)) + "," + ys(p[qosMetric])).join(" "), class: "sline", stroke: color, "data-kind": "line", "data-series": s.name}, svg);
+      if (run.length === 1 || s.points.length <= 60) for (const p of run) svgEl("circle", {cx: xs(centre(p)), cy: ys(p[qosMetric]), r: 3, class: "sdot", stroke: color, "data-kind": "point"}, svg);
+      run = [];
+    };
+    for (const p of s.points) {
+      if (p[qosMetric] === null) { flush(); prev = null; continue; }
+      if (prev && (Math.abs(p.start - prev.end) > 0.5 || hasGapBetween(prev, p))) flush();
+      run.push(p);
+      prev = p;
+    }
+    flush();
+    const item = document.createElement("span");
+    const sw = document.createElement("i");
+    sw.style.background = color;
+    item.append(sw, s.name);
+    qosLegend.appendChild(item);
+  });
+  const ticks = Math.max(1, Math.min(4, Math.floor(pw / 110)));
+  for (let i = 0; i <= ticks; i++) {
+    const t = x0 + (span * i) / ticks;
+    svgEl("text", {x: xs(t), y: bottom + 18, "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle", "data-kind": "tick"}, svg).textContent = fmtTick(t, span);
+  }
+  const cross = svgEl("line", {y1: m.t, y2: bottom, class: "cross", visibility: "hidden"}, svg);
+  const overlay = svgEl("rect", {x: m.l, y: m.t, width: pw, height: ph, fill: "transparent"}, svg);
+  const formatValue = (v) => v === null ? "no valid rate" : metric.axis === "bps" ? fmtBps(v) : metric.axis === "pps" ? fmtPps(v) : v.toFixed(1) + " %";
+  overlay.addEventListener("pointermove", (ev) => {
+    const px = ev.clientX - svg.getBoundingClientRect().left;
+    const t = x0 + ((px - m.l) / pw) * span;
+    const rows = series.map((s) => [s.name, s.points.find((q) => t >= q.start && t < q.end)]).filter((r) => r[1]);
+    const gap = d.gaps.find((g) => t >= g.start && t <= g.end);
+    let lines = null, at = px;
+    if (rows.length) {
+      const any = rows[0][1];
+      lines = [new Date(any.start * 1000).toLocaleTimeString() + " to " + new Date(any.end * 1000).toLocaleTimeString()];
+      for (const [name, p] of rows) lines.push(name + ": " + formatValue(p[qosMetric]));
+      at = xs(centre(any));
+    } else if (gap) {
+      lines = ["Not polled", fmtDuration(gap.end - gap.start) + " without a poll", "(not the same as zero traffic or zero drops)"];
+    }
+    if (!lines) { tip.hidden = true; cross.setAttribute("visibility", "hidden"); return; }
+    tip.textContent = lines.join("\n");
+    tip.hidden = false;
+    tip.style.left = Math.max(0, Math.min(at + 12, box.clientWidth - tip.offsetWidth)) + "px";
+    cross.setAttribute("x1", at);
+    cross.setAttribute("x2", at);
+    cross.setAttribute("visibility", "visible");
+  });
+  overlay.addEventListener("pointerleave", () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+}
+
+function qosSummaryText(d) {
+  const parts = ["Last " + windowLabel(d.window_s), "each point covers " + fmtDuration(d.bucket_s), d.series.length + (d.series.length === 1 ? " element" : " elements")];
+  if (d.gaps.length) parts.push(d.gaps.length + (d.gaps.length === 1 ? " gap" : " gaps") + " with no polls");
+  if (d.series_truncated > 0) parts.push(d.series_truncated + " more not drawn");
+  return parts.join(" · ");
+}
+
+async function refreshQos() {
+  const req = ++qosReq;   // a response for an earlier selection must not overwrite this one
+  try {
+    const data = await getJson("/api/qos");
+    if (req !== qosReq) return;
+    renderQos(data);
+    if (!data.enabled || !qosDevice) return;
+    const history = await getJson("/api/qos/history?device=" + encodeURIComponent(qosDevice) + "&window_s=" + qosWindow);
+    if (req !== qosReq) return;
+    qosDetail = history;
+    drawQosChart(history);
+    qosSummary.textContent = qosSummaryText(history);
+    qosLoaded = true;
+    qosNote.textContent = "";
+    qosWrap.classList.remove("offline");
+    qosChartCard.classList.remove("offline");
+  } catch (err) {
+    if (req !== qosReq) return;
+    if (qosLoaded) {
+      qosNote.textContent = "Could not load QoS telemetry (" + err.message + "). Showing the last data received, which is out of date.";
+      qosWrap.classList.add("offline");
+      qosChartCard.classList.add("offline");
+    }
+  }
+}
+qosDeviceSelect.addEventListener("change", () => { qosDevice = qosDeviceSelect.value; refreshQos(); });
+for (const button of document.querySelectorAll(".qwin button")) {
+  button.addEventListener("click", () => {
+    qosWindow = Number(button.dataset.qwindow);
+    for (const other of document.querySelectorAll(".qwin button")) other.setAttribute("aria-pressed", String(other === button));
+    refreshQos();
+  });
+}
+for (const button of document.querySelectorAll(".qmetric button")) {
+  button.addEventListener("click", () => {
+    qosMetric = button.dataset.qmetric;
+    for (const other of document.querySelectorAll(".qmetric button")) other.setAttribute("aria-pressed", String(other === button));
+    if (qosDetail) drawQosChart(qosDetail);
+  });
+}
+let qosResizeQueued = false;
+window.addEventListener("resize", () => {
+  if (qosResizeQueued || !qosDetail) return;
+  qosResizeQueued = true;
+  requestAnimationFrame(() => { qosResizeQueued = false; if (qosDetail) drawQosChart(qosDetail); });
+});
+refreshQos();
+setInterval(refreshQos, 5000);
 
 // ---- interface statistics (SNMP) ----------------------------------------------------------
 // Values the server doesn't know are null and shown as a dash with the reason, never as 0.

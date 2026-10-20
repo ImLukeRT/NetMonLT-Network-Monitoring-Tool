@@ -15,6 +15,9 @@
 mode: real
 poll_interval_s: 10      # minimum 5 in real mode
 # snmp_poll_interval_s: 30   # how often interfaces are polled; default 30, minimum 10
+# qos_poll_interval_s: 30    # how often QoS telemetry is read (only if a device enables `qos`);
+#                            # default 30, minimum 10
+# qos_retention_hours: 24    # how long QoS history is kept (1 to 168)
 # Optional: how the Network quality section grades latency, jitter and loss. The defaults are
 # shown; they are application-level heuristics, not a QoS standard. Tune them for your links.
 # quality:
@@ -63,3 +66,11 @@ devices:
   #     auth_protocol: SHA256                  # SHA, SHA224, SHA256, SHA384 or SHA512
   #     priv_protocol: AES128                  # AES128, AES192 or AES256
   #     port: 161
+  #   # OPTIONAL and OFF unless enabled: read-only QoS telemetry (queue, class and drop counters
+  #   # the device itself reports). It reuses this device's SNMPv3 settings above, so it needs
+  #   # `snmp` enabled and adds no new credentials. Only the adapter below is supported; most
+  #   # home routers do not expose QoS counters over SNMP, and such a device will simply show
+  #   # "no QoS telemetry". Nothing is scanned or guessed.
+  #   qos:
+  #     enabled: true
+  #     adapter: diffserv-mib                  # DIFFSERV-MIB (RFC 3289); see the README

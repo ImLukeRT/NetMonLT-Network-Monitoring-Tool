@@ -13,6 +13,7 @@ from pathlib import Path
 from netmonlt.alerts import Alert, AlertState
 from netmonlt.domain import CheckResult, Device, Status
 from netmonlt.ifstats import STATUS_OK, InterfaceState, SnmpStatus
+from netmonlt.qos import QosSample, QosSnapshot, QosState, QosStatus
 from netmonlt.quality import CheckSample
 from netmonlt.wifi import WifiReading, WifiSample
 
@@ -112,6 +113,56 @@ CREATE TABLE IF NOT EXISTS wifi_observations (
     source      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wifi_ts ON wifi_observations(ts);
+-- QoS telemetry (opt-in, read-only SNMPv3). Raw counters are kept only for the LATEST poll of each
+-- element (needed to derive the next rate); history holds derived rates, one row per element
+-- per poll, for a bounded time. Counters are TEXT because a Counter64 can exceed signed 64-bit.
+CREATE TABLE IF NOT EXISTS qos_status (
+    device       TEXT PRIMARY KEY REFERENCES devices(name) ON DELETE CASCADE,
+    ts           REAL NOT NULL,
+    status       TEXT NOT NULL,
+    message      TEXT,
+    last_ok_ts   REAL,
+    uptime_ticks INTEGER,
+    adapter      TEXT,
+    source_mib   TEXT,
+    truncated    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS qos_state (
+    device        TEXT NOT NULL REFERENCES devices(name) ON DELETE CASCADE,
+    row_key       TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    detail        TEXT,
+    present       INTEGER NOT NULL,
+    ts            REAL NOT NULL,
+    counter_bits  INTEGER NOT NULL,
+    discontinuity INTEGER,
+    packets       TEXT,
+    octets        TEXT,
+    drop_packets  TEXT,
+    drop_octets   TEXT,
+    interval_s    REAL,
+    pps           REAL,
+    bps           REAL,
+    drop_pps      REAL,
+    drop_bps      REAL,
+    drop_pct      REAL,
+    rate_note     TEXT,
+    PRIMARY KEY (device, row_key)
+);
+CREATE TABLE IF NOT EXISTS qos_history (
+    id        INTEGER PRIMARY KEY,
+    device    TEXT NOT NULL REFERENCES devices(name) ON DELETE CASCADE,
+    row_key   TEXT NOT NULL,
+    ts        REAL NOT NULL,
+    source    TEXT NOT NULL,
+    pps       REAL,
+    bps       REAL,
+    drop_pps  REAL,
+    drop_bps  REAL,
+    rate_note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qos_history ON qos_history(device, ts);
 """
 
 _STATE_COLUMNS = (
@@ -168,6 +219,32 @@ def _state_from_row(row: sqlite3.Row) -> InterfaceState:
         in_errors_delta=row["in_errors_delta"], out_errors_delta=row["out_errors_delta"],
         in_discards_delta=row["in_discards_delta"], out_discards_delta=row["out_discards_delta"],
         rate_note=row["rate_note"],
+    )
+
+
+_QOS_COLUMNS = (
+    "row_key, kind, name, detail, present, ts, counter_bits, discontinuity, packets, octets, "
+    "drop_packets, drop_octets, interval_s, pps, bps, drop_pps, drop_bps, drop_pct, rate_note"
+)
+
+
+def _qos_state_from_row(row: sqlite3.Row) -> QosState:
+    return QosState(
+        key=row["row_key"], kind=row["kind"], name=row["name"], detail=row["detail"],
+        present=bool(row["present"]), ts=row["ts"], counter_bits=row["counter_bits"],
+        discontinuity=row["discontinuity"], packets=_int(row["packets"]),
+        octets=_int(row["octets"]), drop_packets=_int(row["drop_packets"]),
+        drop_octets=_int(row["drop_octets"]), interval_s=row["interval_s"], pps=row["pps"],
+        bps=row["bps"], drop_pps=row["drop_pps"], drop_bps=row["drop_bps"],
+        drop_pct=row["drop_pct"], rate_note=row["rate_note"],
+    )
+
+
+def _qos_status_from_row(row: sqlite3.Row) -> QosStatus:
+    return QosStatus(
+        ts=row["ts"], status=row["status"], message=row["message"], last_ok_ts=row["last_ok_ts"],
+        uptime_ticks=row["uptime_ticks"], adapter=row["adapter"], source_mib=row["source_mib"],
+        truncated=row["truncated"],
     )
 
 
@@ -345,6 +422,124 @@ class Database:
             ).fetchall()
         samples = [CheckSample(r["ts"], r["sent"], r["received"], r["rtt_avg_ms"]) for r in rows]
         return samples, first_ts, last_ts
+
+    # ---- QoS telemetry
+    def get_qos_status(self, device: str) -> QosStatus | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM qos_status WHERE device=?", (device,)
+            ).fetchone()
+        return None if row is None else _qos_status_from_row(row)
+
+    def get_qos_states(self, device: str) -> dict[str, QosState]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_QOS_COLUMNS} FROM qos_state WHERE device=?", (device,)
+            ).fetchall()
+        return {r["row_key"]: _qos_state_from_row(r) for r in rows}
+
+    def save_qos_success(
+        self, device: str, ts: float, snapshot: QosSnapshot, states: list[QosState]
+    ) -> None:
+        """Record a successful poll in one transaction: the status, the latest state of every
+        element, and one history row (derived rates, or why there are none) per element that is
+        reported now. Absent elements keep their last-seen time and get no history row."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO qos_status(device, ts, status, message, last_ok_ts, uptime_ticks, "
+                "adapter, source_mib, truncated) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(device) DO UPDATE SET ts=excluded.ts, status=excluded.status, "
+                "message=NULL, last_ok_ts=excluded.last_ok_ts, "
+                "uptime_ticks=excluded.uptime_ticks, adapter=excluded.adapter, "
+                "source_mib=excluded.source_mib, truncated=excluded.truncated",
+                (device, ts, STATUS_OK, ts, snapshot.uptime_ticks, snapshot.adapter,
+                 snapshot.source_mib, snapshot.truncated),
+            )
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO qos_state(device, " + _QOS_COLUMNS + ") "
+                "VALUES (?, " + ", ".join("?" * 19) + ")",
+                [
+                    (device, s.key, s.kind, s.name, s.detail, int(s.present), s.ts,
+                     s.counter_bits, s.discontinuity, _text(s.packets), _text(s.octets),
+                     _text(s.drop_packets), _text(s.drop_octets), s.interval_s, s.pps, s.bps,
+                     s.drop_pps, s.drop_bps, s.drop_pct, s.rate_note)
+                    for s in states
+                ],
+            )
+            self._conn.executemany(
+                "INSERT INTO qos_history(device, row_key, ts, source, pps, bps, drop_pps, "
+                "drop_bps, rate_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (device, s.key, ts, snapshot.adapter, s.pps, s.bps, s.drop_pps, s.drop_bps,
+                     s.rate_note)
+                    for s in states if s.present
+                ],
+            )
+
+    def save_qos_failure(self, device: str, ts: float, category: str, message: str) -> None:
+        """Record that a poll failed. The last good states and the history are left as they were."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO qos_status(device, ts, status, message) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(device) DO UPDATE SET ts=excluded.ts, status=excluded.status, "
+                "message=excluded.message",
+                (device, ts, category, message),
+            )
+
+    def qos_overview(
+        self, device: str | None = None
+    ) -> list[tuple[str, QosStatus, list[QosState]]]:
+        """(device, status, states) for every device with QoS data, by device name."""
+        with self._lock:
+            sql, args = "SELECT * FROM qos_status", ()
+            if device is not None:
+                sql, args = sql + " WHERE device=?", (device,)
+            statuses = self._conn.execute(sql + " ORDER BY device", args).fetchall()
+            result = []
+            for status_row in statuses:
+                rows = self._conn.execute(
+                    f"SELECT {_QOS_COLUMNS} FROM qos_state WHERE device=? ORDER BY kind, row_key",
+                    (status_row["device"],),
+                ).fetchall()
+                result.append((status_row["device"], _qos_status_from_row(status_row),
+                               [_qos_state_from_row(r) for r in rows]))
+        return result
+
+    def qos_samples(
+        self, device: str, start: float, end: float
+    ) -> tuple[list[QosSample], float | None, float | None]:
+        """The stored history rows of a device in [start, end], oldest first, plus the first and
+        last time anything was stored for it."""
+        with self._lock:
+            first, last = self._conn.execute(
+                "SELECT MIN(ts), MAX(ts) FROM qos_history WHERE device=?", (device,)
+            ).fetchone()
+            rows = self._conn.execute(
+                "SELECT h.ts, h.row_key, COALESCE(s.name, h.row_key) AS name, h.pps, h.bps, "
+                "h.drop_pps, h.drop_bps, h.rate_note FROM qos_history h "
+                "LEFT JOIN qos_state s ON s.device = h.device AND s.row_key = h.row_key "
+                "WHERE h.device=? AND h.ts BETWEEN ? AND ? ORDER BY h.ts, h.id",
+                (device, start, end),
+            ).fetchall()
+        samples = [QosSample(r["ts"], r["row_key"], r["name"], r["pps"], r["bps"], r["drop_pps"],
+                             r["drop_bps"], r["rate_note"]) for r in rows]
+        return samples, first, last
+
+    def prune_qos(self, older_than: float, max_rows: int, absent_older_than: float) -> int:
+        """Delete QoS history older than `older_than`, then the oldest beyond `max_rows`, and
+        elements that stopped being reported before `absent_older_than`."""
+        with self._lock, self._conn:
+            deleted = self._conn.execute(
+                "DELETE FROM qos_history WHERE ts < ?", (older_than,)
+            ).rowcount
+            deleted += self._conn.execute(
+                "DELETE FROM qos_history WHERE id <= "
+                "(SELECT id FROM qos_history ORDER BY id DESC LIMIT 1 OFFSET ?)", (max_rows,)
+            ).rowcount
+            deleted += self._conn.execute(
+                "DELETE FROM qos_state WHERE present=0 AND ts < ?", (absent_older_than,)
+            ).rowcount
+        return deleted
 
     # ---- this computer's Wi-Fi link
     def save_wifi_observation(self, ts: float, reading: WifiReading) -> None:

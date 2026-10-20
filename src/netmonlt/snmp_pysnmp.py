@@ -44,6 +44,8 @@ from pysnmp.hlapi.v3arch.asyncio import (
 from netmonlt.domain import Device, SnmpConfig
 from netmonlt.ifstats import MAX_INTERFACES, InterfaceSnapshot, build_snapshot
 from netmonlt.probes.icmp import TargetError, validate_target
+from netmonlt.qos import MAX_QOS_ROWS, QosSnapshot
+from netmonlt.qos_adapters import ADAPTERS
 from netmonlt.snmp import (
     CATEGORY_AUTH,
     CATEGORY_CONFIG,
@@ -187,6 +189,48 @@ async def _walk_column(engine, auth, target, column: str) -> dict[int, int | byt
     return rows
 
 
+MAX_QOS_WALK_ROWS = 4 * MAX_QOS_ROWS  # rows read per column: a runaway device can't make us loop
+
+
+def convert_oid_value(value: Any) -> int | bytes | str | None:
+    """Like convert_value, but an OBJECT IDENTIFIER (a RowPointer) becomes a dotted string."""
+    if hasattr(value, "asTuple") and not hasattr(value, "asOctets"):
+        return ".".join(str(part) for part in value.asTuple())
+    return convert_value(value)
+
+
+def index_tuple(oid: str, column: str) -> tuple[int, ...] | None:
+    """The index of a row of `column` as a tuple of ints (column.4.2 -> (4, 2)), or None."""
+    prefix = column + "."
+    if not oid.startswith(prefix):
+        return None
+    parts = oid[len(prefix):].split(".")
+    return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) else None
+
+
+async def _walk_table(engine, auth, target, column: str) -> dict[tuple[int, ...], Any]:
+    """GETBULK walk of one column of a table: {index tuple: value}. Read-only."""
+    rows: dict[tuple[int, ...], Any] = {}
+    walk = bulk_walk_cmd(
+        engine, auth, target, ContextData(), 0, BULK_REPETITIONS,
+        ObjectType(ObjectIdentity(column)), lexicographicMode=False,
+    )
+    async with contextlib.aclosing(walk):
+        async for error, status, _, binds in walk:
+            if error:
+                raise SnmpError(classify_error(str(error)))
+            if status:
+                raise SnmpError(classify_error(status.prettyPrint()))
+            for oid, value in binds:
+                index = index_tuple(str(oid), column)
+                converted = convert_oid_value(value)
+                if index is not None and converted is not None:
+                    rows[index] = converted
+            if len(rows) >= MAX_QOS_WALK_ROWS:
+                break
+    return rows
+
+
 class PySnmpClient:
     """Polls interface statistics from real devices over SNMPv3 (see the module docstring)."""
 
@@ -242,6 +286,79 @@ class PySnmpClient:
             raise
         except Exception as exc:  # pysnmp error text may echo parameters: keep only the type
             log.debug("pysnmp raised %s while polling %s", type(exc).__name__, device.name)
+            raise SnmpError(CATEGORY_ERROR) from None
+        finally:
+            engine.close_dispatcher()
+
+
+class PySnmpQosClient:
+    """Reads QoS telemetry from real devices over SNMPv3, through ONE explicitly selected adapter.
+
+    It reuses the device's existing SNMPv3 credentials and security settings, polls only devices
+    whose inventory entry enables `qos`, and walks only the columns that adapter declares (see
+    qos_adapters.py): no discovery, no writes, nothing else is requested. A device that does not
+    implement the MIB returns no rows, which is reported as "unsupported", never as made-up data.
+    """
+
+    def __init__(self, credentials: Mapping[str, SnmpCredentials]):
+        self._credentials = dict(credentials)
+
+    def __repr__(self) -> str:
+        return f"PySnmpQosClient(devices={sorted(self._credentials)}, credentials=<hidden>)"
+
+    @classmethod
+    def from_devices(
+        cls, devices: Sequence[Device], environ: Mapping[str, str] | None = None
+    ) -> "PySnmpQosClient":
+        """Load the credentials of every QoS device from the environment, or say which variables
+        are missing (by name only). Done at startup so a typo fails fast."""
+        credentials: dict[str, SnmpCredentials] = {}
+        problems = []
+        for device in devices:
+            if device.qos is None or device.snmp is None:
+                continue
+            try:
+                credentials[device.name] = load_credentials(device.snmp, environ)
+            except SnmpConfigError as exc:
+                problems.append(f"{device.name}: {exc}")
+        if problems:
+            raise SnmpConfigError("; ".join(problems))
+        return cls(credentials)
+
+    async def poll(self, device: Device) -> QosSnapshot:
+        config, qos = device.snmp, device.qos
+        # Defence in depth: only a configured, authorised, single-host device is ever contacted.
+        if (config is None or qos is None or not device.authorized
+                or device.name not in self._credentials or qos.adapter not in ADAPTERS):
+            raise SnmpError(CATEGORY_CONFIG)
+        adapter = ADAPTERS[qos.adapter]
+        try:
+            validate_target(device.address)
+        except TargetError:
+            raise SnmpError(CATEGORY_CONFIG) from None
+
+        engine = SnmpEngine()
+        try:
+            auth = usm_user(self._credentials[device.name], config)
+            target = await UdpTransportTarget.create(
+                (device.address, config.port), timeout=config.timeout_s, retries=config.retries
+            )
+            uptime = await _get_uptime(engine, auth, target)
+            tables = {}
+            for name, column in adapter.columns.items():
+                tables[name] = await _walk_table(engine, auth, target, column)
+            rows = adapter.build(tables)
+            if not rows:
+                raise SnmpError(CATEGORY_UNSUPPORTED)
+            kept = rows[:MAX_QOS_ROWS]
+            return QosSnapshot(
+                adapter=adapter.name, source_mib=adapter.source_mib, rows=tuple(kept),
+                uptime_ticks=uptime, truncated=len(rows) - len(kept),
+            )
+        except SnmpError:
+            raise
+        except Exception as exc:  # pysnmp error text may echo parameters: keep only the type
+            log.debug("pysnmp raised %s while polling QoS of %s", type(exc).__name__, device.name)
             raise SnmpError(CATEGORY_ERROR) from None
         finally:
             engine.close_dispatcher()
